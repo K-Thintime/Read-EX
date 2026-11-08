@@ -62,3 +62,18 @@ apps/readest.koplugin/native/localsend-bin/target/
 
 # scripts/tauri.mjs parks the wry Cargo.lock here during a Linux CEF build
 /Cargo.lock.wry
+
+# Submodule working trees.
+#
+# Upstream tracks these as gitlinks (mode 160000). This fork was imported from a
+# source archive, so no gitlinks were ever recorded — and committing the trees
+# themselves would bury ~100MB of third-party code in the history.
+# Restore them with `bash scripts/bootstrap-submodules.sh`; CI does the same.
+/packages/foliate-js/
+/packages/tauri/
+/packages/simplecc-wasm/
+/packages/qcms/
+/packages/js-mdict/
+/apps/readest-app/src-tauri/plugins/tauri-plugin-turso/
+/apps/readest-app/src-tauri/plugins/tauri-plugin-webview-upgrade/
+/apps/readest-app/.claude/skills/gstack/

@@ -1,3 +1,17 @@
+> ## Read-EX
+>
+> This is a **fork of [readest](https://github.com/readest/readest)** focused on syncing your library to storage you control:
+>
+> - **OpenList** — new native backend (talks to `/api/auth/login` + `/api/fs/*` directly, lists every mounted drive)
+> - **OneDrive** — via your own Azure app registration
+> - **WebDAV / S3 / Google Drive / iCloud** — upstream backends, all still available
+> - **No paywall on third-party sync** — the upstream premium gate is switched off
+>
+> Installers for Windows, macOS and Linux are built by GitHub Actions — grab them from [Releases](../../releases), or run the *Build Read-EX* workflow yourself.
+> Fork-specific setup, build steps and the full change list live in **[FORK.md](FORK.md)**.
+>
+> Licensed **AGPL-3.0**, same as upstream. All original credit belongs to Bilingify LLC and the readest contributors.
+
 <div align="center">
   <a href="https://readest.com?utm_source=github&utm_medium=referral&utm_campaign=readme" target="_blank">
     <img src="https://github.com/readest/readest/blob/main/apps/readest-app/src-tauri/icons/icon.png?raw=true" alt="Readest Logo" width="20%" />

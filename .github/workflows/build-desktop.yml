@@ -1,18 +1,24 @@
-name: Build Desktop
+name: Build Read-EX
 
-# Read-EX desktop packaging: Windows (NSIS), macOS (universal dmg), Linux
-# (AppImage + deb). Deliberately independent of upstream's release.yml, which
-# depends on Readest's own Sentry / PostHog / Supabase / Apple / Discord
-# secrets and would fail on a fork.
+# Packages Read-EX for Windows (NSIS), macOS (universal dmg) and Linux
+# (AppImage + deb). Deliberately standalone: upstream's release.yml depends on
+# Readest's own Sentry / PostHog / Supabase / Apple / Discord secrets, none of
+# which exist in a fork.
 #
-# Trigger: push a tag, or run manually from the Actions tab. Artifacts are
-# attached to a DRAFT release so nothing ships by accident.
+# Triggers:
+#   - push a v* tag        -> build + attach installers to a DRAFT release
+#   - run from the Actions tab -> build only, installers land as artifacts
+#
+# Everything works with zero secrets. Optional secrets only upgrade the output:
+#   TAURI_SIGNING_PRIVATE_KEY(+ _PASSWORD) -> signed updater artifacts (.sig)
+#   APPLE_*                                -> signed + notarised dmg
+#   vars.MICROSOFT_CLIENT_ID               -> enables the OneDrive backend
 
 on:
   workflow_dispatch:
     inputs:
       draft:
-        description: 'Create the release as a draft'
+        description: 'Publish the release as a draft'
         type: boolean
         default: true
   push:
@@ -22,27 +28,42 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             artifact: read-ex-windows-x64
-            args: '--target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.updater.conf.json'
+            base-args: '--target x86_64-pc-windows-msvc --bundles nsis'
           - os: macos-latest
             artifact: read-ex-macos-universal
-            args: '--target universal-apple-darwin --config src-tauri/tauri.macos-nonestore.conf.json --config src-tauri/tauri.updater.conf.json'
+            base-args: '--target universal-apple-darwin --config src-tauri/tauri.macos-nonestore.conf.json'
           - os: ubuntu-22.04
             artifact: read-ex-linux-x64
-            args: '--bundles appimage,deb --config src-tauri/tauri.updater.conf.json'
+            base-args: '--bundles appimage,deb'
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tauri-action needs the tag/commit history to resolve the release.
+          fetch-depth: 0
+
+      # The repo stores 8 git submodules (tauri fork, swift-rs, foliate-js,
+      # tauri-plugin-turso, ...). A checkout without them leaves pnpm and cargo
+      # with empty directories, so restore them from .gitmodules first.
+      - name: Restore submodules
+        shell: bash
+        run: bash scripts/bootstrap-submodules.sh
 
       - uses: pnpm/action-setup@v4
         with:
@@ -57,41 +78,74 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf libssl-dev libxdo-dev libasound2-dev
+            librsvg2-dev libxdo-dev libssl-dev libasound2-dev libsoup-3.0-dev \
+            patchelf build-essential curl wget file
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Universal macOS binary = both architectures in one bundle.
+      - name: Add macOS cross targets
+        if: matrix.os == 'macos-latest'
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: 'apps/readest-app/src-tauri -> target'
+          # Root Cargo.toml owns the workspace, so the target dir is repo-root/target.
+          workspaces: '. -> target'
+          key: ${{ matrix.artifact }}
 
+      # --frozen-lockfile is the fast path; the fallback exists because the
+      # submodule clones above are branch tips and can drift from the lockfile
+      # that was committed upstream. A resolving install keeps the build alive
+      # instead of failing on a dependency spec the fork cannot control.
       - name: Install JS dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          pnpm install --frozen-lockfile || {
+            echo "::warning::lockfile drifted from the checked-out submodule trees; resolving instead."
+            pnpm install --no-frozen-lockfile
+          }
 
-      # PDF.js worker / wasm / fonts are copied out of node_modules into
-      # public/vendor — the build fails without them.
+      # pdf.js worker / wasm / fonts are copied out of node_modules into
+      # public/vendor; the Next export fails without them.
       - name: Stage vendored assets
         run: pnpm --filter @readest/readest-app setup-vendors
 
-      - name: Write build-time config
+      - name: Configure build environment
         shell: bash
         working-directory: apps/readest-app
         run: |
-          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" > .env.local
-          echo "NEXT_PUBLIC_MICROSOFT_CLIENT_ID=${{ vars.MICROSOFT_CLIENT_ID }}" >> .env.local
+          if [ -n "${{ vars.MICROSOFT_CLIENT_ID }}" ]; then
+            echo "NEXT_PUBLIC_MICROSOFT_CLIENT_ID=${{ vars.MICROSOFT_CLIENT_ID }}" >> .env.tauri
+            echo "OneDrive backend enabled."
+          else
+            echo "::warning::vars.MICROSOFT_CLIENT_ID is unset - the OneDrive row will be disabled in this build. See FORK.md."
+          fi
 
-      - name: Build and attach to release
+      # Updater artifacts are only produced when a signing key exists: with
+      # createUpdaterArtifacts on and no key, tauri build hard-fails.
+      - name: Resolve tauri arguments
+        id: tauri-args
+        shell: bash
+        run: |
+          args="${{ matrix.base-args }}"
+          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
+            args="$args --config src-tauri/tauri.updater.conf.json"
+            echo "Updater artifacts: enabled (signing key present)."
+          else
+            echo "Updater artifacts: skipped (no signing key) - installers still build."
+          fi
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish draft release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS signing + notarization. Omit these secrets and the job still
-          # produces an unsigned dmg — see README for the Gatekeeper workaround.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -102,7 +156,51 @@ jobs:
           projectPath: apps/readest-app
           tagName: ${{ github.ref_name }}
           releaseName: 'Read-EX ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download and install Read-EX for your platform.'
-          releaseDraft: ${{ github.event.inputs.draft == 'false' && false || true }}
+          releaseBody: |
+            Read-EX ${{ github.ref_name }} — desktop builds for Windows, macOS and Linux.
+
+            **Sync backends:** Readest Cloud (optional), WebDAV, S3, Google Drive, OneDrive, iCloud (Apple platforms) and **OpenList**.
+
+            ### Install notes
+            - **Windows**: run the `.exe` installer. SmartScreen will warn about an unknown publisher — the build is unsigned.
+            - **macOS**: open the `.dmg`, drag to Applications. Unsigned builds need `xattr -dr com.apple.quarantine /Applications/Read-EX.app`, or right-click → Open.
+            - **Linux**: the `.AppImage` is portable (`chmod +x` then run); the `.deb` needs `libwebkit2gtk-4.1-0`.
+
+            Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
+          releaseDraft: ${{ github.event_name == 'push' && true || inputs.draft }}
           prerelease: false
-          args: ${{ matrix.args }}
+          args: ${{ steps.tauri-args.outputs.args }}
+
+      - name: Build only
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/readest-app
+          args: ${{ steps.tauri-args.outputs.args }}
+
+      - name: Upload installers
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+          # `**` because the target dir moves under a <triple>/ subdir whenever
+          # --target is passed.
+          path: |
+            target/**/bundle/nsis/*.exe
+            target/**/bundle/msi/*.msi
+            target/**/bundle/dmg/*.dmg
+            target/**/bundle/macos/*.app
+            target/**/bundle/appimage/*.AppImage
+            target/**/bundle/deb/*.deb

@@ -1,0 +1,31 @@
+# Shell scripts must stay LF: a CRLF shebang and a trailing \r on `done` both
+# break `bash script.sh` on the Windows runner, where git's autocrlf would
+# otherwise rewrite them on checkout.
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Windows-only scripting keeps its CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Rust/JS/JSON/YAML/TS sources are LF everywhere — the repo was authored on LF
+# and mixed endings show up as whole-file diffs.
+*.rs text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.wasm binary

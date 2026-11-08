@@ -42,44 +42,37 @@ OpenList（AList 的社区 fork）的 API 有三个和常规 REST 不同的地�
 
 ## 构建
 
-### 0. 先补子模块（必须）
+### 0. 补子模块（必须）
 
-本仓库的历史是一次性导入的，**子模块指针没有记录**。开始构建前先注册：
+本仓库的历史是一次性导入的，**子模块指针没有记录进索引**，所以 `git submodule update` 不会做任何事。用一个脚本从 `.gitmodules` 还原：
 
 ```bash
-git submodule add https://github.com/readest/foliate-js packages/foliate-js
-git submodule add https://github.com/readest/tauri packages/tauri
-git submodule add https://github.com/readest/simplecc-wasm packages/simplecc-wasm
-git submodule add https://github.com/readest/js-mdict packages/js-mdict
-git submodule add https://github.com/mozilla/pdf.js.qcms packages/qcms
-git submodule add https://github.com/readest/tauri-plugin-turso \
-  apps/readest-app/src-tauri/plugins/tauri-plugin-turso
-git submodule add https://github.com/readest/tauri-plugin-webview-upgrade \
-  apps/readest-app/src-tauri/plugins/tauri-plugin-webview-upgrade
+bash scripts/bootstrap-submodules.sh
 ```
 
-> 缺任何一个都会在 `pnpm install`（js-mdict / simplecc-wasm）或 `cargo build`（turso / qcms / tauri）阶段报错。
+脚本幂等：已有内容的目录直接跳过，缺的 `git clone --depth 1` 并重试 3 次，最后校验 5 个构建关键路径（tauri fork、swift-rs、foliate-js、turso、webview-upgrade）。CI 用的是同一条命令，所以本地能过、CI 必然能过。
+
+> 缺任何一个都会在 `pnpm install`（foliate-js）或 `cargo build`（tauri / turso / webview-upgrade）阶段报错。
 > 想保留上游提交历史的话，更省事的做法是 `git clone --recurse-submodules` 官方仓库，再把上面「相对上游的改动」表里的文件覆盖过去。
 
 ### 前置
 
-- Node 22+、pnpm 11、Rust stable、VS Build Tools（Windows）/ Xcode CLT（macOS）/ `libwebkit2gtk-4.1-dev`（Linux）
+- Node 22+、pnpm 11、Rust 1.90+、VS Build Tools（Windows）/ Xcode CLT（macOS）/ `libwebkit2gtk-4.1-dev`（Linux）
 
 ### 本地（验证用，Windows）
 
 ```bash
+bash scripts/bootstrap-submodules.sh                # 补子模块（缺了就装不上）
 pnpm install
-pnpm --filter @readest/readest-app setup-vendors   # 复制 pdf.js worker/wasm/fonts
+pnpm --filter @readest/readest-app setup-vendors    # 复制 pdf.js worker/wasm/fonts
+
+# OneDrive 的 client id 走 .env.tauri —— `pnpm build` 就是 `dotenv -e .env.tauri -- next build`
+echo "NEXT_PUBLIC_MICROSOFT_CLIENT_ID=<你的 Azure Application (client) ID>" \
+  >> apps/readest-app/.env.tauri
 
 cd apps/readest-app
-cat > .env.local <<'EOF'
-NEXT_PUBLIC_APP_PLATFORM=tauri
-NEXT_PUBLIC_MICROSOFT_CLIENT_ID=<你的 Azure Application (client) ID>
-EOF
-
-pnpm build-tauri
 pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
-# 产物：target/x86_64-pc-windows-msvc/release/bundle/nsis/
+# 产物：../../target/x86_64-pc-windows-msvc/release/bundle/nsis/
 ```
 
 本地构建默认**不生成**更新签名包（`tauri.conf.json` 里 `createUpdaterArtifacts: false`），所以不需要签名私钥。
@@ -133,16 +126,16 @@ git push origin v0.1.0
 
 ## 发布到自己的 GitHub
 
+仓库已推送至 **https://github.com/K-Thintime/read-ex**（`main` 分支）。
+
+出包只需推一个 tag：
+
 ```bash
-cd readest-main
-git remote add origin https://github.com/<你的账号>/read-ex.git
-git branch -M main
-git push -u origin main
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
-之后推 tag 即可让 Actions 出包（见下）。
-
----
+工作流跑完会在 Releases 里留下一个 **draft**（草稿），确认安装包没问题再点 Publish。若只是想验证构建，在 Actions 页面手动运行 *Build Read-EX*，产物以 artifact 形式保留 14 天。
 
 ## 许可证
 
