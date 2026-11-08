@@ -2753,5 +2753,21 @@
   "Books uploaded": "已上传书籍",
   "Reset Counts": "重置计数",
   "Reset the counts and sync history on this device?": "要重置此设备上的计数和同步记录吗？",
-  "Folder not available": "文件夹不可用"
+  "Folder not available": "文件夹不可用",
+  "Move Readest Cloud books to your own drive": "把 Readest 云端的书搬到自己的网盘",
+  "Books stored in Readest Cloud are invisible to the storage backends below, because those only mirror what is already in this device’s library. This copies the missing books down once, then uploads the whole library to every backend that is switched on.": "只存在于 Readest 云端的书，下面的网盘后端是看不到的——它们只镜像本机书库里已有的内容。这个操作会先把缺的书下载到本机一次，然后把整个书库上传到所有已开启的网盘。",
+  "Turn on a cloud storage backend below first, then come back.": "请先在下面开启一个网盘后端，再回来操作。",
+  "Targets: {{targets}}": "目标：{{targets}}",
+  "Start migration": "开始迁移",
+  "Preparing…": "准备中…",
+  "Reading your Readest Cloud library…": "正在读取 Readest 云端书库…",
+  "Downloading {{done}}/{{total}}: {{title}}": "正在下载 {{done}}/{{total}}：{{title}}",
+  "Uploading to your cloud storage…": "正在上传到你的网盘…",
+  "Migration finished": "迁移完成",
+  "Readest Cloud holds {{cloud}} books; {{missing}} were missing on this device and {{downloaded}} of them were downloaded.": "云端共 {{cloud}} 本书，其中 {{missing}} 本本机没有，已下载 {{downloaded}} 本。",
+  "The library is now syncing to: {{targets}}": "书库正在同步到：{{targets}}",
+  "Could not download {{count}} books:": "有 {{count}} 本下载失败：",
+  "Turn on a cloud storage backend first": "请先启用一个网盘后端",
+  "The library is still loading, try again in a moment": "书库还在加载，请稍后再试",
+  "Directory not found": "目录不存在"
 }

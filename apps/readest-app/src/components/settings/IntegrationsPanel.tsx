@@ -67,6 +67,7 @@ import GoogleDriveForm from './integrations/GoogleDriveForm';
 import OneDriveForm from './integrations/OneDriveForm';
 import ICloudForm from './integrations/ICloudForm';
 import S3Form from './integrations/S3Form';
+import CloudMigrationSection from './integrations/CloudMigrationSection';
 import OpenListForm from './integrations/OpenListForm';
 import { persistCloudProviderEnabled } from './integrations/cloudSync';
 import {
@@ -511,6 +512,7 @@ const IntegrationsPanel: React.FC = () => {
             onClick={() => navigateToProfile(router)}
           />
         </BoxedList>
+        <CloudMigrationSection />
       </div>
     );
   if (subPage === 'readwise')
