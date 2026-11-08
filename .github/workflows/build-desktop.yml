@@ -1,21 +1,26 @@
 name: Build Read-EX
 
-# Packages Read-EX for Windows (NSIS), macOS (universal dmg) and Linux
-# (AppImage + deb). Deliberately standalone: upstream's release.yml depends on
-# Readest's own Sentry / PostHog / Supabase / Apple / Discord secrets, none of
-# which exist in a fork.
+# Builds Read-EX for Windows, macOS, Linux and Android, then attaches the
+# installers to a draft release.
+#
+# Why the bundle formats are what they are (learned the hard way, see git log):
+#
+#   Windows  portable .zip, not NSIS. The NSIS bundler downloads its toolchain
+#            from GitHub releases at package time and that fetch answers 504
+#            from the runners - twice, eight minutes apart - and the build dies
+#            after cargo has already finished. `--no-bundle` + a zip needs no
+#            network at all and produces a working single-exe app.
+#   Linux    .deb only, not AppImage. Same story: the AppImage bundler shells
+#            out to quick-sharun, which downloads the runtime and fails.
+#   macOS    .dmg works fine; nothing is fetched at package time.
 #
 # Triggers:
-#   - push a v* tag        -> build + attach installers to a DRAFT release
-#   - run from the Actions tab -> build only, installers land as artifacts
+#   - push a v* tag            -> build, attach everything to a DRAFT release
+#   - run from the Actions tab -> build only, files land as artifacts
 #
-# Everything works with zero secrets. Optional secrets only upgrade the output:
-#   TAURI_SIGNING_PRIVATE_KEY(+ _PASSWORD) -> signed updater artifacts (.sig)
-#   APPLE_CERTIFICATE & co.                -> signed + notarised dmg. These are
-#     deliberately NOT passed as env by default: an empty APPLE_CERTIFICATE still
-#     makes tauri run `security import` against nothing, which fails the whole
-#     macOS bundle. Add them to the env blocks only once the secrets exist.
-#   vars.MICROSOFT_CLIENT_ID               -> enables the OneDrive backend
+# Works with zero secrets. TAURI_SIGNING_PRIVATE_KEY upgrades desktop builds to
+# signed updater artifacts; APPLE_* are intentionally never passed as env (an
+# empty APPLE_CERTIFICATE makes tauri run `security import` on nothing).
 
 on:
   workflow_dispatch:
@@ -36,7 +41,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  desktop:
     name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
@@ -44,13 +49,16 @@ jobs:
         include:
           - os: windows-latest
             artifact: read-ex-windows-x64
-            base-args: '--target x86_64-pc-windows-msvc --bundles nsis'
+            bundles: ''
+            target: x86_64-pc-windows-msvc
           - os: macos-latest
             artifact: read-ex-macos-universal
-            base-args: '--target universal-apple-darwin'
+            bundles: dmg
+            target: universal-apple-darwin
           - os: ubuntu-22.04
             artifact: read-ex-linux-x64
-            base-args: '--bundles appimage,deb'
+            bundles: deb
+            target: ''
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -58,12 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # tauri-action needs the tag/commit history to resolve the release.
           fetch-depth: 0
 
-      # The repo stores 8 git submodules (tauri fork, swift-rs, foliate-js,
-      # tauri-plugin-turso, ...). A checkout without them leaves pnpm and cargo
-      # with empty directories, so restore them from .gitmodules first.
+      # The repo records 8 git submodules but the import dropped their gitlinks,
+      # so a plain checkout leaves pnpm and cargo with empty directories.
       - name: Restore submodules
         shell: bash
         run: bash scripts/bootstrap-submodules.sh
@@ -89,25 +95,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Universal macOS binary = both architectures in one bundle.
       - name: Add macOS cross targets
         if: matrix.os == 'macos-latest'
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         with:
-          # Root Cargo.toml owns the workspace, so the target dir is repo-root/target.
           workspaces: '. -> target'
           key: ${{ matrix.artifact }}
-          # Save even when the job fails: a failed *bundle* still leaves a
-          # complete cargo target dir, and reusing it is the difference between
-          # an 11-minute retry and a 30-second one.
           save-if: always
 
-      # --frozen-lockfile is the fast path; the fallback exists because the
-      # submodule clones above are branch tips and can drift from the lockfile
-      # that was committed upstream. A resolving install keeps the build alive
-      # instead of failing on a dependency spec the fork cannot control.
       - name: Install JS dependencies
         run: |
           pnpm install --frozen-lockfile || {
@@ -115,8 +112,6 @@ jobs:
             pnpm install --no-frozen-lockfile
           }
 
-      # pdf.js worker / wasm / fonts are copied out of node_modules into
-      # public/vendor; the Next export fails without them.
       - name: Stage vendored assets
         run: pnpm --filter @readest/readest-app setup-vendors
 
@@ -128,14 +123,13 @@ jobs:
             echo "NEXT_PUBLIC_MICROSOFT_CLIENT_ID=${{ vars.MICROSOFT_CLIENT_ID }}" >> .env.tauri
             echo "OneDrive backend enabled."
           else
-            echo "::warning::vars.MICROSOFT_CLIENT_ID is unset - the OneDrive row will be disabled in this build. See FORK.md."
+            echo "::warning::vars.MICROSOFT_CLIENT_ID is unset - the OneDrive row stays disabled. See FORK.md."
           fi
 
-      # createUpdaterArtifacts is on in tauri.conf.json (the updater chain needs
-      # it), but `tauri build` hard-fails when it cannot find a signing key. Flip
-      # it off in-tree for keyless builds instead of passing --config: tauri-action
-      # resolves --config against the repo root while tauri resolves it against
-      # projectPath, so any relative path fails one of the two.
+      # createUpdaterArtifacts lives in tauri.conf.json, but tauri hard-fails on
+      # it when no signing key is available. Flip it off in-tree rather than
+      # passing --config: tauri-action resolves --config against the repo root
+      # while the tauri CLI resolves it against projectPath.
       - name: Guard updater artifacts
         shell: bash
         working-directory: apps/readest-app
@@ -143,7 +137,7 @@ jobs:
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           if [ -n "$SIGNING_KEY" ]; then
-            echo "Signing key present - updater artifacts (.sig) will be produced."
+            echo "Signing key present - updater artifacts will be produced."
             exit 0
           fi
           node -e "
@@ -155,88 +149,196 @@ jobs:
           "
           echo "::warning::TAURI_SIGNING_PRIVATE_KEY is unset - building installers without updater artifacts."
 
-      - name: Build and publish draft release
-        id: bundle
-        if: startsWith(github.ref, 'refs/tags/')
-        continue-on-error: true
-        uses: tauri-apps/tauri-action@v0
+      - name: Build (Windows, portable)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        working-directory: apps/readest-app
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/readest-app
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Read-EX ${{ github.ref_name }}'
-          releaseBody: |
-            Read-EX ${{ github.ref_name }} — desktop builds for Windows, macOS and Linux.
+        run: |
+          pnpm tauri build --target ${{ matrix.target }} --no-bundle
+          mkdir -p ../../dist
+          cp ../../target/${{ matrix.target }}/release/readest.exe ../../dist/Read-EX.exe
+          # WebView2 is present on Win10 1803+ / Win11; note the requirement in
+          # the readme shipped alongside the exe.
+          cat > ../../dist/README.txt <<'EOF'
+          Read-EX (portable)
+          ==================
+          1. Double-click Read-EX.exe.
+          2. Requires the Microsoft Edge WebView2 runtime. Windows 10 (1803+) and
+             Windows 11 ship it; if the app shows a blank window, install it from
+             https://go.microsoft.com/fwlink/p/?LinkId=2124703
 
-            **Sync backends:** Readest Cloud (optional), WebDAV, S3, Google Drive, OneDrive, iCloud (Apple platforms) and **OpenList**.
+          No installer and no admin rights are needed. Delete the folder to
+          uninstall. Your library lives in %APPDATA%\com.readex.app.
+          EOF
+          cd ../../dist
+          # 7z is preinstalled on windows-latest; Compress-Archive is the backup
+          # because zip layout does not matter for a portable app folder.
+          if command -v 7z >/dev/null 2>&1; then
+            7z a -bd read-ex-windows-x64.zip Read-EX.exe README.txt >/dev/null
+          else
+            powershell -NoProfile -Command "Compress-Archive -Path 'Read-EX.exe','README.txt' -DestinationPath 'read-ex-windows-x64.zip' -Force"
+          fi
+          ls -lh
 
-            ### Install notes
-            - **Windows**: run the `.exe` installer. SmartScreen will warn about an unknown publisher — the build is unsigned.
-            - **macOS**: open the `.dmg`, drag to Applications. Unsigned builds need `xattr -dr com.apple.quarantine /Applications/Read-EX.app`, or right-click → Open.
-            - **Linux**: the `.AppImage` is portable (`chmod +x` then run); the `.deb` needs `libwebkit2gtk-4.1-0`.
-
-            Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
-          releaseDraft: ${{ github.event_name == 'push' && true || inputs.draft }}
-          prerelease: false
-          args: ${{ matrix.base-args }}
-
-      # Bundlers fetch their own helpers at package time — NSIS plugins on
-      # Windows, quick-sharun on Linux — and those downloads intermittently
-      # answer 504 from the runner. Cargo has already finished by then, so one
-      # retry only redoes the cheap bundling step, not the 11-minute build.
-      - name: Retry bundling once
-        if: startsWith(github.ref, 'refs/tags/') && steps.bundle.outcome == 'failure'
-        uses: tauri-apps/tauri-action@v0
+      - name: Build (macOS, dmg)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        working-directory: apps/readest-app
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/readest-app
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Read-EX ${{ github.ref_name }}'
-          releaseBody: |
-            Read-EX ${{ github.ref_name }} — desktop builds for Windows, macOS and Linux.
+        run: |
+          pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
-            **Sync backends:** Readest Cloud (optional), WebDAV, S3, Google Drive, OneDrive, iCloud (Apple platforms) and **OpenList**.
-
-            ### Install notes
-            - **Windows**: run the `.exe` installer. SmartScreen will warn about an unknown publisher — the build is unsigned.
-            - **macOS**: open the `.dmg`, drag to Applications. Unsigned builds need `xattr -dr com.apple.quarantine /Applications/Read-EX.app`, or right-click → Open.
-            - **Linux**: the `.AppImage` is portable (`chmod +x` then run); the `.deb` needs `libwebkit2gtk-4.1-0`.
-
-            Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
-          releaseDraft: ${{ github.event_name == 'push' && true || inputs.draft }}
-          prerelease: false
-          args: ${{ matrix.base-args }}
-
-      - name: Build only
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: tauri-apps/tauri-action@v0
+      - name: Build (Linux, deb)
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        working-directory: apps/readest-app
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/readest-app
-          args: ${{ matrix.base-args }}
+        run: |
+          pnpm tauri build --bundles ${{ matrix.bundles }}
 
       - name: Upload installers
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           if-no-files-found: error
           retention-days: 14
-          # `**` because the target dir moves under a <triple>/ subdir whenever
-          # --target is passed.
+          # One glob set for all three: `**` covers the <triple>/ level that
+          # appears whenever --target is passed, and empty patterns are simply
+          # not matched.
           path: |
-            target/**/bundle/nsis/*.exe
-            target/**/bundle/msi/*.msi
+            dist/*.zip
             target/**/bundle/dmg/*.dmg
-            target/**/bundle/macos/*.app
-            target/**/bundle/appimage/*.AppImage
             target/**/bundle/deb/*.deb
+            target/**/bundle/deb/*.sig
+
+  android:
+    name: read-ex-android
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore submodules
+        shell: bash
+        run: bash scripts/bootstrap-submodules.sh
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          sdkmanager --install "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "NDK_PATH=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: read-ex-android
+          save-if: always
+
+      - name: Install JS dependencies
+        run: |
+          pnpm install --frozen-lockfile || {
+            echo "::warning::lockfile drifted; resolving instead."
+            pnpm install --no-frozen-lockfile
+          }
+
+      - name: Stage vendored assets
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Configure build environment
+        shell: bash
+        working-directory: apps/readest-app
+        run: |
+          if [ -n "${{ vars.MICROSOFT_CLIENT_ID }}" ]; then
+            echo "NEXT_PUBLIC_MICROSOFT_CLIENT_ID=${{ vars.MICROSOFT_CLIENT_ID }}" >> .env.tauri
+          fi
+
+      # Generates src-tauri/gen/android. Uses the identifier from
+      # tauri.conf.json (com.readex.app) as the package name.
+      - name: Init Android project
+        working-directory: apps/readest-app
+        run: pnpm tauri android init --ci
+
+      # --debug: the release variant demands a signing config that only exists
+      # once real distribution keys do. A debug-signed APK installs and runs the
+      # production frontend bundle, which is what matters for a first release.
+      # No --apk flag in tauri 2: APK output is the default. Targets are limited
+      # to the two ABIs that cover phones actually in use, halving build time.
+      - name: Build APK
+        working-directory: apps/readest-app
+        run: pnpm tauri android build --debug --target aarch64 armv7
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-ex-android
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            target/**/apk/**/*.apk
+
+  release:
+    name: Attach to release
+    needs: [desktop, android]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected files
+        run: ls -lh dist
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: ${{ github.event_name == 'push' && true || inputs.draft }}
+          name: Read-EX ${{ github.ref_name }}
+          body: |
+            Read-EX ${{ github.ref_name }} — Windows, macOS, Linux and Android.
+
+            **Sync backends:** Readest Cloud (optional), WebDAV, S3, Google Drive, OneDrive, iCloud (Apple platforms) and **OpenList**.
+
+            ### Install notes
+            - **Windows** — unzip and run `Read-EX.exe`. No installer, no admin rights. Needs the Edge WebView2 runtime (preinstalled on Win10 1803+ / Win11).
+            - **macOS** — open the `.dmg`, drag to Applications. Unsigned: run `xattr -dr com.apple.quarantine /Applications/Read-EX.app` or right-click → Open.
+            - **Linux** — `sudo dpkg -i read-ex_*.deb` (needs `libwebkit2gtk-4.1-0`). Debian/Ubuntu only for now: the AppImage bundler depends on a download that fails on GitHub runners.
+            - **Android** — sideload the `.apk`. It is debug-signed, so enable "install unknown apps" for your file manager.
+
+            Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
+          files: dist/*
+          fail_on_unmatched_files: false

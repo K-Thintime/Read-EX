@@ -104,7 +104,7 @@ git push origin v0.1.0
 |---|---|---|---|
 | Secret | `TAURI_SIGNING_PRIVATE_KEY` | **已配置** | 本仓库已生成专属密钥对并写入 Secret；公钥已写进 `tauri.conf.json` 与 `constants.ts` |
 | Variable | `MICROSOFT_CLIENT_ID` | **待填** | Azure 应用的 client id；未填时 OneDrive 那一行在设置页里是灰的，其余功能不受影响 |
-| Secret | `APPLE_CERTIFICATE` / `_PASSWORD` / `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 可选 | 不加则产出未签名 dmg（用户需手动去隔离属性） |
+| Secret | `APPLE_CERTIFICATE` / `_PASSWORD` / `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 可选 | 默认**不**注入（空值会让 tauri 对着空证书跑 `security import`，整包失败）。要签名时先按 `tauri.macos-nonestore.conf.json` 加上 entitlements，再把这些变量加回 workflow 的 `env` |
 
 密钥已就位，除非要**换掉**它，否则不用再动：
 
