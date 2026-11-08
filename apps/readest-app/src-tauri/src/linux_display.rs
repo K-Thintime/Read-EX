@@ -5,9 +5,9 @@ pub fn check_display(display: Option<&OsStr>) -> Result<(), &'static str> {
         return Ok(());
     }
 
-    Err("Readest's Linux CEF runtime requires an X11 display, but DISPLAY is unset or empty. \
+    Err("Read-EX's Linux CEF runtime requires an X11 display, but DISPLAY is unset or empty. \
          On Wayland, enable XWayland; on Niri, install xwayland-satellite and restart your session. \
-         Launch Readest from that session so it inherits DISPLAY. \
+         Launch Read-EX from that session so it inherits DISPLAY. \
          Flatpak also needs access to the X11 socket. \
          See https://github.com/readest/readest#linux-fails-to-launch-on-wayland--niri")
 }

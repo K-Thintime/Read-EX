@@ -85,12 +85,6 @@ const TAURI_UPDATER_KEYS = new Set([
   'windows-aarch64',
 ]);
 
-// These strings come from shared upstream keys that hard-code the product name,
-// and all 34 locales translate it verbatim ("有新版本的 Readest 可更新！"). Swapping
-// the name at render time keeps every existing translation usable; renaming the
-// keys would drop all of them until each file is retranslated.
-const brand = (text: string) => text.replace(/Readest/g, 'Read-EX');
-
 export const UpdaterContent = ({
   latestVersion,
   lastVersion,
@@ -620,15 +614,13 @@ export const UpdaterContent = ({
           {checkUpdate ? (
             <div className='text-base-content grow text-sm'>
               <h2 className='mb-4 text-center font-bold sm:text-start'>
-                {brand(_('A new version of Readest is available!'))}
+                {_('A new version of Readest is available!')}
               </h2>
               <p className='mb-2'>
-                {brand(
-                  _('Readest {{newVersion}} is available (installed version {{currentVersion}}).', {
-                    newVersion,
-                    currentVersion,
-                  }),
-                )}
+                {_('Readest {{newVersion}} is available (installed version {{currentVersion}}).', {
+                  newVersion,
+                  currentVersion,
+                })}
               </p>
               <p className='mb-2'>{_('Download and install now?')}</p>
 
@@ -817,7 +809,7 @@ export const UpdaterWindow = () => {
     <Dialog
       id='updater_window'
       isOpen={isOpen}
-      title={checkUpdate ? _('Software Update') : brand(_("What's New in Readest"))}
+      title={checkUpdate ? _('Software Update') : _("What's New in Readest")}
       onClose={() => setIsOpen(false)}
       boxClassName='sm:w-[75%]! sm:h-auto sm:max-h-[85vh]! sm:max-w-2xl!'
     >

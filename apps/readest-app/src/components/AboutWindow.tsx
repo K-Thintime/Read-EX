@@ -109,7 +109,7 @@ export const AboutWindow = () => {
   // report (#5285), so tapping the label copies it. The label itself stays
   // localized; the copied string is locale-neutral and names the app first.
   const handleCopyVersion = async () => {
-    const copied = await writeTextToClipboard(`Readest ${getAppVersion()} (${browserInfo})`);
+    const copied = await writeTextToClipboard(`Read-EX ${getAppVersion()} (${browserInfo})`);
     if (!copied) return;
     eventDispatcher.dispatch('toast', {
       type: 'info',
@@ -134,7 +134,7 @@ export const AboutWindow = () => {
               <Image src='/icon.png' alt='App Logo' className='h-20 w-20' width={64} height={64} />
             </div>
             <div className='flex select-text flex-col items-center'>
-              <h2 className='mb-2 text-2xl font-bold'>Readest</h2>
+              <h2 className='mb-2 text-2xl font-bold'>Read-EX</h2>
               <button
                 type='button'
                 title={_('Copy')}

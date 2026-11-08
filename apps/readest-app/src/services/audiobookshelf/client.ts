@@ -346,7 +346,7 @@ export class ABSClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        deviceInfo: { clientName: 'Readest', deviceId: getDeviceId() },
+        deviceInfo: { clientName: 'Read-EX', deviceId: getDeviceId() },
         supportedMimeTypes: SUPPORTED_MIME_TYPES,
         mediaPlayer: 'html5',
       }),

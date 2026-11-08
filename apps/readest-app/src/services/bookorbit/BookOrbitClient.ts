@@ -53,7 +53,7 @@ export class BookOrbitClient {
   private deviceFields(): PluginDeviceFields {
     return {
       deviceId: this.config.deviceId,
-      deviceModel: (this.config.deviceName || 'Readest').slice(0, 100),
+      deviceModel: (this.config.deviceName || 'Read-EX').slice(0, 100),
       pluginVersion: `readest-${getAppVersion()}`.slice(0, 20),
       // Always the UTC frame — see formatKoDatetime; keys derived from
       // server-minted datetimes then agree across Readest devices.

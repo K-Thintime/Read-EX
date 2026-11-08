@@ -151,6 +151,32 @@ pnpm tauri signer generate -w ~/.tauri/readex.key   # 生成新的一对
 
 ---
 
+## 品牌名 Read-EX
+
+产品名在 34 个语言包里被逐词翻译成 "Readest"，因此改名没有去动文案 key，而是在
+`hooks/useTranslation.ts` 里对 `t()` 的返回值做一次替换。这样一处改动就能覆盖全部界面，
+也不会丢掉任何已有翻译。
+
+明确**保留** Readest 字样的地方：
+
+| 位置 | 原因 |
+|---|---|
+| `Readest Cloud` | readest.com 的托管服务名，改成 Read-EX Cloud 会让人以为有自建后端 |
+| `readest.com` / `readest://` | 小写标识符与深链协议，不参与替换 |
+| `DATA_SUBDIR = 'Readest'` | 本地数据子目录 |
+| `SYNC_BASE_DIR = 'Readest'` | 网盘上的同步根目录 |
+| `nodeAppService` 的 `APP_NAME` | 服务端模式的数据目录 |
+| 许可证/来源说明 | AGPL 归属 |
+
+其余用户可见处逐个改过：窗口标题（Rust 侧 `title()`）、关于页、剪藏浮层文案、
+引用卡片水印、离线页、PWA manifest / `apple-mobile-web-app-title`、LocalSend 与
+KOReader/BookOrbit/AudiobookShelf 的客户端标识、Discord RPC 按钮、Linux 启动报错。
+
+> 判断标准是「会不会影响数据」：只改显示名。目录名、协议、identifier 一律不动，
+> 否则现有书库、同步目录和配置会「消失」。
+
+---
+
 ## 自动更新
 
 三件事必须同时成立，少一件更新就是死的：
