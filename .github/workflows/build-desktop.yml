@@ -304,14 +304,31 @@ jobs:
         working-directory: apps/readest-app
         run: pnpm tauri android init --ci
 
+      # The wrapper downloads its own Gradle distribution on first run and
+      # services.gradle.org times out from the runners:
+      #   Downloading gradle-8.14.3-bin.zip failed: java.net.SocketTimeoutException
+      # The Tencent mirror serves the identical artefact and answers 200, so
+      # rewrite the URL inside the generated wrapper properties.
+      - name: Point Gradle wrapper at a reachable mirror
+        working-directory: apps/readest-app
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties';
+            let s = fs.readFileSync(p, 'utf8');
+            s = s.replace(/services\.gradle\.org\/distributions/g, 'mirrors.cloud.tencent.com/gradle');
+            fs.writeFileSync(p, s);
+            console.log(s.split('\n').find(l => l.startsWith('distributionUrl')));
+          "
+
       # --debug: the release variant demands a signing config that only exists
       # once real distribution keys do. A debug-signed APK installs and runs the
       # production frontend bundle, which is what matters for a first release.
-      # No --apk flag in tauri 2: APK output is the default. Targets are limited
-      # to the two ABIs that cover phones actually in use, halving build time.
+      # No --apk flag in tauri 2: APK output is the default. aarch64 covers
+      # every phone shipped in the last decade; armv7 can be added later.
       - name: Build APK
         working-directory: apps/readest-app
-        run: pnpm tauri android build --debug --target aarch64 armv7
+        run: pnpm tauri android build --debug --target aarch64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
