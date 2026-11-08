@@ -22,9 +22,9 @@ Read-EX 是 [readest/readest](https://github.com/readest/readest) 的一个 fork
 | `src/components/settings/integrations/OpenListForm.tsx` | **新增** OpenList 配置页（含目录浏览器） |
 | `src/components/settings/IntegrationsPanel.tsx` | 新增 OpenList 入口行与子页 |
 | `src/types/settings.ts`、`src/services/constants.ts` | `OpenListSettings` 与默认值 |
-| `src-tauri/tauri.conf.json` | `productName` → `Read-EX`，`identifier` → `com.readex.app`，更新器指向本仓库 |
-| `src-tauri/tauri.updater.conf.json` | **新增** 仅 CI 使用的更新签名叠加配置 |
-| `.github/workflows/build-desktop.yml` | **新增** 三平台打包工作流 |
+| `src-tauri/tauri.conf.json` | `productName` → `Read-EX`，`identifier` → `com.readex.app`，更新器公钥/地址指向本仓库，`createUpdaterArtifacts: true` |
+| `.github/workflows/build-desktop.yml` | **新增** 三平台打包工作流（并移除上游 13 条在 fork 里必然失败的流水线） |
+| `scripts/bootstrap-submodules.sh` | **新增** 从 `.gitmodules` 还原 8 个子模块，本地与 CI 共用 |
 
 ---
 
@@ -75,8 +75,19 @@ pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
 # 产物：../../target/x86_64-pc-windows-msvc/release/bundle/nsis/
 ```
 
-本地构建默认**不生成**更新签名包（`tauri.conf.json` 里 `createUpdaterArtifacts: false`），所以不需要签名私钥。
-CI 通过 `--config src-tauri/tauri.updater.conf.json` 叠加开启。
+`createUpdaterArtifacts` 是在 `tauri.conf.json` 里开启的，所以**本地构建也需要签名私钥**（仓库用的那把在 `~/.tauri/readex.key`）：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/readex.key)"
+```
+
+不想签名就先关掉这个开关，否则 `tauri build` 会在打包阶段直接报错找不到密钥：
+
+```bash
+node -e "const fs=require('fs'),p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p));j.bundle.createUpdaterArtifacts=false;fs.writeFileSync(p,JSON.stringify(j,null,2))"
+```
+
+> CI 里这一步是自动的（`Guard updater artifacts`）。**不要**试图用 `--config` 叠加配置：`tauri-action` 会把 `--config` 按仓库根解析，而 tauri CLI 按 `projectPath` 解析，两者永远对不上——第一版流水线就是这么挂的。
 
 ### CI（macOS / Linux 必须）
 
@@ -89,14 +100,19 @@ git push origin v0.1.0
 
 需要的仓库配置：
 
-| 类型 | 名称 | 必需 | 说明 |
+| 类型 | 名称 | 状态 | 说明 |
 |---|---|---|---|
-| Secret | `TAURI_SIGNING_PRIVATE_KEY` | 更新功能必需 | `pnpm tauri signer generate -w ~/.tauri/readex.key` 生成的私钥内容 |
-| Secret | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 同上 | 生成时设置的口令 |
-| Variable | `MICROSOFT_CLIENT_ID` | OneDrive 必需 | Azure 应用的 client id |
-| Secret | `APPLE_CERTIFICATE` / `_PASSWORD` / `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 可选 | 不加则产出未签名 dmg |
+| Secret | `TAURI_SIGNING_PRIVATE_KEY` | **已配置** | 本仓库已生成专属密钥对并写入 Secret；公钥已写进 `tauri.conf.json` 与 `constants.ts` |
+| Variable | `MICROSOFT_CLIENT_ID` | **待填** | Azure 应用的 client id；未填时 OneDrive 那一行在设置页里是灰的，其余功能不受影响 |
+| Secret | `APPLE_CERTIFICATE` / `_PASSWORD` / `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 可选 | 不加则产出未签名 dmg（用户需手动去隔离属性） |
 
-生成密钥后，**必须**把公钥写回 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`，并把 `endpoints` 里的 `OWNER` 换成你的 GitHub 用户名。否则自动更新会签名校验失败。
+密钥已就位，除非要**换掉**它，否则不用再动：
+
+```bash
+pnpm tauri signer generate -w ~/.tauri/readex.key   # 生成新的一对
+```
+
+换密钥后必须同时更新三处，否则自动更新静默失效：私钥 → 仓库 Secret，公钥 → `tauri.conf.json` 的 `plugins.updater.pubkey` 与 `src/services/constants.ts` 的 `READEST_UPDATER_PUBKEY`（两处必须一致）。
 
 ---
 
