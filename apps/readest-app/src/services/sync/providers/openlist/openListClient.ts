@@ -346,22 +346,27 @@ export class OpenListClient {
   async download(path: string, sign?: string): Promise<Response | null> {
     const query = sign ? `?sign=${encodeURIComponent(sign)}` : '';
     const url = `${this.baseUrl}/p${encodePath(path)}${query}`;
-    let res: Response;
-    try {
-      res = await this.fetchFn(url, { method: 'GET', headers: await this.authHeaders() });
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      throw new FileSyncError(`OpenList download failed: ${message}`, 'NETWORK');
+    for (let attempt = 0; ; attempt++) {
+      let res: Response;
+      try {
+        res = await this.fetchFn(url, { method: 'GET', headers: await this.authHeaders(attempt > 0) });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        throw new FileSyncError(`OpenList download failed: ${message}`, 'NETWORK');
+      }
+      if (res.status === HTTP_NOT_FOUND) return null;
+      // Same contract as `call` / `put`: one forced re-login rescues an expired
+      // token; a second 401 means the credentials themselves are wrong.
+      if (res.status === HTTP_UNAUTHORIZED && attempt === 0) continue;
+      if (!res.ok) {
+        throw new FileSyncError(
+          `OpenList download failed: HTTP ${res.status} for ${path}`,
+          res.status === HTTP_UNAUTHORIZED ? 'AUTH_FAILED' : 'NETWORK',
+          res.status,
+        );
+      }
+      return res;
     }
-    if (res.status === HTTP_NOT_FOUND) return null;
-    if (!res.ok) {
-      throw new FileSyncError(
-        `OpenList download failed: HTTP ${res.status} for ${path}`,
-        res.status === HTTP_UNAUTHORIZED ? 'AUTH_FAILED' : 'NETWORK',
-        res.status,
-      );
-    }
-    return res;
   }
 
   /** Absolute URL of the proxy download route, for the native streaming path. */
