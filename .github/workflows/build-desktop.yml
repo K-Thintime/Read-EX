@@ -246,14 +246,28 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # The runner image already ships a full Android SDK. setup-android first
+      # tries to upgrade cmdline-tools and then hangs on
+      # "Review licenses that have not been accepted (y/N)?" - with no stdin it
+      # exits 1 and kills the job. Driving sdkmanager directly with `yes` skips
+      # that dance entirely.
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK
+        shell: bash
         run: |
-          sdkmanager --install "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
-          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
-          echo "NDK_PATH=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | head -1)"
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          # `yes` gets SIGPIPE once sdkmanager stops reading; do not let that fail
+          # the step.
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "ndk;27.0.12077973" "platforms;android-35" "build-tools;35.0.0"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "NDK_PATH=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
