@@ -218,6 +218,45 @@ describe('updater', () => {
       expect(result).toBe(false);
     });
 
+    test('a tauri-updater failure on Windows falls back to the release API', async () => {
+      // Regression for the v0.1.2 symptom: latest.json has no `windows-x86_64`
+      // entry, the plugin throws, and the old code let that abort the whole
+      // check - manual checks showed "update check failed" and no prompt fired.
+      mockOsType.mockReturnValue('windows');
+      mockCheck.mockRejectedValue(new Error('no matching platform in the update manifest'));
+      mockTauriFetch.mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            tag_name: 'v2.0.0',
+            html_url: 'https://example.com/releases/tag/v2.0.0',
+            assets: [
+              { name: 'Read-EX_2.0.0_windows-x64.exe', browser_download_url: 'https://x/e.exe' },
+            ],
+          }),
+      });
+
+      const result = await checkForAppUpdates(dummyTranslate, false);
+
+      expect(result).toBe(true);
+      expect(mockSetUpdaterWindowVisible).toHaveBeenCalledWith(
+        true,
+        '2.0.0',
+        '1.0.0',
+        true,
+        undefined,
+        expect.objectContaining({ kind: 'windows-exe', assetUrl: 'https://x/e.exe' }),
+      );
+    });
+
+    test('a tauri-updater failure on Windows stays silent in auto mode', async () => {
+      mockOsType.mockReturnValue('windows');
+      mockCheck.mockRejectedValue(new Error('no matching platform'));
+      mockTauriFetch.mockResolvedValue({ ok: false, json: () => Promise.resolve({}) });
+
+      await expect(checkForAppUpdates(dummyTranslate, true)).resolves.toBe(false);
+    });
+
     test('handles linux platform', async () => {
       mockOsType.mockReturnValue('linux');
       mockCheck.mockResolvedValue({ version: '3.0.0' });

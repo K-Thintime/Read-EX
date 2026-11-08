@@ -352,8 +352,17 @@ export const checkForAppUpdates = async (
 
     if (['macos', 'windows', 'linux'].includes(OS_TYPE)) {
       // 1. The tauri updater: only knows about platforms whose bundle produced
-      //    a signed updater artifact (macOS dmg on this fork).
-      const update = await check();
+      //    a signed updater artifact (macOS dmg on this fork). On Windows the
+      //    manifest has no `windows-x86_64` entry and the plugin ERRORS instead
+      //    of answering null — swallowing that is what lets step 2 speak. Let
+      //    the error propagate and every manual check reports "update check
+      //    failed" while auto prompts never fire at all (v0.1.2 bug).
+      let update = null;
+      try {
+        update = await check();
+      } catch (err) {
+        console.warn('tauri updater check failed; falling back to the release API', err);
+      }
       if (update) {
         if (isUpdateIgnored(update.version)) return false;
         // Enum ScrollBarStyle is exported as type by tauri, so it cannot be used directly.
