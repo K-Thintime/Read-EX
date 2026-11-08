@@ -84,7 +84,6 @@ export const normalizeServerUrl = (raw: string | undefined): string => {
   return withScheme.replace(/\/+$/, '');
 };
 
-
 /** Percent-encode one path segment, keeping `/` separators literal. */
 const encodeSegment = (segment: string): string => encodeURIComponent(segment);
 
@@ -328,7 +327,14 @@ export class OpenListClient {
       ['As-Task', 'false'],
       ['Overwrite', 'true'],
     ]);
-    await upload(`${this.baseUrl}${API_PREFIX}/fs/put`, localPath, headers);
+    // The native command rejects with a bare string; wrap it so the sync engine
+    // can report WHY the upload failed instead of a generic transport error.
+    try {
+      await upload(`${this.baseUrl}${API_PREFIX}/fs/put`, localPath, headers);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw new FileSyncError(`OpenList upload failed: ${message}`, 'NETWORK');
+    }
   }
 
   /**

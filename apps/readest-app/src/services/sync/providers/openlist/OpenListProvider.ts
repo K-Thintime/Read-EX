@@ -230,6 +230,10 @@ class OpenListProviderImpl {
       return true;
     } catch (e) {
       console.warn('OpenListProvider.uploadStream failed', remotePath, e);
+      // A classified failure (bad credentials, missing path) must reach the
+      // engine with its message intact; only unclassified transport noise is
+      // reduced to the boolean "try the buffered path instead" contract.
+      if (e instanceof FileSyncError) throw e;
       return false;
     }
   }

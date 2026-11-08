@@ -1,6 +1,21 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { createProgressThrottle, webDownload, type ProgressPayload } from '@/utils/transfer';
+
+const mockInvoke = vi.fn();
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (...args: unknown[]) => mockInvoke(...args),
+  Channel: class {
+    onmessage: unknown;
+  },
+}));
+
+import {
+  createProgressThrottle,
+  tauriDownload,
+  tauriUpload,
+  webDownload,
+  type ProgressPayload,
+} from '@/utils/transfer';
 
 const buildResponse = (
   body: Uint8Array,
@@ -91,6 +106,56 @@ describe('webDownload', () => {
     globalThis.fetch = vi.fn(async () => buildResponse(bytes, null)) as unknown as typeof fetch;
     const result = await webDownload('https://example.test/file');
     expect(await result.blob.arrayBuffer()).toEqual(bytes.buffer);
+  });
+});
+
+describe('tauriUpload / tauriDownload header serialisation', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue('');
+    vi.stubGlobal('window', {
+      crypto: { getRandomValues: (a: Uint32Array) => (a[0] = 1) },
+    });
+  });
+
+  test('a Map of headers is flattened to a plain object before the IPC call', async () => {
+    // Regression: the Rust command takes HashMap<String,String>. A JS Map
+    // serialises to `{}` across IPC, so Authorization / File-Path /
+    // X-File-Size vanished and every OpenList upload failed.
+    await tauriUpload(
+      'https://openlist.test/api/fs/put',
+      '/tmp/book.epub',
+      'PUT',
+      undefined,
+      new Map([
+        ['Authorization', 'tk-1'],
+        ['File-Path', '/drive/Readest/book.epub'],
+        ['X-File-Size', '42'],
+      ]),
+    );
+
+    const [, payload] = mockInvoke.mock.calls[0]!;
+    expect(payload.headers).toEqual({
+      Authorization: 'tk-1',
+      'File-Path': '/drive/Readest/book.epub',
+      'X-File-Size': '42',
+    });
+    expect(payload.headers).not.toBeInstanceOf(Map);
+  });
+
+  test('a plain object is passed through untouched', async () => {
+    const headers = { Authorization: 'tk-2' };
+    await tauriDownload('https://openlist.test/p/x', '/tmp/x', undefined, headers);
+
+    const [, payload] = mockInvoke.mock.calls[0]!;
+    expect(payload.headers).toEqual(headers);
+  });
+
+  test('missing headers become an empty object, never undefined', async () => {
+    await tauriUpload('https://x/y', '/tmp/z', 'PUT');
+
+    const [, payload] = mockInvoke.mock.calls[0]!;
+    expect(payload.headers).toEqual({});
   });
 });
 

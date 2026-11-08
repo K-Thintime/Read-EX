@@ -393,18 +393,33 @@ export class FileSyncEngine {
         }
         await this.ensureDirs(dirs);
         let ok = false;
+        let lastError: unknown = null;
         try {
           ok = await this.provider.uploadStream(path, src.path);
         } catch (e) {
           // Authentication will not heal by retrying the same credentials.
           if (e instanceof FileSyncError && e.code === 'AUTH_FAILED') throw e;
+          lastError = e;
         }
         if (!ok) {
           // Mirror the buffered path's one-shot retry: a parent may have been
           // recreated mid-PUT (409). Re-ensure directories and try once more.
           await this.ensureDirs(dirs);
-          ok = await this.provider.uploadStream(path, src.path);
-          if (!ok) throw new FileSyncError('Streaming upload failed', 'NETWORK');
+          try {
+            ok = await this.provider.uploadStream(path, src.path);
+          } catch (e) {
+            if (e instanceof FileSyncError && e.code === 'AUTH_FAILED') throw e;
+            lastError = e;
+          }
+          if (!ok) {
+            // Carry the provider's own message: "Streaming upload failed" alone
+            // is unactionable from a phone, where there is no console to read.
+            const detail = lastError instanceof Error ? lastError.message : '';
+            throw new FileSyncError(
+              detail ? `Streaming upload failed: ${detail}` : 'Streaming upload failed',
+              'NETWORK',
+            );
+          }
         }
         return { uploaded: true };
       }

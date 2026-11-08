@@ -2,6 +2,21 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 
 export type UploadMethod = 'POST' | 'PUT';
 
+/**
+ * Headers accepted by the native transfer commands. The Rust side takes a
+ * `HashMap<String, String>`, i.e. a JSON object — a `Map` does NOT survive the
+ * IPC boundary (it serialises to `{}`), which silently drops Authorization /
+ * File-Path / X-File-Size and turns every upload into a 401 or a "missing
+ * path" error. Callers may pass either, and {@link toHeaderRecord} normalises.
+ */
+export type TransferHeaders = Map<string, string> | Record<string, string>;
+
+const toHeaderRecord = (headers?: TransferHeaders): Record<string, string> => {
+  if (!headers) return {};
+  if (headers instanceof Map) return Object.fromEntries(headers);
+  return headers;
+};
+
 export const enum UploadFileError {
   Unauthorized = 'Unauthorized access',
   DownloadFailed = 'File download failed',
@@ -173,7 +188,7 @@ export const tauriUpload = async (
   filePath: string,
   method: UploadMethod,
   progressHandler?: ProgressHandler,
-  headers?: Map<string, string>,
+  headers?: TransferHeaders,
 ): Promise<string> => {
   const ids = new Uint32Array(1);
   window.crypto.getRandomValues(ids);
@@ -189,7 +204,7 @@ export const tauriUpload = async (
     url,
     filePath,
     method,
-    headers: headers ?? {},
+    headers: toHeaderRecord(headers),
     onProgress,
   });
 };
@@ -198,7 +213,7 @@ export const tauriDownload = async (
   url: string,
   filePath: string,
   progressHandler?: ProgressHandler,
-  headers?: Record<string, string>,
+  headers?: TransferHeaders,
   body?: string,
   singleThreaded?: boolean,
   skipSslVerification?: boolean,
@@ -216,7 +231,7 @@ export const tauriDownload = async (
     id,
     url,
     filePath,
-    headers: headers ?? {},
+    headers: toHeaderRecord(headers),
     onProgress,
     body,
     singleThreaded,
