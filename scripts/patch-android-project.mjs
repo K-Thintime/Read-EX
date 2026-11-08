@@ -96,7 +96,7 @@ if (gradle.includes(strategies[0])) {
 const SIGNING_BLOCK = `
 // --- Read-EX release signing (added by scripts/patch-android-project.mjs) ---
 // No java.util.Properties here: inside a Gradle .kts script the implicit
-// receiver is Project, so the leading `java` in \`java.util.Properties\`
+// receiver is Project, so the leading 'java' in 'java.util.Properties'
 // resolves to the java extension and the script fails to compile with
 // "Unresolved reference: util". Parsing two keys by hand is the cheap way out.
 val readexPropsFile = rootProject.file("keystore.properties")
