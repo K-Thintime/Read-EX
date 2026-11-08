@@ -1,0 +1,606 @@
+// @vitest-environment node
+import { describe, it, expect } from 'vitest';
+import {
+  transformBookNoteToDB,
+  transformBookNoteFromDB,
+  transformBookConfigToDB,
+  transformBookConfigFromDB,
+  transformBookToDB,
+  transformBookFromDB,
+} from '@/utils/transform';
+import { BookConfig, BookNote, Book } from '@/types/book';
+import { DBBookConfig, DBBookNote } from '@/types/records';
+
+describe('transformBookNoteToDB with handwriting', () => {
+  const ink: BookNote = {
+    bookHash: 'abc123',
+    id: 'ink-1',
+    type: 'ink',
+    cfi: 'epubcfi(/6/4!/4/2,/1:0,/1:5)',
+    text: 'marked words',
+    note: '',
+    ink: [
+      {
+        id: 's1',
+        color: '#facc15',
+        width: 0.03,
+        tool: 'marker',
+        anchor: 'epubcfi(/6/4!/4/2,/1:0,/1:5)',
+        shape: 'flow',
+        points: [
+          [0.1, 0.5, 0.42],
+          [0.9, 0.5],
+        ],
+      },
+    ],
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+  };
+
+  it('carries the strokes in the ink column, both ways', () => {
+    const db = transformBookNoteToDB(ink, 'user1');
+    expect(db.ink).toEqual(ink.ink);
+    expect(transformBookNoteFromDB(db).ink).toEqual(ink.ink);
+  });
+
+  it('leaves the ink column alone for other notes', () => {
+    const db = transformBookNoteToDB({ ...ink, type: 'annotation', ink: undefined }, 'user1');
+    // An absent key is not sent, so an upsert never clears stored strokes.
+    expect('ink' in JSON.parse(JSON.stringify(db))).toBe(false);
+    expect(transformBookNoteFromDB({ ...db, ink: null }).ink).toBeUndefined();
+  });
+
+  it('pulls a row without strokes without a key that would wipe local strokes', () => {
+    // A server whose database predates the column returns no ink; merging the
+    // pulled note over the local one must keep the local strokes.
+    const { ink: _ink, ...row } = transformBookNoteToDB(ink, 'user1');
+    const pulled = transformBookNoteFromDB(row);
+    expect('ink' in pulled).toBe(false);
+    expect({ ...ink, ...pulled }.ink).toEqual(ink.ink);
+  });
+});
+
+describe('transformBookNoteToDB with a CrossPoint anchor', () => {
+  const highlight: BookNote = {
+    bookHash: 'abc123',
+    id: 'k3j9x0a',
+    type: 'annotation',
+    cfi: 'epubcfi(/6/4!/4/2,/1:0,/1:5)',
+    text: 'words',
+    note: '',
+    crosspoint: { spine: 1, start_offset: 10, end_offset: 15, pages: 19 },
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+  };
+
+  it('carries the anchor in the crosspoint column, both ways', () => {
+    const db = transformBookNoteToDB(highlight, 'user1');
+    expect(db.crosspoint).toEqual(highlight.crosspoint);
+    expect(transformBookNoteFromDB(db).crosspoint).toEqual(highlight.crosspoint);
+  });
+
+  it('never sends or pulls a key that would clear an anchor', () => {
+    const db = transformBookNoteToDB({ ...highlight, crosspoint: undefined }, 'user1');
+    expect('crosspoint' in JSON.parse(JSON.stringify(db))).toBe(false);
+    const pulled = transformBookNoteFromDB({ ...db, crosspoint: null });
+    expect('crosspoint' in pulled).toBe(false);
+    expect({ ...highlight, ...pulled }.crosspoint).toEqual(highlight.crosspoint);
+  });
+
+  it('sends anchors cleared by a moved range as null, so the server forgets them', () => {
+    const moved = { ...highlight, xpointer0: null, xpointer1: null, crosspoint: null };
+    const db = JSON.parse(JSON.stringify(transformBookNoteToDB(moved, 'user1')));
+    expect(db).toMatchObject({ xpointer0: null, xpointer1: null, crosspoint: null });
+  });
+});
+
+describe('transformBookNoteToDB with xpointer fields', () => {
+  it('round-trips the reserved Notebook type and Markdown content', () => {
+    const note: BookNote = {
+      bookHash: 'abc123',
+      id: 'notebook',
+      type: 'notebook',
+      cfi: 'epubcfi(/6/2!/4/2/1:0)',
+      xpointer0: '/body/DocFragment[1]/body/p[1]/text().0',
+      note: '# Reading notes\n\nA useful idea.',
+      createdAt: 1700000000000,
+      updatedAt: 1700000001000,
+    };
+
+    const db = transformBookNoteToDB(note, 'user1');
+    const roundTrip = transformBookNoteFromDB(db);
+
+    expect(roundTrip).toMatchObject({
+      id: 'notebook',
+      type: 'notebook',
+      cfi: note.cfi,
+      xpointer0: note.xpointer0,
+      note: note.note,
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt,
+    });
+  });
+
+  it('passes through xpointer0 and xpointer1', () => {
+    const note: BookNote = {
+      bookHash: 'abc123',
+      metaHash: 'meta456',
+      id: 'note1',
+      type: 'annotation',
+      cfi: 'epubcfi(/6/4!/4/2/1:0)',
+      xpointer0: '/body/DocFragment[2]/body/div[1]/p[1]/text().0',
+      xpointer1: '/body/DocFragment[2]/body/div[1]/p[1]/text().50',
+      text: 'highlighted text',
+      note: 'my note',
+      style: 'highlight',
+      color: 'yellow',
+      createdAt: 1700000000000,
+      updatedAt: 1700000001000,
+    };
+
+    const dbNote = transformBookNoteToDB(note, 'user1');
+
+    expect(dbNote.xpointer0).toBe('/body/DocFragment[2]/body/div[1]/p[1]/text().0');
+    expect(dbNote.xpointer1).toBe('/body/DocFragment[2]/body/div[1]/p[1]/text().50');
+    expect(dbNote.cfi).toBe('epubcfi(/6/4!/4/2/1:0)');
+  });
+
+  it('handles missing xpointer fields (Readest-only note)', () => {
+    const note: BookNote = {
+      bookHash: 'abc123',
+      id: 'note2',
+      type: 'annotation',
+      cfi: 'epubcfi(/6/4!/4/2/1:0)',
+      text: 'text',
+      note: '',
+      createdAt: 1700000000000,
+      updatedAt: 1700000001000,
+    };
+
+    const dbNote = transformBookNoteToDB(note, 'user1');
+
+    expect(dbNote.xpointer0).toBeUndefined();
+    expect(dbNote.xpointer1).toBeUndefined();
+    expect(dbNote.cfi).toBe('epubcfi(/6/4!/4/2/1:0)');
+  });
+});
+
+describe('transformBookNoteFromDB with xpointer fields', () => {
+  it('reads xpointer0 and xpointer1 from DB', () => {
+    const dbNote: DBBookNote = {
+      user_id: 'user1',
+      book_hash: 'abc123',
+      meta_hash: 'meta456',
+      id: 'note1',
+      type: 'annotation',
+      cfi: 'epubcfi(/6/4!/4/2/1:0)',
+      xpointer0: '/body/DocFragment[2]/body/div[1]/p[1]/text().0',
+      xpointer1: '/body/DocFragment[2]/body/div[1]/p[1]/text().50',
+      text: 'highlighted text',
+      note: 'my note',
+      style: 'highlight',
+      color: 'yellow',
+      created_at: '2023-11-14T22:13:20.000Z',
+      updated_at: '2023-11-14T22:13:21.000Z',
+    };
+
+    const note = transformBookNoteFromDB(dbNote);
+
+    expect(note.xpointer0).toBe('/body/DocFragment[2]/body/div[1]/p[1]/text().0');
+    expect(note.xpointer1).toBe('/body/DocFragment[2]/body/div[1]/p[1]/text().50');
+    expect(note.cfi).toBe('epubcfi(/6/4!/4/2/1:0)');
+  });
+
+  it('handles missing xpointer fields from DB', () => {
+    const dbNote: DBBookNote = {
+      user_id: 'user1',
+      book_hash: 'abc123',
+      id: 'note2',
+      type: 'annotation',
+      cfi: 'epubcfi(/6/4!/4/2/1:0)',
+      note: '',
+      created_at: '2023-11-14T22:13:20.000Z',
+      updated_at: '2023-11-14T22:13:21.000Z',
+    };
+
+    const note = transformBookNoteFromDB(dbNote);
+
+    expect(note.xpointer0).toBeUndefined();
+    expect(note.xpointer1).toBeUndefined();
+  });
+
+  it('defaults cfi to empty string when missing from DB (KOReader note)', () => {
+    const dbNote: DBBookNote = {
+      user_id: 'user1',
+      book_hash: 'abc123',
+      id: 'note3',
+      type: 'annotation',
+      xpointer0: '/body/DocFragment[1]/body/p[1]/text().0',
+      xpointer1: '/body/DocFragment[1]/body/p[1]/text().20',
+      note: '',
+      created_at: '2023-11-14T22:13:20.000Z',
+      updated_at: '2023-11-14T22:13:21.000Z',
+    };
+
+    const note = transformBookNoteFromDB(dbNote);
+
+    expect(note.cfi).toBe('');
+    expect(note.xpointer0).toBe('/body/DocFragment[1]/body/p[1]/text().0');
+    expect(note.xpointer1).toBe('/body/DocFragment[1]/body/p[1]/text().20');
+  });
+});
+
+describe('transformBookNote with global flag', () => {
+  const baseNote: BookNote = {
+    bookHash: 'abc123',
+    id: 'note-g',
+    type: 'annotation',
+    cfi: 'epubcfi(/6/4!/4/2/1:0)',
+    text: 'highlighted text',
+    note: '',
+    style: 'highlight',
+    color: 'yellow',
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+  };
+
+  it('passes through global=true when serializing to DB', () => {
+    const note: BookNote = { ...baseNote, global: true };
+    const dbNote = transformBookNoteToDB(note, 'user1');
+    expect(dbNote.global).toBe(true);
+  });
+
+  it('passes through global=false when serializing to DB', () => {
+    const note: BookNote = { ...baseNote, global: false };
+    const dbNote = transformBookNoteToDB(note, 'user1');
+    expect(dbNote.global).toBe(false);
+  });
+
+  it('omits global when undefined (legacy notes)', () => {
+    const dbNote = transformBookNoteToDB(baseNote, 'user1');
+    expect(dbNote.global).toBeUndefined();
+  });
+
+  it('reads global=true from DB', () => {
+    const dbNote: DBBookNote = {
+      user_id: 'user1',
+      book_hash: 'abc123',
+      id: 'note-g',
+      type: 'annotation',
+      cfi: 'epubcfi(/6/4!/4/2/1:0)',
+      text: 'highlighted text',
+      note: '',
+      global: true,
+      created_at: '2023-11-14T22:13:20.000Z',
+      updated_at: '2023-11-14T22:13:21.000Z',
+    };
+    const note = transformBookNoteFromDB(dbNote);
+    expect(note.global).toBe(true);
+  });
+
+  it('leaves global undefined when missing from DB', () => {
+    const dbNote: DBBookNote = {
+      user_id: 'user1',
+      book_hash: 'abc123',
+      id: 'note-g',
+      type: 'annotation',
+      cfi: 'epubcfi(/6/4!/4/2/1:0)',
+      text: 'highlighted text',
+      note: '',
+      created_at: '2023-11-14T22:13:20.000Z',
+      updated_at: '2023-11-14T22:13:21.000Z',
+    };
+    const note = transformBookNoteFromDB(dbNote);
+    expect(note.global).toBeUndefined();
+  });
+
+  it('round-trips global=true through DB transform', () => {
+    const note: BookNote = { ...baseNote, global: true };
+    const db = transformBookNoteToDB(note, 'user1');
+    const dbRecord: DBBookNote = {
+      ...db,
+      created_at: new Date(note.createdAt).toISOString(),
+      updated_at: new Date(note.updatedAt).toISOString(),
+    };
+    const restored = transformBookNoteFromDB(dbRecord);
+    expect(restored.global).toBe(true);
+  });
+
+  // Regression: an old client that has not been updated to know about
+  // `global` will receive a note with global=true from the server, then
+  // upsert the same row back during a later sync. The legacy client only
+  // copies fields it knows about, so its outgoing payload omits `global`.
+  // We simulate that here by stripping `global` from the round-tripped
+  // BookNote and re-serializing — the resulting DB payload also omits the
+  // column, and the server-side merge therefore preserves the existing
+  // global=true value (the column is left untouched on UPDATE).
+  it('legacy client round-trip does not actively clear global (column omitted)', () => {
+    const note: BookNote = { ...baseNote, global: true };
+    const dbFromUpdated = transformBookNoteToDB(note, 'user1');
+    const dbRecord: DBBookNote = {
+      ...dbFromUpdated,
+      created_at: new Date(note.createdAt).toISOString(),
+      updated_at: new Date(note.updatedAt).toISOString(),
+    };
+    const restored = transformBookNoteFromDB(dbRecord);
+
+    // Simulate a legacy client: it doesn't know about `global`, so the
+    // field is dropped from the in-memory note before it gets sent back.
+    const legacyOutgoing: BookNote = { ...restored };
+    delete (legacyOutgoing as { global?: boolean }).global;
+
+    const legacyDb = transformBookNoteToDB(legacyOutgoing, 'user1');
+    expect(legacyDb.global).toBeUndefined();
+    // The destructure-spread inside transformBookNoteToDB assigns
+    // global=undefined as an own property, but JSON.stringify drops keys
+    // whose value is undefined. So the wire payload sent to Supabase has
+    // no `global` column, and the server-side merge preserves whatever is
+    // already stored — which is exactly what we want for legacy clients.
+    expect(Object.hasOwn(legacyDb, 'global')).toBe(true);
+    expect(JSON.parse(JSON.stringify(legacyDb))).not.toHaveProperty('global');
+  });
+});
+
+describe('transformBookConfigToDB / transformBookConfigFromDB rsvpPosition', () => {
+  const baseConfig: BookConfig = {
+    bookHash: 'hash1',
+    updatedAt: 1700000000000,
+  };
+
+  it('serializes rsvpPosition to JSON string in DB record', () => {
+    const config: BookConfig = {
+      ...baseConfig,
+      rsvpPosition: { cfi: 'epubcfi(/6/4!/4/2/1:0)', wordText: 'hello' },
+    };
+    const db = transformBookConfigToDB(config, 'user1');
+    expect(db.rsvp_position).toBe(
+      JSON.stringify({ cfi: 'epubcfi(/6/4!/4/2/1:0)', wordText: 'hello' }),
+    );
+  });
+
+  it('omits rsvp_position when rsvpPosition is undefined', () => {
+    const db = transformBookConfigToDB(baseConfig, 'user1');
+    expect(db.rsvp_position).toBeUndefined();
+  });
+
+  it('deserializes rsvp_position from DB record', () => {
+    const dbConfig: DBBookConfig = {
+      user_id: 'user1',
+      book_hash: 'hash1',
+      rsvp_position: JSON.stringify({ cfi: 'epubcfi(/6/4!/4/2/1:0)', wordText: 'hello' }),
+      updated_at: '2023-11-14T22:13:20.000Z',
+    };
+    const config = transformBookConfigFromDB(dbConfig);
+    expect(config.rsvpPosition).toEqual({ cfi: 'epubcfi(/6/4!/4/2/1:0)', wordText: 'hello' });
+  });
+
+  it('leaves rsvpPosition undefined when rsvp_position is absent from DB', () => {
+    const dbConfig: DBBookConfig = {
+      user_id: 'user1',
+      book_hash: 'hash1',
+      updated_at: '2023-11-14T22:13:20.000Z',
+    };
+    const config = transformBookConfigFromDB(dbConfig);
+    expect(config.rsvpPosition).toBeUndefined();
+  });
+
+  it('round-trips rsvpPosition through DB transform', () => {
+    const config: BookConfig = {
+      ...baseConfig,
+      rsvpPosition: { cfi: 'epubcfi(/6/8!/4/2/3:5)', wordText: 'world' },
+    };
+    const db = transformBookConfigToDB(config, 'user1');
+    // Simulate what DB returns (updated_at as ISO string)
+    const dbRecord: DBBookConfig = { ...db, updated_at: new Date(config.updatedAt).toISOString() };
+    const restored = transformBookConfigFromDB(dbRecord);
+    expect(restored.rsvpPosition).toEqual(config.rsvpPosition);
+  });
+});
+
+describe('transformBook readingStatus + readingStatusUpdatedAt', () => {
+  const userId = 'user-1';
+  const baseBook: Book = {
+    hash: 'h1',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('serializes abandoned status + timestamp to ISO in the DB record', () => {
+    const ts = Date.UTC(2026, 5, 18, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, readingStatus: 'abandoned', readingStatusUpdatedAt: ts },
+      userId,
+    );
+    expect(db.reading_status).toBe('abandoned');
+    expect(db.reading_status_updated_at).toBe(new Date(ts).toISOString());
+  });
+
+  it('leaves reading_status_updated_at null when unset', () => {
+    const db = transformBookToDB({ ...baseBook, readingStatus: 'finished' }, userId);
+    expect(db.reading_status_updated_at).toBeNull();
+  });
+
+  it('round-trips abandoned + timestamp back to the client shape', () => {
+    const ts = Date.UTC(2026, 5, 18, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, readingStatus: 'abandoned', readingStatusUpdatedAt: ts },
+      userId,
+    );
+    const back = transformBookFromDB(db);
+    expect(back.readingStatus).toBe('abandoned');
+    expect(back.readingStatusUpdatedAt).toBe(ts);
+  });
+
+  it('reads undefined readingStatusUpdatedAt when the DB column is null', () => {
+    const back = transformBookFromDB({
+      user_id: userId,
+      book_hash: 'h1',
+      format: 'EPUB',
+      title: 'T',
+      author: 'A',
+      reading_status: 'finished',
+      reading_status_updated_at: null,
+      created_at: new Date(1).toISOString(),
+      updated_at: new Date(2).toISOString(),
+    });
+    expect(back.readingStatusUpdatedAt).toBeUndefined();
+  });
+});
+
+describe('transformBook coverHash + coverUpdatedAt (issue #4544)', () => {
+  const userId = 'user-1';
+  const baseBook: Book = {
+    hash: 'h1',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('serializes coverHash verbatim and coverUpdatedAt to ISO', () => {
+    const ts = Date.UTC(2026, 5, 22, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, coverHash: 'abcdef0123456789', coverUpdatedAt: ts },
+      userId,
+    );
+    expect(db.cover_hash).toBe('abcdef0123456789');
+    expect(db.cover_updated_at).toBe(new Date(ts).toISOString());
+  });
+
+  it('leaves cover columns null when unset', () => {
+    const db = transformBookToDB(baseBook, userId);
+    expect(db.cover_hash).toBeNull();
+    expect(db.cover_updated_at).toBeNull();
+  });
+
+  it('round-trips coverHash + coverUpdatedAt back to the client shape', () => {
+    const ts = Date.UTC(2026, 5, 22, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, coverHash: 'deadbeef', coverUpdatedAt: ts },
+      userId,
+    );
+    const back = transformBookFromDB(db);
+    expect(back.coverHash).toBe('deadbeef');
+    expect(back.coverUpdatedAt).toBe(ts);
+  });
+
+  it('reads null cover fields when the DB columns are null', () => {
+    const back = transformBookFromDB({
+      user_id: userId,
+      book_hash: 'h1',
+      format: 'EPUB',
+      title: 'T',
+      author: 'A',
+      cover_hash: null,
+      cover_updated_at: null,
+      created_at: new Date(1).toISOString(),
+      updated_at: new Date(2).toISOString(),
+    });
+    expect(back.coverHash).toBeNull();
+    expect(back.coverUpdatedAt).toBeNull();
+  });
+});
+
+describe('transformBook metadataUpdatedAt (issue #5438)', () => {
+  const userId = 'user-1';
+  const baseBook: Book = {
+    hash: 'h1',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('round-trips metadataUpdatedAt through the DB shape', () => {
+    const ts = Date.UTC(2026, 7, 1, 12, 0, 0);
+    const db = transformBookToDB({ ...baseBook, metadataUpdatedAt: ts }, userId);
+    expect(db.metadata_updated_at).toBe(new Date(ts).toISOString());
+    const back = transformBookFromDB(db);
+    expect(back.metadataUpdatedAt).toBe(ts);
+  });
+
+  it('leaves the column null when unset (legacy rows)', () => {
+    const db = transformBookToDB(baseBook, userId);
+    expect(db.metadata_updated_at).toBeNull();
+    const back = transformBookFromDB(db);
+    expect(back.metadataUpdatedAt).toBeNull();
+  });
+});
+
+describe('book original filename', () => {
+  const book: Book = {
+    hash: 'h',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    originalFilename: '原書 (original edition).epub',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('round-trips the original import filename through the DB record', () => {
+    const db = transformBookToDB(book, 'u');
+    expect(db).toMatchObject({ original_filename: book.originalFilename });
+    expect(transformBookFromDB(db).originalFilename).toBe(book.originalFilename);
+  });
+
+  it('omits the outgoing column when no original filename is known', () => {
+    const db = transformBookToDB({ ...book, originalFilename: undefined }, 'u');
+    expect(JSON.parse(JSON.stringify(db))).not.toHaveProperty('original_filename');
+  });
+
+  it.each([undefined, null])('keeps the local filename when the DB value is %s', (value) => {
+    const row = transformBookToDB(book, 'u');
+    const pulled = transformBookFromDB({ ...row, original_filename: value });
+    expect(pulled).not.toHaveProperty('originalFilename');
+    expect({ ...book, ...pulled }.originalFilename).toBe(book.originalFilename);
+  });
+});
+
+describe('book page count', () => {
+  const book: Book = {
+    hash: 'h',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('pushes the import-time page count so peers get it without the file', () => {
+    expect(transformBookToDB({ ...book, pageCount: 212 }, 'u').page_count).toBe(212);
+    expect(transformBookToDB(book, 'u').page_count).toBeNull();
+  });
+
+  it('pulls the page count, and leaves the key off a row without one', () => {
+    const row = transformBookToDB(book, 'u');
+    expect(transformBookFromDB({ ...row, page_count: 212 }).pageCount).toBe(212);
+    // A key holding undefined would wipe the local count in the pull merge's
+    // `{ ...local, ...remote }` spread.
+    expect('pageCount' in transformBookFromDB({ ...row, page_count: null })).toBe(false);
+  });
+});
+
+describe('book config read-aloud packs', () => {
+  it('round-trips the packs each destination holds', () => {
+    const config = {
+      bookHash: 'h',
+      updatedAt: 1,
+      ttsPacks: { readest: ['3-a.mp3'], webdav: [] },
+    } as BookConfig;
+    const db = transformBookConfigToDB(config, 'u');
+    expect(transformBookConfigFromDB(db).ttsPacks).toEqual({ readest: ['3-a.mp3'], webdav: [] });
+  });
+
+  it('sends no column when the config never recorded packs', () => {
+    // Only a book with Read Aloud history writes the new column.
+    const db = transformBookConfigToDB({ bookHash: 'h', updatedAt: 1 } as BookConfig, 'u');
+    expect('tts_packs' in db).toBe(false);
+    expect(transformBookConfigFromDB(db).ttsPacks).toBeUndefined();
+  });
+});

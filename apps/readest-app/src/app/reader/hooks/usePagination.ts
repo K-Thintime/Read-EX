@@ -1,0 +1,767 @@
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useEnv } from '@/context/EnvContext';
+import { FoliateView } from '@/types/view';
+import { ViewSettings } from '@/types/book';
+import { useReaderStore } from '@/store/readerStore';
+import { useBookDataStore } from '@/store/bookDataStore';
+import { useDeviceControlStore } from '@/store/deviceStore';
+import { useSettingsStore } from '@/store/settingsStore';
+import { useSidebarStore } from '@/store/sidebarStore';
+import { eventDispatcher } from '@/utils/event';
+import {
+  resolvePageTurn,
+  normalizeDomKeyEvent,
+  isPencilNativeKey,
+  KeyCandidate,
+} from '@/utils/keybinding';
+import { getCachedEinkRefreshSupported, refreshEinkScreen } from '@/utils/bridge';
+import { isTauriAppPlatform } from '@/services/environment';
+import { tauriGetWindowLogicalPosition } from '@/utils/window';
+import { getReadingRulerMoveDirection } from '../utils/readingRuler';
+import { isPageOverflowing } from '../utils/pageOverflow';
+import { isDragPastPanEdge } from '../utils/turnGestureArena';
+import { hasReaderOverlay, subscribeReaderOverlays } from '../utils/readerOverlay';
+import { useTouchInterceptor } from './useTouchInterceptor';
+
+export type ScrollSource = 'touch' | 'mouse';
+
+type PaginationSide = 'left' | 'right' | 'up' | 'down';
+type PaginationMode = 'pan' | 'page' | 'section';
+
+const swapLeftRight = (side: PaginationSide) => {
+  if (side === 'left') return 'right';
+  if (side === 'right') return 'left';
+  return side;
+};
+
+const isPanningView = (view: FoliateView | null, viewSettings: ViewSettings | null | undefined) => {
+  if (!view || !viewSettings) return false;
+  return (
+    view.book.rendition?.layout === 'pre-paginated' &&
+    (viewSettings.zoomLevel > 100 || viewSettings.zoomMode !== 'fit-page')
+  );
+};
+
+const hasHorizontalPanning = (
+  view: FoliateView | null,
+  viewSettings: ViewSettings | null | undefined,
+) => {
+  if (!view || !viewSettings) return false;
+  return isPanningView(view, viewSettings) && view.isOverflowX();
+};
+
+// Zoom a fixed-layout page and keep the saved setting in step, as a pinch does.
+export const setFixedLayoutZoom = (bookKey: string, view: FoliateView, zoomLevel: number) => {
+  const { getViewSettings, setViewSettings } = useReaderStore.getState();
+  const viewSettings = getViewSettings(bookKey);
+  if (!viewSettings || viewSettings.zoomLevel === zoomLevel) return;
+  view.renderer.setAttribute('scale-factor', zoomLevel);
+  viewSettings.zoomLevel = zoomLevel;
+  setViewSettings(bookKey, viewSettings);
+};
+
+export const hasVerticalPanning = (
+  view: FoliateView | null,
+  viewSettings: ViewSettings | null | undefined,
+) => {
+  if (!view || !viewSettings) return false;
+  return isPanningView(view, viewSettings) && view.isOverflowY();
+};
+
+// In scrolled mode, snap the page-scroll distance to whole lines so the new view
+// tiles cleanly: forward, the new view's top aligns to the first line that wasn't
+// fully visible (so no already-shown line repeats and lines aren't cut at the top);
+// backward, the new view's bottom aligns to the last such line. `distance` is a
+// positive scroll amount. Falls back to `distance` if the geometry is unavailable.
+const snapScrolledDistanceToLines = (
+  view: FoliateView,
+  distance: number,
+  forward: boolean,
+): number => {
+  try {
+    const visible = view.renderer.getContents().find((c) => {
+      const f = c.doc?.defaultView?.frameElement?.getBoundingClientRect();
+      return !!f && f.bottom > 1 && f.top < window.innerHeight;
+    });
+    const frameEl = visible?.doc?.defaultView?.frameElement as HTMLElement | undefined;
+    if (!visible || !frameEl) return distance;
+    let container: Element | null = frameEl;
+    while (container && container.id !== 'container') container = container.parentElement;
+    if (!(container instanceof HTMLElement)) return distance;
+
+    const cRect = container.getBoundingClientRect();
+    const frameRect = frameEl.getBoundingClientRect();
+    const size = cRect.height;
+    const scrollTop = container.scrollTop;
+
+    const range = visible.doc.createRange();
+    range.selectNodeContents(visible.doc.body);
+    const rects = Array.from(range.getClientRects()).filter((r) => r.width > 2 && r.height > 2);
+    if (rects.length < 2) return distance;
+    const heights = rects.map((r) => r.height).sort((a, b) => a - b);
+    const maxLineHeight = (heights[Math.floor(heights.length / 2)] ?? 0) * 1.8;
+
+    // Line boxes in content (scroll) coordinates, sorted top-to-bottom (skip
+    // block/container boxes that are much taller than a line).
+    const toContent = (localY: number) => localY + frameRect.top - cRect.top + scrollTop;
+    const lines = rects
+      .filter((r) => r.height <= maxLineHeight)
+      .map((r) => ({ top: toContent(r.top), bottom: toContent(r.bottom) }))
+      .sort((a, b) => a.top - b.top);
+
+    let snapped: number;
+    if (forward) {
+      // First line not fully visible at the bottom -> it becomes the new view's top.
+      const bottomEdge = scrollTop + size;
+      const next = lines.find((l) => l.bottom > bottomEdge + 1);
+      if (!next) return distance;
+      snapped = next.top - scrollTop;
+    } else {
+      // Last line not fully visible at the top -> it becomes the new view's bottom.
+      const topEdge = scrollTop;
+      let prev: { top: number; bottom: number } | undefined;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i]!.top < topEdge - 1) {
+          prev = lines[i]!;
+          break;
+        }
+      }
+      if (!prev) return distance;
+      snapped = scrollTop + size - prev.bottom;
+    }
+    // Guard against degenerate snaps; keep within roughly one page.
+    return snapped > size * 0.4 && snapped < size * 1.6 ? snapped : distance;
+  } catch {
+    return distance;
+  }
+};
+
+// Page turns since the last deep full refresh, per open view. Keyed by the
+// FoliateView so the count is scoped to the book and dropped when it closes.
+// Drives the automatic e-ink refresh that fires every `einkAutoRefreshInterval`
+// pages — the only ghosting-cleanup path usable on readers without spare buttons.
+const einkPageTurnsSinceRefresh = new WeakMap<FoliateView, number>();
+
+const resetEinkRefreshCounter = (view: FoliateView | null) => {
+  if (view) einkPageTurnsSinceRefresh.set(view, 0);
+};
+
+const noteEinkPageTurn = (
+  view: FoliateView,
+  viewSettings: ViewSettings,
+  navigation: Promise<void>,
+) => {
+  const interval = viewSettings.einkAutoRefreshInterval;
+  if (!viewSettings.isEink || !interval || interval <= 0) return;
+  // Skip only when the startup capability probe authoritatively settled false
+  // (the interval can reach a non-e-ink device via synced per-book config, so
+  // the bridge call there is a guaranteed no-op). `null` (probe not yet run)
+  // keeps going. Deliberately NOT latched on refresh outcomes: { success:false }
+  // also comes back for transient conditions on a fully supported device
+  // (detached window, zero-sized view, one-off vendor exception), so a single
+  // miss must not permanently disable auto-refresh or hide the user's option.
+  if (getCachedEinkRefreshSupported() === false) return;
+  // Counts page turns routed through viewPagination: tap/click zones, wheel,
+  // volume keys, hardware page-turner keys, and the on-screen nav buttons. Not
+  // counted (they call view.next/prev or renderer.next/prev directly, bypassing
+  // this path): PageUp/PageDown and Shift+Arrow selection-extension shortcuts,
+  // the footer prev/next buttons, section jumps, the native swipe the paginator
+  // commits on its own, and the hands-free turners — auto page turn (corner
+  // dwell), TTS page-follow, and auto-scroll's section hop. So auto full
+  // refresh tracks manual turns only; a hands-free session won't trigger it.
+  // Intentionally no start/end boundary skip either: renderer.atEnd / atStart
+  // are section-page based, so on fixed-layout / one-page-per-section books
+  // they read true on nearly every real turn and would starve the counter. A
+  // no-op turn that cannot move just refreshes on schedule with nothing
+  // changed — the lesser cost versus never refreshing.
+  const turns = (einkPageTurnsSinceRefresh.get(view) ?? 0) + 1;
+  if (turns >= interval) {
+    resetEinkRefreshCounter(view);
+    // Fire only after the turn settles: the native hook deep-refreshes whatever
+    // is on the panel right now, so refreshing before view.next/prev commits
+    // would flash the outgoing page while the incoming one lands as an ordinary
+    // update and keeps its ghosting. Both fulfill and reject re-surface the
+    // current frame — a turn that cannot move (atStart/atEnd) should still clear
+    // on schedule rather than silently skip a cycle.
+    // No platform gate here (unlike the manual binding): the interval is set
+    // only on Android but a synced per-book config can carry it elsewhere, and
+    // off-Android the bridge rejects — swallowed here as an intentional no-op.
+    // A resolved { success: false } is only reachable on a supported device whose
+    // vendor hook failed at refresh time, so it's a real 'advertised but not
+    // refreshing' case worth a field log; a rejection (off-Android) stays silent.
+    const refresh = () =>
+      refreshEinkScreen()
+        .then((result) => {
+          if (!result.success) console.debug('auto e-ink full refresh no-op:', result.error);
+        })
+        .catch(() => {});
+    navigation.then(refresh, refresh);
+  } else {
+    einkPageTurnsSinceRefresh.set(view, turns);
+  }
+};
+
+export const viewPagination = (
+  view: FoliateView | null,
+  viewSettings: ViewSettings | null | undefined,
+  side: PaginationSide,
+  mode: PaginationMode = 'page',
+  panDistance: number = 50,
+) => {
+  if (!view || !viewSettings) return;
+  const renderer = view.renderer;
+  if (viewSettings.rtl) {
+    side = swapLeftRight(side);
+  }
+  if (renderer.scrolled) {
+    // `renderer.size` is already the visible content height: in scrolled mode the
+    // scroll container is inset by the header/footer (parent padding), so `size`
+    // shrinks when they're shown. Subtracting their heights again here would
+    // double-count and make consecutive views overlap.
+    const { size } = renderer;
+    const isFixedLayout = view.book.rendition?.layout === 'pre-paginated';
+    // Overlap is a fixed-layout (PDF) setting: reflowable turns snap to whole
+    // lines below, which already keeps the cut line on the next view.
+    const scrollingOverlap = isFixedLayout ? viewSettings.scrollingOverlap : 0;
+    const distance = size - scrollingOverlap;
+    switch (mode) {
+      case 'section':
+        if (side === 'left' || side === 'up') {
+          return view.renderer.prevSection?.();
+        } else {
+          return view.renderer.nextSection?.();
+        }
+      case 'pan':
+      case 'page':
+      default: {
+        const forward = !(side === 'left' || side === 'up');
+        // Snap so the view's bottom edge lands between lines (not for vertical flow).
+        const snapped =
+          viewSettings.vertical ||
+          (viewSettings.scrolledDirection === 'horizontal' && isFixedLayout)
+            ? distance
+            : snapScrolledDistanceToLines(view, distance, forward);
+        // In scrolled mode 'pan' and 'page' both advance a full viewport (the
+        // caller's panDistance is ignored here; short pans only exist on the
+        // non-scrolled panning path below, which deliberately does not count).
+        // So every scrolled turn reaching here is one page — counting all of
+        // them keeps "Every N pages" at N viewports.
+        const navigation = forward ? view.next(snapped) : view.prev(snapped);
+        noteEinkPageTurn(view, viewSettings, navigation);
+        return navigation;
+      }
+    }
+  } else if (mode === 'pan' && isPanningView(view, viewSettings)) {
+    if (hasHorizontalPanning(view, viewSettings) && (side === 'left' || side === 'right')) {
+      return view.pan(side === 'left' ? -panDistance : panDistance, 0);
+    } else if (hasVerticalPanning(view, viewSettings) && (side === 'up' || side === 'down')) {
+      return view.pan(0, side === 'up' ? -panDistance : panDistance);
+    } else {
+      const navigation = side === 'left' || side === 'up' ? view.prev() : view.next();
+      noteEinkPageTurn(view, viewSettings, navigation);
+      return navigation;
+    }
+  } else {
+    switch (mode) {
+      case 'section':
+        if (side === 'left' || side === 'up') {
+          return view.renderer.prevSection?.();
+        } else {
+          return view.renderer.nextSection?.();
+        }
+      case 'pan':
+      case 'page':
+      default: {
+        const navigation = side === 'left' || side === 'up' ? view.prev() : view.next();
+        noteEinkPageTurn(view, viewSettings, navigation);
+        return navigation;
+      }
+    }
+  }
+};
+
+export const usePagination = (
+  bookKey: string,
+  viewRef: React.RefObject<FoliateView | null>,
+  containerRef: React.RefObject<HTMLDivElement | null>,
+) => {
+  const { appService } = useEnv();
+  const { getBookData } = useBookDataStore();
+  const { getViewSettings, getViewState } = useReaderStore();
+  const { hoveredBookKey, setHoveredBookKey } = useReaderStore();
+  const {
+    acquireVolumeKeyInterception,
+    releaseVolumeKeyInterception,
+    acquirePageTurnerKeyInterception,
+    releasePageTurnerKeyInterception,
+    ensureKeyForwarding,
+  } = useDeviceControlStore();
+  // Reactive subscription: drives the effect dependency array below. The
+  // handlers themselves re-read via getState() to avoid stale closures.
+  const hardwarePageTurner = useSettingsStore((s) => s.settings.hardwarePageTurner);
+  const isSettingsDialogOpen = useSettingsStore((s) => s.isSettingsDialogOpen);
+  const overlayOpen = useSyncExternalStore(subscribeReaderOverlays, hasReaderOverlay, () => false);
+  const readerControlsOpen = !!hoveredBookKey || isSettingsDialogOpen || overlayOpen;
+  // While this book's TTS is actively playing, the volume keys must control the
+  // system volume instead of flipping pages (#4691). A paused or stopped session
+  // hands them back to the page-flip interception. Safe on iOS because the
+  // native interception never reconfigures the audio session while native TTS
+  // owns it (a .mixWithOthers flip there would vacate the Now Playing slot).
+  const [ttsPlaying, setTtsPlaying] = useState(false);
+  // handlePageFlip is registered once (see the effect below), so it can't read
+  // the ttsPlaying state directly without going stale. This ref mirrors it for
+  // the volume-key page-flip guard.
+  const ttsPlayingRef = useRef(false);
+
+  const handlePageFlip = async (
+    msg: MessageEvent | CustomEvent | React.MouseEvent<HTMLDivElement, MouseEvent>,
+  ) => {
+    const viewState = getViewState(bookKey);
+    const bookData = getBookData(bookKey);
+    if (!viewState?.inited || !bookData) return;
+
+    const dispatchReadingRulerMove = (side: PaginationSide) => {
+      return eventDispatcher.dispatchSync('reading-ruler-move', {
+        bookKey,
+        direction: getReadingRulerMoveDirection(side, viewRef.current?.book.dir),
+      });
+    };
+
+    if (msg instanceof MessageEvent) {
+      if (msg.data && msg.data.bookKey === bookKey) {
+        const viewSettings = getViewSettings(bookKey)!;
+        if (msg.data.type === 'iframe-single-click') {
+          const viewElement = containerRef.current;
+          if (viewElement) {
+            const { screenX } = msg.data;
+            const viewRect = viewElement.getBoundingClientRect();
+            let windowStartX;
+            // Currently for tauri APP the window.screenX is always 0
+            if (isTauriAppPlatform()) {
+              if (appService?.isMobile) {
+                windowStartX = 0;
+              } else {
+                const windowPosition = (await tauriGetWindowLogicalPosition()) as {
+                  x: number;
+                  y: number;
+                };
+                windowStartX = windowPosition.x;
+              }
+            } else {
+              windowStartX = window.screenX;
+            }
+            // A page-filling image or table in a two-page spread fills only its
+            // column, so the zones are measured on that column; the spread's
+            // own center falls on the gutter (#6745).
+            const columnCount =
+              msg.data.media && !bookData.isFixedLayout && !viewSettings.vertical
+                ? (viewRef.current?.renderer.columnCount ?? 1)
+                : 1;
+            const zoneWidth = viewRect.width / columnCount;
+            const viewStartX = windowStartX + viewRect.left;
+            const column = Math.floor((screenX - viewStartX) / zoneWidth);
+            const zoneStartX =
+              viewStartX + Math.max(0, Math.min(column, columnCount - 1)) * zoneWidth;
+            const zoneCenterX = zoneStartX + zoneWidth / 2;
+            const consumed = eventDispatcher.dispatchSync('iframe-single-click', {
+              bookKey,
+              windowX: msg.data.windowX,
+              windowY: msg.data.windowY,
+            });
+            if (!consumed) {
+              const centerStartX = zoneStartX + zoneWidth * 0.375;
+              const centerEndX = zoneStartX + zoneWidth * 0.625;
+              if (
+                viewSettings.disableClick! ||
+                (screenX >= centerStartX && screenX <= centerEndX)
+              ) {
+                // A page-filling image/table leaves nowhere else to tap for
+                // its viewer, so the center opens it (#6424). Only media
+                // from the reader's own handlers, which post from this window.
+                // A fixed-layout page that runs past the viewport hides its
+                // title, the other way to the toolbar, so the center keeps the
+                // toolbar (#6866).
+                const titleHidden =
+                  bookData.isFixedLayout &&
+                  !viewSettings.vertical &&
+                  !!viewRef.current &&
+                  isPageOverflowing(viewRef.current.renderer);
+                if (msg.data.media && msg.source === window && !titleHidden) {
+                  window.postMessage(
+                    { type: 'iframe-open-media', bookKey, ...msg.data.media },
+                    '*',
+                  );
+                  return;
+                }
+                // toggle visibility of the header bar and the footer bar
+                setHoveredBookKey(hoveredBookKey ? null : bookKey);
+                return;
+              }
+
+              if (hoveredBookKey) {
+                setHoveredBookKey(null);
+                return;
+              }
+
+              const side: PaginationSide =
+                screenX >= zoneCenterX
+                  ? viewSettings.fullscreenClickArea
+                    ? 'down'
+                    : viewSettings.swapClickArea
+                      ? 'left'
+                      : 'right'
+                  : viewSettings.fullscreenClickArea
+                    ? 'down'
+                    : viewSettings.swapClickArea
+                      ? 'right'
+                      : 'left';
+
+              if (viewSettings.readingRulerEnabled && dispatchReadingRulerMove(side)) {
+                return;
+              }
+
+              viewPagination(viewRef.current, viewSettings, side);
+            }
+          }
+        } else if (msg.data.type === 'iframe-wheel' && !viewSettings.scrolled) {
+          // The wheel event is handled by the iframe itself in scrolled mode.
+          // A panning page (fit-width or zoomed PDF) scrolls natively; a
+          // vertical wheel only gets here once it sits at its top or bottom
+          // edge (see useMouseEvent), and then turns the page the way it
+          // scrolls, so reverse paging doesn't apply and sideways only pans.
+          const panning = isPanningView(viewRef.current, viewSettings);
+          const { deltaX } = msg.data;
+          const reverse = !panning && useSettingsStore.getState().settings.reverseWheelPaging;
+          const deltaY = reverse ? -msg.data.deltaY : msg.data.deltaY;
+          if (deltaY > 0) {
+            viewPagination(viewRef.current, viewSettings, 'down');
+          } else if (deltaY < 0) {
+            viewPagination(viewRef.current, viewSettings, 'up');
+          } else if (panning) {
+            return;
+          } else if (deltaX < 0) {
+            viewPagination(viewRef.current, viewSettings, 'left');
+          } else if (deltaX > 0) {
+            viewPagination(viewRef.current, viewSettings, 'right');
+          }
+        } else if (msg.data.type === 'iframe-mouseup') {
+          if (msg.data.button === 3) {
+            viewRef.current?.history.back();
+          } else if (msg.data.button === 4) {
+            viewRef.current?.history.forward();
+          }
+        }
+      }
+    } else if (msg instanceof CustomEvent) {
+      const viewSettings = getViewSettings(bookKey);
+      // Native volume events can still arrive after interception is released.
+      // Read current controls state here: this listener is registered once.
+      if (
+        msg.type === 'native-key-down' &&
+        viewSettings?.volumeKeysToFlip &&
+        !ttsPlayingRef.current &&
+        !useReaderStore.getState().hoveredBookKey &&
+        !useSettingsStore.getState().isSettingsDialogOpen &&
+        !hasReaderOverlay()
+      ) {
+        const { keyName } = msg.detail;
+        setHoveredBookKey('');
+        if (
+          viewSettings.paragraphMode?.enabled &&
+          (keyName === 'VolumeUp' || keyName === 'VolumeDown')
+        ) {
+          eventDispatcher.dispatch(keyName === 'VolumeUp' ? 'paragraph-prev' : 'paragraph-next', {
+            bookKey,
+          });
+          return;
+        }
+        if (keyName === 'VolumeUp') {
+          if (viewSettings.readingRulerEnabled && dispatchReadingRulerMove('up')) {
+            return;
+          }
+          viewPagination(viewRef.current, viewSettings, 'up');
+        } else if (keyName === 'VolumeDown') {
+          if (viewSettings.readingRulerEnabled && dispatchReadingRulerMove('down')) {
+            return;
+          }
+          viewPagination(viewRef.current, viewSettings, 'down');
+        }
+      }
+    } else {
+      if (msg.type === 'click') {
+        const { clientX } = msg;
+        // A click beside the page lands here, outside the page iframes. Like a
+        // click on the page, it dismisses the selection toolbar first instead
+        // of turning the page under it (#6958).
+        if (
+          eventDispatcher.dispatchSync('iframe-single-click', {
+            bookKey,
+            windowX: clientX,
+            windowY: msg.clientY,
+          })
+        ) {
+          return;
+        }
+        const width = window.innerWidth;
+        const leftThreshold = width * 0.5;
+        const rightThreshold = width * 0.5;
+        const viewSettings = getViewSettings(bookKey);
+        if (!viewSettings?.disableClick) {
+          if (clientX < leftThreshold) {
+            viewPagination(viewRef.current, viewSettings, 'left');
+          } else if (clientX > rightThreshold) {
+            viewPagination(viewRef.current, viewSettings, 'right');
+          }
+        }
+      }
+    }
+  };
+
+  // Hardware page turner: media keys arrive via the `native-key-down`
+  // event; D-pad / keyboard keys arrive either as a top-window `keydown`
+  // or — when focus is inside a book iframe — as an `iframe-keydown`
+  // postMessage (mirroring useShortcuts' unified window + iframe handling).
+  // All resolve through the shared binding registry. Suppressed while the
+  // toolbar is visible so D-pad keys keep driving toolbar spatial navigation.
+  const handleHardwarePageTurn = (candidate: KeyCandidate, execute = true): boolean => {
+    if (document.querySelector('[data-shortcut-recording="true"]')) return false;
+    const settings = useSettingsStore.getState().settings.hardwarePageTurner;
+    if (!settings?.enabled) return false;
+    if (useReaderStore.getState().hoveredBookKey) return false;
+
+    // Only the active book (the one driving the sidebar) responds, so a
+    // single key press doesn't flip every book open in a parallel view.
+    if (useSidebarStore.getState().sideBarBookKey !== bookKey) return false;
+
+    const viewState = getViewState(bookKey);
+    if (!viewState?.inited) return false;
+
+    const action = resolvePageTurn(settings, candidate);
+    if (!action) return false;
+    // Auto-repeat must still claim a configured chord so browser defaults
+    // (for example Ctrl+End) remain suppressed, but must not turn again.
+    if (!execute) return true;
+
+    // E-ink full screen refresh (Android only) — clears ghosting without
+    // turning the page. The native bridge no-ops on non-e-ink hardware.
+    if (action === 'refresh') {
+      // On a device the capability probe authoritatively ruled out, don't claim
+      // the key at all: refreshEinkScreen would no-op yet still swallow the
+      // button, and the "Refresh Page" row is hidden there, so a stale binding
+      // could no longer be cleared from the UI. Returning false lets the key fall
+      // through to its normal behavior, making the stale binding inert. Unsettled
+      // (null) still claims the chord so a transient probe gap mid-read can't leak
+      // the key.
+      if (getCachedEinkRefreshSupported() === false) return false;
+      if (appService?.isAndroidApp) {
+        refreshEinkScreen().catch(() => {});
+        resetEinkRefreshCounter(viewRef.current);
+      }
+      return true;
+    }
+
+    const viewSettings = getViewSettings(bookKey);
+    const side = action === 'pagePrev' || action === 'sectionPrev' ? 'up' : 'down';
+    const mode = action === 'sectionPrev' || action === 'sectionNext' ? 'section' : 'page';
+    setHoveredBookKey('');
+    if (
+      mode === 'page' &&
+      viewSettings?.readingRulerEnabled &&
+      eventDispatcher.dispatchSync('reading-ruler-move', {
+        bookKey,
+        direction: getReadingRulerMoveDirection(side, viewRef.current?.book.dir),
+      })
+    ) {
+      return true;
+    }
+    viewPagination(viewRef.current, viewSettings, side, mode);
+    return true;
+  };
+
+  const handleHardwareNativeKey = (msg: CustomEvent) => {
+    const keyName = msg.detail?.keyName;
+    if (typeof keyName !== 'string') return;
+    handleHardwarePageTurn({ source: 'native', id: keyName });
+  };
+
+  const handleHardwareIframeKey = (msg: CustomEvent): boolean => {
+    const detail = msg.detail as { bookKey?: string; event?: KeyboardEvent } | undefined;
+    const event = detail?.event;
+    if (detail?.bookKey !== bookKey || !event) return false;
+    const target = event.target as HTMLElement | null;
+    if (
+      target?.isContentEditable ||
+      /^(INPUT|TEXTAREA|SELECT)$/.test(target?.tagName ?? '') ||
+      (/^(A|BUTTON)$/.test(target?.tagName ?? '') && (event.key === 'Enter' || event.key === ' '))
+    ) {
+      return false;
+    }
+    return handleHardwarePageTurn(normalizeDomKeyEvent(event), !event.repeat);
+  };
+
+  const handleHardwareDomKey = (event: KeyboardEvent | MessageEvent) => {
+    let candidate: KeyCandidate;
+    let execute = true;
+    if (event instanceof KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target?.tagName ?? '')) {
+        return;
+      }
+      candidate = normalizeDomKeyEvent(event);
+      execute = !event.repeat;
+    } else if (event.data?.type === 'iframe-keydown' && event.data.bookKey === bookKey) {
+      if (event.data.handled || event.data.interactiveTarget || event.data.repeat) return;
+      const id = event.data.code || event.data.key;
+      if (typeof id !== 'string' || !id) return;
+      candidate = normalizeDomKeyEvent(event.data);
+    } else {
+      return;
+    }
+
+    if (handleHardwarePageTurn(candidate, execute)) {
+      // Stop `useShortcuts` from also paging on this key — capture-phase
+      // for the window keydown, registration order for the iframe message.
+      if (event instanceof KeyboardEvent) event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  };
+
+  useEffect(() => {
+    if (!appService?.isMobileApp) return;
+
+    eventDispatcher.on('native-key-down', handlePageFlip);
+    return () => {
+      eventDispatcher.off('native-key-down', handlePageFlip);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Track this book's TTS playback so volume-key interception can step aside
+  // while audio is playing (#4691).
+  useEffect(() => {
+    const handlePlaybackState = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { bookKey?: string; state?: string };
+      if (detail?.bookKey !== bookKey) return;
+      const playing = detail.state === 'playing';
+      ttsPlayingRef.current = playing;
+      setTtsPlaying(playing);
+    };
+    eventDispatcher.on('tts-playback-state', handlePlaybackState);
+    return () => {
+      eventDispatcher.off('tts-playback-state', handlePlaybackState);
+    };
+  }, [bookKey]);
+
+  // Volume-key page-flip interception (mobile only). Acquired only while the
+  // setting is on, controls are hidden and TTS is idle; release on re-run/unmount
+  // keeps the reference count balanced.
+  const volumeKeysToFlip = !!getViewSettings(bookKey)?.volumeKeysToFlip;
+  useEffect(() => {
+    if (!appService?.isMobileApp) return;
+    if (!volumeKeysToFlip || ttsPlaying || readerControlsOpen) return;
+
+    acquireVolumeKeyInterception();
+    return () => {
+      releaseVolumeKeyInterception();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [volumeKeysToFlip, ttsPlaying, readerControlsOpen]);
+
+  // Hardware page turner: native-key + DOM-key listeners and native
+  // media-key interception, re-evaluated whenever the setting changes.
+  // Pencil gestures are forwarded unconditionally by the iOS bridge, so they
+  // only need the JS forwarding handler — acquiring media-key interception
+  // for them would claim MPRemoteCommandCenter next/prev-track and drag the
+  // app into the Now Playing eligibility rules (#4691).
+  useEffect(() => {
+    const bindings = hardwarePageTurner?.bindings;
+    const nativeBindings = [
+      bindings?.pagePrev,
+      bindings?.pageNext,
+      bindings?.sectionPrev,
+      bindings?.sectionNext,
+      bindings?.refresh,
+    ].filter((b) => b?.source === 'native');
+    const hasNativeBinding = nativeBindings.length > 0;
+    const hasMediaKeyBinding = nativeBindings.some((b) => b && !isPencilNativeKey(b.id));
+    const needsNativeInterception =
+      !!appService?.isMobileApp && !!hardwarePageTurner?.enabled && hasMediaKeyBinding;
+
+    if (needsNativeInterception) {
+      acquirePageTurnerKeyInterception();
+    }
+    if (hasNativeBinding) {
+      if (appService?.isMobileApp) ensureKeyForwarding();
+      eventDispatcher.on('native-key-down', handleHardwareNativeKey);
+    }
+    eventDispatcher.onSync('iframe-page-turn-keydown', handleHardwareIframeKey);
+    window.addEventListener('keydown', handleHardwareDomKey, true);
+    window.addEventListener('message', handleHardwareDomKey);
+
+    return () => {
+      if (needsNativeInterception) {
+        releasePageTurnerKeyInterception();
+      }
+      if (hasNativeBinding) {
+        eventDispatcher.off('native-key-down', handleHardwareNativeKey);
+      }
+      eventDispatcher.offSync('iframe-page-turn-keydown', handleHardwareIframeKey);
+      window.removeEventListener('keydown', handleHardwareDomKey, true);
+      window.removeEventListener('message', handleHardwareDomKey);
+    };
+    // The media-vs-pencil decision depends on binding ids, not just sources,
+    // and every persist creates a fresh settings object — key the effect on
+    // object identity. Re-running acquire/release on any change is safe
+    // because interception is reference-counted.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hardwarePageTurner]);
+
+  // Horizontal pan of a zoomed page when the current touch began (see below);
+  // undefined when this interceptor did not see the touch start.
+  const swipeStartPanXRef = useRef<number | null | undefined>(undefined);
+
+  // Touch swipe page flip for fixed-layout books — registered as a touch interceptor
+  // so it participates in the priority-based consumption chain.
+  useTouchInterceptor(
+    `swipe-flip-${bookKey}`,
+    (bk, detail) => {
+      if (bk !== bookKey) return false;
+      if (detail.phase === 'start') {
+        swipeStartPanXRef.current = viewRef.current?.renderer.panX ?? null;
+        return false;
+      }
+      if (detail.phase !== 'end') return false;
+      const startPanX = swipeStartPanXRef.current;
+      swipeStartPanXRef.current = undefined;
+      const bookData = getBookData(bookKey);
+      const viewSettings = getViewSettings(bookKey);
+      if (!bookData?.isFixedLayout || viewSettings?.scrolled) return false;
+      if (viewSettings?.disableSwipe) return false;
+
+      const { deltaX, deltaY, deltaT } = detail;
+      // A zoomed page pans under a drag, unless it is pulled past its edge.
+      const panning = isPanningView(viewRef.current, viewSettings);
+      if (panning) {
+        if (startPanX === undefined || !isDragPastPanEdge(startPanX, deltaX)) return false;
+      }
+      const vx = Math.abs(deltaX / (deltaT || 1));
+      if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 30 && vx > 0.2) {
+        // Like Photos, the page turned to opens at 100% zoom. A swipe at the
+        // book's first or last page turns nowhere and keeps the zoom.
+        const view = viewRef.current;
+        const forward = viewSettings?.rtl ? deltaX > 0 : deltaX < 0;
+        if (panning && view && !(forward ? view.renderer.atEnd : view.renderer.atStart)) {
+          setFixedLayoutZoom(bookKey, view, 100);
+        }
+        viewPagination(viewRef.current, viewSettings, deltaX > 0 ? 'left' : 'right');
+        return true;
+      }
+      return false;
+    },
+    0,
+  );
+
+  return {
+    handlePageFlip,
+  };
+};

@@ -1,0 +1,2985 @@
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { RiDeleteBinLine } from 'react-icons/ri';
+
+import * as CFI from 'foliate-js/epubcfi.js';
+import { useEnv } from '@/context/EnvContext';
+import {
+  BookNote,
+  BooknoteGroup,
+  HighlightColor,
+  HighlightStyle,
+  NoteExportFormat,
+} from '@/types/book';
+import { FoliateView, NOTE_PREFIX } from '@/types/view';
+import { NativeTouchEventType } from '@/types/system';
+import { getLocale, getOSPlatform, makeSafeFilename, uniqueId } from '@/utils/misc';
+import { useThemeStore } from '@/store/themeStore';
+import { useBookDataStore } from '@/store/bookDataStore';
+import { getBookProgress, useBookProgress } from '@/store/readerProgressStore';
+import { useSettingsStore } from '@/store/settingsStore';
+import { useReaderStore } from '@/store/readerStore';
+import { useNotebookStore } from '@/store/notebookStore';
+import { useSidebarStore } from '@/store/sidebarStore';
+import { useCustomDictionaryStore } from '@/store/customDictionaryStore';
+import { isSystemDictionaryEnabled } from '@/services/dictionaries/registry';
+import { invokeSystemDictionary } from '@/services/dictionaries/systemDictionary';
+import { buildSelectionContext } from '@/services/dictionaries/contextDictionary';
+import type { DictionarySelectionContext } from '@/services/dictionaries/types';
+import { useTranslation } from '@/hooks/useTranslation';
+import { useResponsiveSize } from '@/hooks/useResponsiveSize';
+import { useDeviceControlStore } from '@/store/deviceStore';
+import { useFoliateEvents } from '../../hooks/useFoliateEvents';
+import { useRendererInputListeners } from '../../hooks/useRendererInputListeners';
+import { useBookOrbitNotesSync } from '../../hooks/useBookOrbitNotesSync';
+import { useGrimmoryNotesSync } from '../../hooks/useGrimmoryNotesSync';
+import { useNotesSync } from '../../hooks/useNotesSync';
+import { useReadwiseSync } from '../../hooks/useReadwiseSync';
+import { useHardcoverSync } from '../../hooks/useHardcoverSync';
+import { usePageboundSync } from '../../hooks/usePageboundSync';
+import { useNotionSync } from '../../hooks/useNotionSync';
+import { useObsidianSync } from '../../hooks/useObsidianSync';
+import { useTextSelector } from '../../hooks/useTextSelector';
+import { useSaveBooknoteNoteText } from '../../hooks/useSaveBooknoteNoteText';
+import { placeToolbar, Point, Position, Rect, TextSelection } from '@/utils/sel';
+import {
+  getPopupPosition,
+  getPosition,
+  getRangeRectInWebview,
+  getRangeTextStyleInWebview,
+  getTextFromRange,
+  getRenderedRunsFromRange,
+} from '@/utils/sel';
+import { getPopupBounds, offsetPosition } from '@/utils/insets';
+import { eventDispatcher } from '@/utils/event';
+import { findTocItemBS } from '@/services/nav';
+import { throttle } from '@/utils/throttle';
+import {
+  beginGesture,
+  createDeferredActionState,
+  flushDeferredAction,
+  isLongPressHold,
+  runOrDeferAction,
+} from '../../utils/deferredAction';
+import { Insets } from '@/types/misc';
+import { runSimpleCC } from '@/utils/simplecc';
+import { getWordCount, isSingleLookupTerm } from '@/utils/word';
+import { getIndexFromCfi } from '@/utils/cfi';
+import { writeTextToClipboard } from '@/utils/clipboard';
+import { AnnotationLinkType, buildAnnotationUrl } from '@/utils/deeplink';
+import { DEFAULT_NOTE_EXPORT_CONFIG } from '@/services/constants';
+import { canShareText, shareSelectedText } from '@/utils/share';
+import {
+  getToolbarToolTypes,
+  shouldShowHighlightOptions,
+  supportsProofread,
+} from '@/utils/annotationToolbar';
+import { AnnotationToolType } from '@/types/annotator';
+import { TransformContext } from '@/services/transformers/types';
+import { transformContent } from '@/services/transformService';
+import {
+  buildTTSSentenceHighlight,
+  drawAnnotationOverlay,
+  mergeRestyledAnnotation,
+  removeBookNoteOverlays,
+  removeEmptyAnnotationPlaceholder,
+  resolveAnnotationClick,
+} from '../../utils/annotatorUtil';
+import { buildAnnotationIndex, selectLocationAnnotations } from '../../utils/annotationIndex';
+import { findContentAtPoint } from '../../utils/crossDocSelection';
+import {
+  expandAllRenderedSections,
+  expandGlobalAnnotation,
+  removeGlobalAnnotationOverlays,
+} from '../../utils/globalAnnotations';
+import { annotationToolButtons } from './AnnotationTools';
+import AnnotationRangeEditor from './AnnotationRangeEditor';
+import PageTurnHint from './PageTurnHint';
+import SelectionRangeEditor from './SelectionRangeEditor';
+import AnnotationPopup from './AnnotationPopup';
+import DictionaryPopup from './DictionaryPopup';
+import type { VocabularyCapture } from './DictionaryResultsView';
+import { vocabularyLang } from '@/services/vocabulary/entry';
+import { sentenceAt } from '@/services/vocabulary/sentence';
+import DictionarySheet from './DictionarySheet';
+import NoteEditorSheet from './NoteEditorSheet';
+import TranslatorPopup from './TranslatorPopup';
+import useShortcuts from '@/hooks/useShortcuts';
+import ProofreadPopup from './ProofreadPopup';
+import { setProofreadRulesVisibility } from '@/app/reader/components/ProofreadRules';
+import ExportMarkdownDialog from './ExportMarkdownDialog';
+import QuoteCardDialog from './QuoteCardDialog';
+import type { QuoteCardColors, QuoteCardFont } from '@/utils/quoteCard';
+import { getFontFamilies } from '@/utils/style';
+import type { QuoteCardContent } from '@/utils/quoteCardRenderer';
+import ImportAnnotationsDialog from './ImportAnnotationsDialog';
+import Alert from '@/components/Alert';
+import ModalPortal from '@/components/ModalPortal';
+import { SelectedFile, useFileSelector } from '@/hooks/useFileSelector';
+import { parseMrexpt } from '@/utils/mrexpt';
+import { nextBooknoteStamp } from '@/utils/booknoteStamp';
+import {
+  convertMrexptEntriesToBookNotes,
+  mergeImportedBookNotes,
+} from '@/services/annotation/providers/mrexpt';
+import {
+  convertAnnotationExportToBookNotes,
+  parseAnnotationExport,
+} from '@/services/annotation/providers/readest';
+import {
+  extractReadEraLibrary,
+  findReadEraDocByFileMd5,
+  findReadEraDocForBook,
+  getReadEraFileMd5,
+  parseReadEraBackup,
+} from '@/utils/readera';
+import { convertReadEraDocToBookNotes } from '@/services/annotation/providers/readera';
+
+const ZERO_INSETS: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
+
+const isSameRange = (a: Range, b: Range) =>
+  a.startContainer === b.startContainer &&
+  a.startOffset === b.startOffset &&
+  a.endContainer === b.endContainer &&
+  a.endOffset === b.endOffset;
+
+const Annotator: React.FC<{ bookKey: string; contentInsets: Insets; gridInsets?: Insets }> = ({
+  bookKey,
+  contentInsets,
+  gridInsets = ZERO_INSETS,
+}) => {
+  const _ = useTranslation();
+  const { envConfig, appService } = useEnv();
+  const { settings, setSettingsDialogBookKey, setSettingsDialogOpen, setActiveSettingsItemId } =
+    useSettingsStore();
+  const { isDarkMode, isIPhoneDuo, themeCode } = useThemeStore();
+  // Per-field selectors — see store/readerProgressStore.ts header for the
+  // "destructure-subscribes-the-whole-store" rationale.
+  const getConfig = useBookDataStore((s) => s.getConfig);
+  const setConfig = useBookDataStore((s) => s.setConfig);
+  const saveConfig = useBookDataStore((s) => s.saveConfig);
+  const getBookData = useBookDataStore((s) => s.getBookData);
+  const updateBooknotes = useBookDataStore((s) => s.updateBooknotes);
+  const getView = useReaderStore((s) => s.getView);
+  const getViewsById = useReaderStore((s) => s.getViewsById);
+  const getViewSettings = useReaderStore((s) => s.getViewSettings);
+  const { setNotebookVisible, setNotebookActiveTab } = useNotebookStore();
+  const { clearBooknotesNav, isSideBarVisible } = useSidebarStore();
+  const { listenToNativeTouchEvents } = useDeviceControlStore();
+  const { loadCustomDictionaries } = useCustomDictionaryStore();
+  const { selectFiles } = useFileSelector(appService, _);
+
+  const saveBooknoteNoteText = useSaveBooknoteNoteText(bookKey);
+
+  useNotesSync(bookKey);
+  useBookOrbitNotesSync(bookKey);
+  useGrimmoryNotesSync(bookKey);
+  useReadwiseSync(bookKey);
+  useHardcoverSync(bookKey);
+  usePageboundSync(bookKey);
+  useNotionSync(bookKey);
+  useObsidianSync(bookKey);
+
+  useEffect(() => {
+    void loadCustomDictionaries(envConfig).catch((error) => {
+      console.warn('Failed to load custom dictionaries:', error);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const osPlatform = getOSPlatform();
+  const config = getConfig(bookKey)!;
+  // Reactive: subscribe to THIS book's progress via the dedicated
+  // progress store. This is the only piece of data we need to react to
+  // per page turn — the `useEffect(..., [progress])` below uses it to
+  // re-apply local-page annotations after each relocate.
+  const progress = useBookProgress(bookKey)!;
+  const bookData = getBookData(bookKey)!;
+  const view = getView(bookKey);
+  const viewSettings = getViewSettings(bookKey)!;
+  const primaryLang = bookData.book?.primaryLanguage || 'en';
+
+  const containerRef = React.useRef<HTMLDivElement>(null);
+
+  const [selection, setSelection] = useState<TextSelection | null>(null);
+  const [translationEpoch, setTranslationEpoch] = useState(0);
+  const [showAnnotPopup, setShowAnnotPopup] = useState(false);
+  const [showDictionaryPopup, setShowDictionaryPopup] = useState(false);
+  const [showDeepLPopup, setShowDeepLPopup] = useState(false);
+  const [showProofreadPopup, setShowProofreadPopup] = useState(false);
+  const [trianglePosition, setTrianglePosition] = useState<Position>();
+  const [annotPopupPosition, setAnnotPopupPosition] = useState<Position>();
+  // The side of the tapped word the footnote popup took, when one is open: a
+  // tap on a highlighted link opens both it and this toolbar (#6390).
+  const [footnotePopupDir, setFootnotePopupDir] = useState<Position['dir'] | null>(null);
+  const [dictPopupPosition, setDictPopupPosition] = useState<Position>();
+  const [translatorPopupPosition, setTranslatorPopupPosition] = useState<Position>();
+  const [proofreadPopupPosition, setProofreadPopupPosition] = useState<Position>();
+  const [highlightOptionsVisible, setHighlightOptionsVisible] = useState(false);
+  const [showAnnotationNotes, setShowAnnotationNotes] = useState(false);
+  // The note the Annotate action is currently collecting, plus the highlights
+  // it created on the way (#4791: those only live as long as this editor).
+  const [noteEditorTarget, setNoteEditorTarget] = useState<{
+    annotationId: string;
+    placeholderIds: string[];
+  } | null>(null);
+  const [annotationNotes, setAnnotationNotes] = useState<BookNote[]>([]);
+  const [editingAnnotation, setEditingAnnotation] = useState<BookNote | null>(null);
+  const [externalDragPoint, setExternalDragPoint] = useState<Point | null>(null);
+  const [showExportDialog, setShowExportDialog] = useState(false);
+  const [quoteCard, setQuoteCard] = useState<{
+    content: QuoteCardContent;
+    readerColors: QuoteCardColors;
+    fontFamilies: Record<QuoteCardFont, string>;
+    defaultFont: QuoteCardFont;
+  } | null>(null);
+  const [showImportDialog, setShowImportDialog] = useState(false);
+  const [importingAnnotations, setImportingAnnotations] = useState(false);
+  // "Clear Annotations" confirm dialog. Hosted here (and not in BookMenu)
+  // because the menu unmounts the moment the user picks the entry, which
+  // would otherwise tear down the dialog state immediately.
+  const [clearAnnotationsCount, setClearAnnotationsCount] = useState(0);
+  const [exportData, setExportData] = useState<{
+    booknoteGroups: { [href: string]: BooknoteGroup };
+  } | null>(null);
+
+  const [selectedStyle, setSelectedStyle] = useState<HighlightStyle>(
+    settings.globalReadSettings.highlightStyle,
+  );
+  const [selectedColor, setSelectedColor] = useState<HighlightColor>(
+    settings.globalReadSettings.highlightStyles[selectedStyle],
+  );
+  const androidTouchEndRef = useRef(false);
+  // Whether a finger is down, from the iOS native touch observer.
+  const iosTouchActiveRef = useRef(false);
+  // Holds a quick action that fired while the user is still touching the screen
+  // (Android long-press selects text via selectionchange before touchend). The
+  // pending action runs on touchend so popups don't open under an active touch.
+  const deferredQuickActionRef = useRef(createDeferredActionState());
+  // Timestamp of the latest touch pointerdown (0 for mouse). Used to require a
+  // long-press hold before the instant quick action fires, so a tap-to-deselect
+  // can't re-open the dictionary off a racy lingering selectionchange (iOS).
+  const pointerDownTimeRef = useRef(0);
+  // Set while an instant-quick-action dictionary lookup is up, because that
+  // path consumes the selection as it opens (see handleQuickAction). Dismissing
+  // the lookup hands the selection back (#6213).
+  const instantLookupDeselectedRef = useRef(false);
+  // Set when a Word Lens gloss tap synthesizes a selection so the
+  // selection-change effect opens the dictionary popup instead of the
+  // annotation toolbar. Cleared as soon as it's consumed.
+  const pendingWordLensDictRef = useRef(false);
+
+  // The lookup surfaces read the selection they were opened on, but it can be
+  // cleared without the dismiss that closes them: the instant highlight quick
+  // action clears it on a tap (#6419). Close them in the same render, before
+  // they can render without text.
+  if (!selection && (showDictionaryPopup || showDeepLPopup || showProofreadPopup)) {
+    setShowDictionaryPopup(false);
+    setShowDeepLPopup(false);
+    setShowProofreadPopup(false);
+  }
+
+  const showingPopup =
+    showAnnotPopup || showDictionaryPopup || showDeepLPopup || showProofreadPopup;
+
+  const popupPadding = useResponsiveSize(10);
+  const trianglePadding = popupPadding * 2 + 6;
+  const maxWidth = window.innerWidth - 2 * popupPadding;
+  const maxHeight = window.innerHeight - 2 * popupPadding;
+  const dictPopupWidth = Math.min(480, maxWidth);
+  // Tall enough to fit a header + 2-3 expanded cards comfortably. The popup
+  // shows all enabled providers stacked (no tabs) so it needs more vertical
+  // room than the legacy single-tab layout.
+  const dictPopupHeight = Math.min(360, maxHeight);
+  const transPopupWidth = Math.min(480, maxWidth);
+  const transPopupHeight = Math.min(265, maxHeight);
+  const proofreadPopupWidth = Math.min(440, maxWidth);
+  const proofreadPopupHeight = Math.min(200, maxHeight);
+  const canShare = canShareText(appService);
+  // For the ✓ (global) toggle in HighlightOptions: figure out whether
+  // the booknote anchored at the current selection is currently global,
+  // and whether the toggle should be shown at all (only meaningful for
+  // re-flowable formats with a non-empty selection text).
+  const currentAnnotation = selection?.cfi
+    ? config.booknotes?.find(
+        (a) => a.type === 'annotation' && a.style && !a.deletedAt && a.cfi === selection.cfi,
+      )
+    : undefined;
+  const globalToggleAvailable =
+    !bookData.isFixedLayout &&
+    !!selection?.annotated &&
+    !!currentAnnotation &&
+    !!selection?.text &&
+    selection.text.trim().length > 0;
+  const globalToggleActive = !!currentAnnotation?.global;
+  const annotPopupMaxWidth = Math.min(useResponsiveSize(300), maxWidth);
+  const annotPopupToolSize = useResponsiveSize(44);
+  const toolbarToolTypes = getToolbarToolTypes(viewSettings.annotationToolbarItems, canShare);
+  const highlightOptionsGap = toolbarToolTypes.length <= 4 ? 4 : 8;
+  // Three 30px styles, a four- or five-color pill (100px or 122px), and three gaps;
+  // the global toggle adds a 30px button and a gap. Keep in sync with HighlightOptions.
+  const colorStripMinWidth = toolbarToolTypes.length <= 4 ? 100 : 122;
+  const highlightOptionsMinWidth = useResponsiveSize(
+    90 +
+      colorStripMinWidth +
+      3 * highlightOptionsGap +
+      (globalToggleAvailable ? 30 + highlightOptionsGap : 0),
+  );
+  const highlightOptionsAvailable = shouldShowHighlightOptions(toolbarToolTypes, selection ?? null);
+  const annotPopupWidth =
+    annotationNotes.length > 0 || noteEditorTarget
+      ? annotPopupMaxWidth
+      : Math.min(
+          Math.max(
+            Math.max(toolbarToolTypes.length, 1) * annotPopupToolSize,
+            highlightOptionsAvailable ? highlightOptionsMinWidth : 0,
+          ),
+          annotPopupMaxWidth,
+        );
+  const annotPopupHeight = useResponsiveSize(44);
+  // The style/color strip that rides on the toolbar's far side, with its gap.
+  const highlightOptionsBlock = useResponsiveSize(28 + 16);
+  // Set while the toolbar shares its side with the footnote popup because the
+  // other side has no room for it; the popup then opens beyond it (#6390).
+  const [toolbarBlock, setToolbarBlock] = useState<{ dir: Position['dir']; size: number } | null>(
+    null,
+  );
+
+  // Where to anchor the toolbar. A tap on a highlighted link opens the footnote
+  // popup at the same word, so the toolbar takes the side the popup left free
+  // when it fits there, and otherwise stays put and has the popup make room.
+  const getToolbarPosition = (sel: TextSelection, rect: Rect) => {
+    const size = annotPopupHeight + (highlightOptionsAvailable ? highlightOptionsBlock : 0);
+    const { position, shared } = placeToolbar(
+      (avoidDir) => getPosition(sel, rect, trianglePadding, viewSettings.vertical, avoidDir),
+      sel.popup ? null : footnotePopupDir,
+      rect,
+      size,
+      popupPadding,
+    );
+    setToolbarBlock(shared ? { dir: position.dir, size } : null);
+    return position;
+  };
+  const androidSelectionHandlerHeight = 0;
+
+  // Reposition popups on scroll without dismissing them
+  const repositionPopups = useCallback(() => {
+    if (!selection || !selection.text) return;
+    const gridFrame = document.querySelector(`#gridcell-${bookKey}`);
+    if (!gridFrame) return;
+    // On iPhone Duo clamp to the safe region, not the physical cell (its
+    // status-bar strip can otherwise sit under a popup, #6307). The points come
+    // back relative to that region; they are shifted to cell coordinates below.
+    const { rect, origin } = getPopupBounds(
+      gridFrame.getBoundingClientRect(),
+      gridInsets,
+      isIPhoneDuo,
+    );
+    const triangPos = getToolbarPosition(selection, rect);
+    const annotPopupPos = getPopupPosition(
+      triangPos,
+      rect,
+      viewSettings.vertical ? annotPopupHeight : annotPopupWidth,
+      viewSettings.vertical ? annotPopupWidth : annotPopupHeight,
+      popupPadding,
+    );
+    if (annotPopupPos.dir === 'down' && osPlatform === 'android') {
+      triangPos.point.y += androidSelectionHandlerHeight;
+      annotPopupPos.point.y += androidSelectionHandlerHeight;
+    }
+    const dictPopupPos = getPopupPosition(
+      triangPos,
+      rect,
+      dictPopupWidth,
+      dictPopupHeight,
+      popupPadding,
+    );
+    const transPopupPos = getPopupPosition(
+      triangPos,
+      rect,
+      transPopupWidth,
+      transPopupHeight,
+      popupPadding,
+    );
+    const proofreadPopupPos = getPopupPosition(
+      triangPos,
+      rect,
+      proofreadPopupWidth,
+      proofreadPopupHeight,
+      popupPadding,
+    );
+    if (triangPos.point.x == 0 || triangPos.point.y == 0) return;
+    setAnnotPopupPosition(offsetPosition(annotPopupPos, origin));
+    setDictPopupPosition(offsetPosition(dictPopupPos, origin));
+    setTranslatorPopupPosition(offsetPosition(transPopupPos, origin));
+    setProofreadPopupPosition(offsetPosition(proofreadPopupPos, origin));
+    setTrianglePosition(offsetPosition(triangPos, origin));
+    // Re-clamp when the cell's insets change, which only iPhone Duo uses;
+    // elsewhere the deps are unchanged.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    selection,
+    bookKey,
+    isIPhoneDuo && gridInsets,
+    viewSettings.vertical,
+    annotPopupWidth,
+    annotPopupHeight,
+    footnotePopupDir,
+  ]);
+
+  useEffect(() => {
+    const onFootnotePopupAnchor = (event: CustomEvent) => {
+      const { key, dir } = event.detail as { key: string; dir: Position['dir'] | null };
+      if (key === bookKey) setFootnotePopupDir(dir);
+    };
+    eventDispatcher.on('footnote-popup-anchor', onFootnotePopupAnchor);
+    return () => eventDispatcher.off('footnote-popup-anchor', onFootnotePopupAnchor);
+  }, [bookKey]);
+
+  useEffect(() => {
+    eventDispatcher.dispatch('annotation-toolbar-block', {
+      key: bookKey,
+      block: showAnnotPopup ? toolbarBlock : null,
+    });
+  }, [bookKey, showAnnotPopup, toolbarBlock]);
+
+  // The footnote popup renders after the tap's selection has placed the
+  // toolbar, so move the toolbar off its side once it is known.
+  useEffect(() => {
+    repositionPopups();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [footnotePopupDir]);
+
+  useEffect(() => {
+    repositionPopups();
+  }, [repositionPopups]);
+
+  useEffect(() => {
+    const highlightStyle = settings.globalReadSettings.highlightStyle;
+    setSelectedStyle(highlightStyle);
+    setSelectedColor(settings.globalReadSettings.highlightStyles[highlightStyle]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.globalReadSettings.highlightStyle]);
+
+  const transformCtx: TransformContext = useMemo(
+    () => ({
+      bookKey,
+      viewSettings: getViewSettings(bookKey)!,
+      userLocale: getLocale(),
+      content: '',
+      isFixedLayout: bookData.isFixedLayout,
+      transformers: ['punctuation'],
+      reversePunctuationTransform: true,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // The passage around the looked-up text, for the AI context dictionary (#5544).
+  const dictionarySelection = useMemo<DictionarySelectionContext | undefined>(
+    () =>
+      showDictionaryPopup && selection?.range
+        ? {
+            ...buildSelectionContext(selection.range),
+            bookTitle: bookData.book?.title,
+            bookAuthor: bookData.book?.author,
+            targetLang: viewSettings.translateTargetLang,
+          }
+        : undefined,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [showDictionaryPopup, selection],
+  );
+  // The lookup as the vocabulary builder saves it (#789), filed under the
+  // same language Word Lens reads its marks from.
+  const dictionaryCapture = useMemo<VocabularyCapture | undefined>(
+    () =>
+      showDictionaryPopup && selection?.text
+        ? {
+            lang: vocabularyLang(bookData.book?.primaryLanguage),
+            occurrence: {
+              sentence: (selection.range && sentenceAt(selection.range)) || selection.text,
+              bookHash: bookData.book?.hash,
+              bookTitle: bookData.book?.title,
+              bookAuthor: bookData.book?.author,
+              cfi: selection.cfi,
+              at: Date.now(),
+            },
+          }
+        : undefined,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [showDictionaryPopup, selection],
+  );
+
+  const getAnnotationText = useCallback(
+    async (range: Range) => {
+      transformCtx['content'] = getTextFromRange(range, ['rt']);
+      return await transformContent(transformCtx);
+    },
+    [primaryLang, transformCtx],
+  );
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const handleDismissPopup = useCallback(
+    throttle(() => {
+      instantLookupDeselectedRef.current = false;
+      setSelection(null);
+      setShowAnnotPopup(false);
+      setShowAnnotationNotes(false);
+      setAnnotationNotes([]);
+      setShowDictionaryPopup(false);
+      setShowDeepLPopup(false);
+      setShowProofreadPopup(false);
+      setEditingAnnotation(null);
+      setNoteEditorTarget(null);
+    }, 500),
+    [],
+  );
+
+  const {
+    isTextSelected,
+    isInstantAnnotating,
+    handleScroll,
+    handleTouchStart,
+    handleTouchMove,
+    handleTouchEnd,
+    handleTouchCancel,
+    handleMouseDown,
+    handlePointerDown,
+    handlePointerMove,
+    handleNativeTouchMove,
+    handlePointerCancel,
+    handlePointerUp,
+    handleDoubleClick,
+    handleSelectionchange,
+    handleRendererRelocate,
+    handleShowPopup,
+    handleUpToPopup,
+    handleContextmenu,
+    dragSelectionTo,
+    suppressNativeSelectionHandles,
+    restoreSelectionRange,
+    noteAutoTurnPoint,
+    cancelAutoTurn,
+    onAutoTurn,
+    turnHint,
+  } = useTextSelector(
+    bookKey,
+    contentInsets,
+    setSelection,
+    setEditingAnnotation,
+    setExternalDragPoint,
+    getAnnotationText,
+    handleDismissPopup,
+  );
+
+  const handleDismissPopupAndSelection = () => {
+    handleDismissPopup();
+    view?.deselect();
+    // A popup-window selection lives in its own document (the footnote popup
+    // view's iframe or the host document), which view.deselect() can't reach.
+    if (selection?.popup) {
+      selection.range.startContainer.ownerDocument?.getSelection()?.removeAllRanges();
+    }
+    isTextSelected.current = false;
+  };
+
+  // Whether the currently shown selection came from the footnote popup, for
+  // event handlers that only know the incoming event, not the selection state.
+  // The note editor spends that selection (dropSelectionForOverlay), so the
+  // cleared report it echoes back must not dismiss the editor (#6395).
+  const selectionIsPopupRef = useRef(false);
+  useEffect(() => {
+    selectionIsPopupRef.current = !!selection?.popup && !noteEditorTarget;
+  }, [selection, noteEditorTarget]);
+
+  // Selections made outside the book's section documents arrive via this
+  // event: the footnote popup renders its own foliate view (or a host-document
+  // element for data-attribute footnotes), and paragraph mode renders a clone
+  // of the focused paragraph in the host document (ParagraphOverlay, #6200), so
+  // the per-section listeners attached in onLoad below never see them. A
+  // detail without a range means the selection was cleared or the surface
+  // closed.
+  const footnoteSelectionEpochRef = useRef(0);
+  const popupRestoredRangeRef = useRef<Range | null>(null);
+  useEffect(() => {
+    const onFootnoteSelection = async (event: CustomEvent) => {
+      const detail = event.detail as {
+        key: string;
+        range?: Range;
+        index?: number;
+        cfi?: string;
+        href?: string;
+        annotated?: boolean;
+        isNote?: boolean;
+        rect?: TextSelection['rect'];
+        getPopupCfi?: TextSelection['getPopupCfi'];
+        quickAction?: boolean;
+      };
+      if (detail.key !== bookKey) return;
+      // Every event for this book advances the epoch so a handler still
+      // awaiting getAnnotationText below can detect it was superseded — a
+      // cleared or newer selection must not be overwritten by stale state.
+      const epoch = ++footnoteSelectionEpochRef.current;
+      if (!detail.range) {
+        // The instant dictionary clears the popup selection as it opens; that
+        // report must not close the lookup.
+        if (selectionIsPopupRef.current && !instantLookupDeselectedRef.current) {
+          handleDismissPopup();
+        }
+        return;
+      }
+      // The range the lookup dismiss handed back (keepSelectionAfterLookup) is
+      // already the selection; reporting it again would rerun the lookup.
+      const restored = popupRestoredRangeRef.current;
+      popupRestoredRangeRef.current = null;
+      if (restored && isSameRange(restored, detail.range)) return;
+      // Nothing can select new text while the instant dictionary is up, so a
+      // popup selection now is iOS re-confirming the one the lookup dropped;
+      // drop it again so its handles don't sit on the lookup.
+      if (instantLookupDeselectedRef.current) {
+        detail.range.startContainer.ownerDocument?.getSelection()?.removeAllRanges();
+        return;
+      }
+      // A click on an overlay drawn in the popup: a highlight opens the
+      // toolbar in its annotated state (Delete Highlight + style options) with
+      // its range handles (#6390), a note bubble opens the note view — like
+      // the same clicks in the main view.
+      if (detail.annotated && detail.cfi) {
+        const { booknotes = [] } = getConfig(bookKey)!;
+        const annotation = booknotes.find(
+          (b) =>
+            b.type === 'annotation' &&
+            !b.deletedAt &&
+            b.cfi === detail.cfi &&
+            (detail.isNote ? b.note : b.style),
+        );
+        if (annotation) {
+          const text = annotation.text || (await getAnnotationText(detail.range));
+          if (epoch !== footnoteSelectionEpochRef.current) return;
+          if (detail.isNote) {
+            setShowAnnotationNotes(true);
+            setHighlightOptionsVisible(false);
+          } else {
+            if (annotation.style && annotation.color) {
+              setSelectedStyle(annotation.style);
+              setSelectedColor(annotation.color);
+            }
+            setShowAnnotationNotes(false);
+            setAnnotationNotes([]);
+          }
+          setEditingAnnotation(!detail.isNote && annotation.style ? annotation : null);
+          setSelection({
+            key: bookKey,
+            text,
+            range: detail.range,
+            index: detail.index ?? -1,
+            cfi: detail.cfi,
+            href: detail.href,
+            rect: detail.isNote ? detail.rect : undefined,
+            page: annotation.page ?? getBookProgress(bookKey)?.page ?? 0,
+            annotated: true,
+            popup: true,
+            getPopupCfi: detail.getPopupCfi,
+          });
+          return;
+        }
+      }
+      const text = await getAnnotationText(detail.range);
+      if (epoch !== footnoteSelectionEpochRef.current) return;
+      // A settled footnote-popup selection runs the quick action like one made
+      // in the book (#6804). Read-aloud is off for popup selections, so it
+      // keeps the toolbar.
+      const quickAction = getViewSettings(bookKey)?.annotationQuickAction;
+      if (detail.quickAction && quickAction !== 'tts') {
+        isTextSelected.current = true;
+      }
+      setSelection({
+        key: bookKey,
+        text,
+        range: detail.range,
+        index: detail.index ?? -1,
+        cfi: detail.cfi,
+        href: detail.href,
+        page: getBookProgress(bookKey)?.page ?? 0,
+        popup: true,
+        getPopupCfi: detail.getPopupCfi,
+      });
+    };
+    // A gesture in the popup re-arms the quick action like a pointerdown in
+    // the book (see onLoad); Android re-arms from the native touchstart.
+    const onFootnotePointerdown = (event: CustomEvent) => {
+      const detail = event.detail as { key: string; pointerType?: string };
+      if (detail.key !== bookKey || appService?.isAndroidApp) return;
+      // A new press is the reader's next gesture, not iOS re-confirming the
+      // selection the instant dictionary dropped: on desktop the rest of the
+      // popup stays clickable under the lookup, and a word selected or a click
+      // on empty space there must look it up or close the lookup (#6869).
+      instantLookupDeselectedRef.current = false;
+      beginGesture(deferredQuickActionRef.current);
+      pointerDownTimeRef.current = detail.pointerType === 'mouse' ? 0 : Date.now();
+    };
+    eventDispatcher.on('footnote-selection', onFootnoteSelection);
+    eventDispatcher.on('footnote-pointerdown', onFootnotePointerdown);
+    return () => {
+      eventDispatcher.off('footnote-selection', onFootnoteSelection);
+      eventDispatcher.off('footnote-pointerdown', onFootnotePointerdown);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey]);
+
+  const onLoad = (event: Event) => {
+    const detail = (event as CustomEvent).detail;
+    const { doc, index } = detail;
+
+    const handleTouchmove = (ev: TouchEvent) => {
+      // Available on iOS, on Android not fired
+      // To make the popup not follow the selection while dragging
+      setShowAnnotPopup(false);
+      if (!isInstantAnnotating.current) {
+        setEditingAnnotation(null);
+      }
+      handleTouchMove(ev);
+    };
+
+    // Attach generic selection listeners for all formats, including PDF.
+    // For PDF we only guarantee Copy & Translate; highlight/annotate may be limited by CFI support.
+    //
+    // The renderer `scroll` listener and the Android `native-touch` bridge are
+    // NOT attached here: onLoad fires for every (pre)loaded section, but those
+    // listeners live on the renderer / global dispatcher, which outlive sections.
+    // Attaching them per load leaked one set per chapter and degraded paragraph
+    // mode over a long session. They are registered once per view via
+    // useRendererInputListeners below. Popup repositioning on scroll is already
+    // handled by the dedicated effect further down.
+    //
+    // Every listener below is a function of its own for this page. On Android
+    // and Windows each page iframe runs its own Sentry, which caches its
+    // listener wrapper on the function: a function shared by two pages would
+    // run through the first page's wrapper, which goes dead once that page
+    // unloads.
+    const opts = { passive: false };
+    detail.doc?.addEventListener('touchstart', () => handleTouchStart(), opts);
+    detail.doc?.addEventListener('touchmove', handleTouchmove, opts);
+    // Bound to the section so a selectionchange deferred during the drag can
+    // be processed (and the popup shown once) when the gesture ends.
+    detail.doc?.addEventListener('touchend', handleTouchEnd.bind(null, doc, index));
+    if (!appService?.isIOSApp && !appService?.isAndroidApp) {
+      detail.doc?.addEventListener('touchcancel', () => handleTouchCancel());
+    }
+    // Re-arm the instant quick action at the start of each gesture. Android does
+    // this via the native-touch touchstart above; iOS/desktop have no such path,
+    // and a single iOS long-press emits multiple selectionchange events for the
+    // same word — without re-arming, the system-dictionary sheet stacked twice
+    // (the action fired once per event instead of once per gesture).
+    if (!appService?.isAndroidApp) {
+      detail.doc?.addEventListener(
+        'pointerdown',
+        (ev: Event) => {
+          beginGesture(deferredQuickActionRef.current);
+          // Remember when the gesture started so the instant quick action can
+          // require a long-press hold (touch only — mouse selections fire on
+          // pointerup and shouldn't be time-gated).
+          pointerDownTimeRef.current =
+            (ev as PointerEvent).pointerType === 'mouse' ? 0 : Date.now();
+        },
+        opts,
+      );
+    }
+    detail.doc?.addEventListener('mousedown', (ev: MouseEvent) => handleMouseDown(ev));
+    detail.doc?.addEventListener('pointerdown', handlePointerDown.bind(null, doc, index), opts);
+    detail.doc?.addEventListener('pointermove', handlePointerMove.bind(null, doc, index), opts);
+    detail.doc?.addEventListener('pointercancel', handlePointerCancel.bind(null, doc, index));
+    detail.doc?.addEventListener('pointerup', handlePointerUp.bind(null, doc, index));
+    detail.doc?.addEventListener('selectionchange', handleSelectionchange.bind(null, doc, index));
+
+    // Fixed-layout books used to wire their own `contextmenu` listener here that
+    // forced the translator popup open, from back when PDFs had no annotation
+    // toolbar of their own. The toolbar is shared with EPUB now, and the shortcut
+    // had become actively harmful: Android dispatches `contextmenu` for the long
+    // press that selects a word, so every PDF selection buried the word — and the
+    // dictionary the reader had asked for — under an unrequested translation
+    // (#5821). PDF selections now take the same path as every other format.
+
+    // Disable the default context menu on mobile devices (selection handles suffice)
+    detail.doc?.addEventListener('contextmenu', (ev: Event) => handleContextmenu(ev));
+  };
+
+  const onCreateOverlay = (event: Event) => {
+    const detail = (event as CustomEvent).detail;
+    const { booknotes = [] } = getConfig(bookKey)!;
+    // Resolve the live (doc, overlayer) pair for this section so we can
+    // fan out global annotations across every text-occurrence in it.
+    const sectionContent = view?.renderer?.getContents().find((c) => c.index === detail.index) as
+      | { doc?: Document; index?: number }
+      | undefined;
+    const sectionDoc = sectionContent?.doc;
+
+    const activeAnnotations = booknotes.filter((b) => b.type === 'annotation' && !b.deletedAt);
+
+    // 1. Draw native overlays only for notes whose anchor (cfi) lives
+    //    inside this section — same as before.
+    activeAnnotations
+      .filter((booknote) => getIndexFromCfi(booknote.cfi) === detail.index)
+      .map((annotation) => {
+        try {
+          view?.addAnnotation(annotation);
+        } catch (err) {
+          console.warn('Failed to add annotation', { annotation, error: err });
+        }
+      });
+
+    // 2. Fan out every `global` annotation in this newly-rendered
+    //    section, regardless of which section originally anchored it.
+    //    `expandGlobalAnnotation` already skips the home anchor when the
+    //    synthetic CFI collides with `note.cfi`.
+    if (sectionDoc) {
+      for (const annotation of activeAnnotations) {
+        if (!annotation.global) continue;
+        try {
+          expandGlobalAnnotation(view ?? null, annotation, sectionDoc, detail.index);
+        } catch (err) {
+          console.warn('Failed to expand global annotation', { annotation, error: err });
+        }
+      }
+    }
+  };
+
+  const onDrawAnnotation = (event: Event) => {
+    const viewSettings = getViewSettings(bookKey)!;
+    drawAnnotationOverlay((event as CustomEvent).detail, {
+      settings,
+      viewSettings,
+      isDarkMode,
+      isMobile: !!appService?.isMobile,
+    });
+  };
+
+  const onShowAnnotation = (event: Event) => {
+    const detail = (event as CustomEvent).detail;
+    const { value, index, range } = detail;
+    const { booknotes = [] } = getConfig(bookKey)!;
+    const resolved = resolveAnnotationClick(value, booknotes);
+    if (!resolved) return;
+    const { annotation, cfi, isNote, isCopy } = resolved;
+
+    const { style, color, text, note } = annotation;
+    const selection = {
+      key: bookKey,
+      annotated: true,
+      text: text ?? '',
+      note: note ?? '',
+      rect: isNote ? detail.rect : undefined,
+      cfi,
+      index,
+      range,
+      // This listener is registered once per view, so the `progress` it closes
+      // over is null until the first relocate: read the live progress instead.
+      page: annotation.page || getBookProgress(bookKey)?.page || 0,
+    };
+    if (isNote) {
+      setShowAnnotationNotes(true);
+      setHighlightOptionsVisible(false);
+      setEditingAnnotation(null);
+    } else {
+      setShowAnnotPopup(false);
+      setEditingAnnotation(null);
+      setShowAnnotationNotes(false);
+      setAnnotationNotes([]);
+      if (style && color) {
+        setSelectedStyle(style);
+        setSelectedColor(color);
+      }
+      // No range handles on a copy of a global annotation: dragging them would
+      // move the annotation itself to the copy's text.
+      if (style && range && !isCopy) {
+        setEditingAnnotation(annotation);
+      }
+    }
+    setSelection(selection);
+    handleUpToPopup();
+  };
+
+  // On mobile the sidebar is a bottom sheet that would otherwise be covered
+  // by the in-reader popups (popup z-50 vs sheet z-45); on any platform an
+  // opening sidebar means the user has left the annotation context, so close
+  // whatever popup is showing instead of letting it float above the sheet.
+  useEffect(() => {
+    if (isSideBarVisible) {
+      handleDismissPopup();
+    }
+  }, [isSideBarVisible, handleDismissPopup]);
+
+  const lastRelocateCfiRef = useRef<string | null>(null);
+  const onRelocate = (event: Event) => {
+    // A page turn or scroll moves the anchor out from under any open popup
+    // (including the note popup), so dismiss instead of leaving it floating
+    // over unrelated text. Same-position settle relocates (e.g. fractional
+    // DPR snap adjustments after a tap) must not close a just-opened popup,
+    // so only a real location change dismisses. Skip while a selection drag
+    // is in flight so cross page auto turns keep their popup flow intact.
+    const detail = (event as CustomEvent).detail;
+    const cfi: string | null = detail?.cfi ?? null;
+    const moved = lastRelocateCfiRef.current !== null && cfi !== lastRelocateCfiRef.current;
+    lastRelocateCfiRef.current = cfi;
+    if (!moved) return;
+    if (isTextSelected.current || isInstantAnnotating.current) return;
+    handleDismissPopup();
+  };
+
+  useFoliateEvents(view, {
+    onLoad,
+    onCreateOverlay,
+    onDrawAnnotation,
+    onShowAnnotation,
+    onRelocate,
+    onRendererRelocate: handleRendererRelocate,
+  });
+
+  // Mobile native-touch handler (Android MainActivity / iOS touch observer).
+  // Registered once per view by useRendererInputListeners; it
+  // resolves the CURRENT primary section's doc/index at fire time rather than
+  // capturing them at load time, because foliate also fires `load` for preloaded
+  // neighbour sections, whose doc/index would be off-screen.
+  const handleNativeTouch = (ev: NativeTouchEventType) => {
+    const contents = view?.renderer?.getContents?.() ?? [];
+    const content = contents.find((c) => c.index === view?.renderer?.primaryIndex) ?? contents[0];
+    const doc = content?.doc;
+    const index = content?.index;
+    // Release/cancel must clear a pending dwell even if a page turn unloaded
+    // the section the gesture began in.
+    if (ev.type === 'touchcancel') {
+      iosTouchActiveRef.current = false;
+      handleTouchCancel();
+      return;
+    }
+    if (appService?.isIOSApp) {
+      if (ev.type === 'touchstart') {
+        iosTouchActiveRef.current = true;
+        handleTouchStart();
+      } else if (ev.type === 'touchmove' && doc) {
+        // Native events also cover popup controls: hide only for a drag
+        // that has actually changed the book selection.
+        if (handleNativeTouchMove(ev.x, ev.y, doc)) setShowAnnotPopup(false);
+      } else if (ev.type === 'touchend') {
+        iosTouchActiveRef.current = false;
+        handleTouchEnd(doc, index);
+        flushDeferredAction(deferredQuickActionRef.current);
+      }
+      return;
+    }
+    if (!doc || index === undefined) return;
+    if (ev.type === 'touchstart') {
+      androidTouchEndRef.current = false;
+      beginGesture(deferredQuickActionRef.current);
+      handleTouchStart();
+    } else if (ev.type === 'touchmove') {
+      handleNativeTouchMove(ev.x, ev.y, doc);
+    } else if (ev.type === 'touchend') {
+      androidTouchEndRef.current = true;
+      handleTouchEnd();
+      handlePointerUp(doc, index);
+      flushDeferredAction(deferredQuickActionRef.current);
+    }
+  };
+
+  // Register the renderer `scroll` listener and mobile `native-touch`
+  // bridge once per view, with cleanup — see the hook for why attaching these in
+  // onLoad leaked listeners and degraded paragraph mode over a long session.
+  useRendererInputListeners(view, {
+    onRendererScroll: handleScroll,
+    onNativeTouch: handleNativeTouch,
+    enableNativeTouch: !!(appService?.isAndroidApp || appService?.isIOSApp),
+    listenToNativeTouchEvents,
+  });
+
+  // A double-click / touch double-tap on a word selects that word and raises the
+  // quick action (if one is configured) or the annotation toolbar — like a
+  // long-press selection. The iframe posts `iframe-double-click` (gated by the
+  // user's double-click setting) with coordinates in the originating section's
+  // viewport and in the window; resolve the section under the window point —
+  // in scroll mode that need not be the primary one (#6583) — then select the
+  // word under the point.
+  useEffect(() => {
+    const handleDoubleClickMessage = (msg: MessageEvent) => {
+      const data = msg.data;
+      if (!data || data.bookKey !== bookKey || data.type !== 'iframe-double-click') return;
+      const contents = view?.renderer?.getContents?.() ?? [];
+      const content = findContentAtPoint(contents, { x: data.windowX, y: data.windowY });
+      if (!content) return;
+      const { doc, index } = content;
+      // A double-click is a deliberate act-on-word gesture, so let the quick
+      // action fire without the touch long-press hold gate (matching a mouse
+      // selection, which sets this to 0 on pointerdown).
+      pointerDownTimeRef.current = 0;
+      void handleDoubleClick(doc, index, data.clientX, data.clientY);
+    };
+    window.addEventListener('message', handleDoubleClickMessage);
+    return () => window.removeEventListener('message', handleDoubleClickMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey, view]);
+
+  // Word Lens: open the dictionary popup for a tapped glossed word. The tap is
+  // detected in the iframe click handler (iframeEventHandlers.ts), which sends
+  // the gloss <ruby> element here. We synthesize a selection over the base word
+  // (excluding the <rt> hint) so the existing dictionary popup positions itself.
+  useEffect(() => {
+    const handleWordLensDictionary = (event: CustomEvent) => {
+      const { element, word } = event.detail as { element: Element | null; word: string };
+      if (event.detail?.bookKey !== bookKey || !element || !word) return;
+      // Read the view fresh: this handler is registered once (deps [bookKey]) and
+      // the closed-over `view` may still be null from when the effect first ran.
+      const view = getView(bookKey);
+      const doc = element.ownerDocument;
+      const content = view?.renderer?.getContents().find((c) => c.doc === doc);
+      if (!content || content.index == null) return;
+      const index = content.index;
+      const rt = element.querySelector('rt');
+      const range = doc.createRange();
+      try {
+        range.selectNodeContents(element);
+        if (rt) range.setEndBefore(rt);
+      } catch {
+        return;
+      }
+      const text = range.toString().trim() || word;
+      pendingWordLensDictRef.current = true;
+      setSelection({
+        key: bookKey,
+        text,
+        range,
+        index,
+        cfi: view?.getCFI(index, range),
+        page: index + 1,
+      });
+    };
+    eventDispatcher.on('wordlens-dictionary', handleWordLensDictionary);
+    return () => {
+      eventDispatcher.off('wordlens-dictionary', handleWordLensDictionary);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey]);
+
+  useEffect(() => {
+    handleShowPopup(showingPopup);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showingPopup]);
+
+  // When popups are visible, update their positions on scroll events
+  useEffect(() => {
+    const view = getView(bookKey);
+    if (!view?.renderer) return;
+    const onScroll = () => {
+      if (showingPopup) {
+        repositionPopups();
+      }
+    };
+    view.renderer.addEventListener('scroll', onScroll);
+    return () => {
+      view.renderer.removeEventListener('scroll', onScroll);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey, showingPopup, repositionPopups]);
+
+  useEffect(() => {
+    eventDispatcher.on('export-annotations', handleExportMarkdown);
+    eventDispatcher.on('clear-annotations', handleClearAnnotations);
+    eventDispatcher.on('import-annotations', handleImportAnnotations);
+    eventDispatcher.on('create-tts-highlight', handleCreateTTSHighlight);
+    return () => {
+      eventDispatcher.off('export-annotations', handleExportMarkdown);
+      eventDispatcher.off('clear-annotations', handleClearAnnotations);
+      eventDispatcher.off('import-annotations', handleImportAnnotations);
+      eventDispatcher.off('create-tts-highlight', handleCreateTTSHighlight);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    // Lazily back-fill `page` on every annotation that doesn't have one
+    // yet. Each call to view.getCFIProgress(cfi) synchronously
+    // decompresses the matching section's XHTML out of the EPUB zip and
+    // walks its text nodes (foliate-js progress.js #getCache), costing
+    // ~100-300ms per cold section on a release Android build. For users
+    // with many annotations spread across many chapters that's seconds
+    // of zip-IPC + main-thread work and the back-fill must NOT steal
+    // the open-book hot window. The `page` field only feeds the
+    // secondary "p NN ·" label in the sidebar BooknoteItem — strictly a
+    // nice-to-have.
+    //
+    // First attempt used requestIdleCallback. On Android Tauri the
+    // WebView's rIC fires aggressively while the main thread is still
+    // doing layout/style work for the freshly-opened book, so each tick
+    // ended up running a 100-300ms getCFIProgress in what was
+    // effectively the hot window — Bottom-Up profile showed 1.5s+ of
+    // sendIpcMessage -> readData -> loadDocument -> getCFIProgress under
+    // "Fire Idle Callback" still inside the open-book TBT window.
+    //
+    // Strategy now:
+    //  - Hard gate on the FIRST 'stabilized' renderer event (i.e. wait
+    //    until the open-book paint is fully settled).
+    //  - Then a 5s grace timer so the user's first page-turns and the
+    //    paginator's adjacent-section preload can finish.
+    //  - Then process annotations one-at-a-time with a 250ms gap
+    //    between each. Each getCFIProgress shows up as its own short
+    //    task with input-handling slots in between, instead of a chain
+    //    of back-to-back idle callbacks.
+    //  - Batch the saveConfig write at the end (one IPC instead of N).
+    //  - Skip entirely if there are no annotations missing a page.
+    const config = getConfig(bookKey);
+    const allAnnotations = config?.booknotes ?? [];
+    const pending = allAnnotations.filter((a) => !a.deletedAt && a.cfi && !a.page);
+    if (pending.length === 0) return;
+    pending.sort((a, b) => CFI.compare(a.cfi, b.cfi));
+
+    const GRACE_MS = 5000;
+    const TICK_GAP_MS = 250;
+
+    let cancelled = false;
+    let scheduledHandle: ReturnType<typeof setTimeout> | null = null;
+    let pendingStabilizedView: FoliateView | null = null;
+    let pendingStabilizedHandler: (() => void) | null = null;
+
+    const detachStabilized = () => {
+      if (pendingStabilizedView && pendingStabilizedHandler) {
+        try {
+          pendingStabilizedView.renderer?.removeEventListener(
+            'stabilized',
+            pendingStabilizedHandler,
+          );
+        } catch {
+          // ignore — renderer may be torn down already.
+        }
+      }
+      pendingStabilizedView = null;
+      pendingStabilizedHandler = null;
+    };
+
+    let touched = false;
+    let i = 0;
+    const tick = async () => {
+      if (cancelled) return;
+      scheduledHandle = null;
+      const view = getView(bookKey);
+      if (!view) {
+        // View not ready yet — back off and try again.
+        scheduledHandle = setTimeout(tick, TICK_GAP_MS);
+        return;
+      }
+      const annotation = pending[i++];
+      if (annotation && !annotation.page) {
+        try {
+          const progress = await view.getCFIProgress(annotation.cfi);
+          if (!cancelled && progress) {
+            annotation.page = progress.location.current + 1;
+            touched = true;
+          }
+        } catch (err) {
+          console.warn('Failed to back-fill annotation page', err);
+        }
+      }
+      if (cancelled) return;
+      if (i < pending.length) {
+        scheduledHandle = setTimeout(tick, TICK_GAP_MS);
+      } else if (touched) {
+        const updatedConfig = updateBooknotes(bookKey, allAnnotations);
+        if (updatedConfig) {
+          saveConfig(envConfig, bookKey, updatedConfig, settings);
+        }
+      }
+    };
+
+    const startGrace = () => {
+      if (cancelled) return;
+      scheduledHandle = setTimeout(tick, GRACE_MS);
+    };
+
+    // Wait for the renderer to fire its first 'stabilized' event before
+    // arming the grace timer. If the renderer is missing (e.g. fixed-
+    // layout PDF teardown path) or never stabilizes within 10s, fall
+    // back to a plain time-based start so the page back-fill still
+    // eventually runs.
+    const view = getView(bookKey);
+    const renderer = view?.renderer;
+    const FALLBACK_START_MS = 10000;
+    if (renderer && typeof renderer.addEventListener === 'function') {
+      const onStabilized = () => {
+        if (cancelled) return;
+        detachStabilized();
+        startGrace();
+      };
+      pendingStabilizedView = view!;
+      pendingStabilizedHandler = onStabilized;
+      renderer.addEventListener('stabilized', onStabilized, {
+        once: true,
+      } as AddEventListenerOptions);
+      // Safety net: if 'stabilized' never arrives (corner cases like
+      // an empty renderer) start the grace timer anyway after 10s.
+      scheduledHandle = setTimeout(() => {
+        if (cancelled) return;
+        detachStabilized();
+        startGrace();
+      }, FALLBACK_START_MS);
+    } else {
+      scheduledHandle = setTimeout(tick, GRACE_MS);
+    }
+
+    return () => {
+      cancelled = true;
+      detachStabilized();
+      if (scheduledHandle != null) {
+        clearTimeout(scheduledHandle);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // A real touch selection only appears after the OS long-press (~500ms); a
+  // quick tap that re-reports a lingering selection fires far sooner.
+  const quickActionMinHoldMs = 300;
+
+  const handleQuickAction = () => {
+    // iOS/desktop immediate path: only fire from a long-press hold. Without this
+    // a tap-to-deselect after dismissing the system dictionary occasionally
+    // re-opened it off a racy lingering selectionchange. Android defers to
+    // touchend (a deliberate lift) and is left as-is.
+    if (
+      !appService?.isAndroidApp &&
+      !isLongPressHold(pointerDownTimeRef.current, Date.now(), quickActionMinHoldMs)
+    ) {
+      return;
+    }
+    const action = viewSettings.annotationQuickAction;
+    const runAction = () => {
+      switch (action) {
+        case 'copy':
+          handleCopy(false);
+          handleDismissPopupAndSelection();
+          break;
+        case 'highlight':
+          // In the book, instant annotating already applied the highlight. The
+          // footnote popup has no instant annotating, so highlight its
+          // selection here, as the toolbar's highlight button does.
+          if (selection?.popup) handleHighlight();
+          handleDismissPopupAndSelection();
+          break;
+        case 'search':
+          handleSearch();
+          break;
+        case 'dictionary':
+          // A dictionary lookup only makes sense for a single word (or a short
+          // CJK term); on a longer selection fall back to the annotation
+          // toolbar so highlighting and copying stay reachable (#5213).
+          if (selection && isSingleLookupTerm(selection.text)) {
+            handleDictionary();
+            // Drop the selection for as long as the lookup is up, so iOS's
+            // native handles and blue highlight — painted above web content —
+            // don't sit on top of the popup (#5585). With
+            // keepSelectionAfterLookup it is handed back on dismiss (#6213):
+            // re-selecting the word with a quick action armed only opens the
+            // dictionary again, so that is the only way to highlight or copy it.
+            // Clear the flag before deselecting: the selectionchange this fires
+            // would otherwise dismiss the popup we just opened.
+            isTextSelected.current = false;
+            instantLookupDeselectedRef.current = true;
+            view?.deselect();
+            // A popup selection lives in the popup's own document, out of
+            // view.deselect()'s reach; its cleared report is ignored while the
+            // lookup is up (onFootnoteSelection).
+            if (selection.popup) {
+              selection.range.startContainer.ownerDocument?.getSelection()?.removeAllRanges();
+            }
+          } else {
+            handleShowAnnotPopup();
+          }
+          break;
+        case 'translate':
+          handleTranslation();
+          break;
+        case 'tts':
+          handleSpeakText(true);
+          break;
+        case 'share':
+          handleShare();
+          break;
+      }
+    };
+    // On Android, a long-press fires selectionchange (and this handler) while
+    // the finger is still down. Defer until touchend so popups aren't dismissed
+    // by the in-progress touch (closes #3935). An iOS footnote-popup selection
+    // also settles with the finger down, and iOS re-confirms it (handles and
+    // all) on release, so it waits for the release too; a book selection on
+    // iOS is already published at touchend.
+    runOrDeferAction(
+      deferredQuickActionRef.current,
+      (!!appService?.isAndroidApp && !androidTouchEndRef.current) ||
+        (!!appService?.isIOSApp && !!selection?.popup && iosTouchActiveRef.current),
+      runAction,
+    );
+  };
+
+  useEffect(() => {
+    // One-tap highlighting (#5983): with the highlight tool on the toolbar the
+    // style/color strip opens with the popup, so a color pick highlights the
+    // fresh selection directly (HighlightOptions calls handleHighlight, which
+    // creates the record when none exists at the CFI yet).
+    setHighlightOptionsVisible(highlightOptionsAvailable);
+    if (selection && selection.text.trim().length > 0) {
+      // Read-and-reset the Word Lens dictionary flag up front so it can never
+      // stick to a later selection if an early return below fires (e.g. a gloss
+      // tap whose synthesized range yields an off-frame/zero position).
+      const wantWordLensDict = pendingWordLensDictRef.current;
+      pendingWordLensDictRef.current = false;
+      const gridFrame = document.querySelector(`#gridcell-${bookKey}`);
+      if (!gridFrame) return;
+      // On iPhone Duo clamp to the safe region, not the physical cell (its
+      // status-bar strip can otherwise sit under a popup, #6307). The points come
+      // back relative to that region; they are shifted to cell coordinates below.
+      const { rect, origin } = getPopupBounds(
+        gridFrame.getBoundingClientRect(),
+        gridInsets,
+        isIPhoneDuo,
+      );
+      const triangPos = getToolbarPosition(selection, rect);
+      const annotPopupPos = getPopupPosition(
+        triangPos,
+        rect,
+        viewSettings.vertical ? annotPopupHeight : annotPopupWidth,
+        viewSettings.vertical ? annotPopupWidth : annotPopupHeight,
+        popupPadding,
+      );
+      if (annotPopupPos.dir === 'down' && osPlatform === 'android') {
+        triangPos.point.y += androidSelectionHandlerHeight;
+        annotPopupPos.point.y += androidSelectionHandlerHeight;
+      }
+      const dictPopupPos = getPopupPosition(
+        triangPos,
+        rect,
+        dictPopupWidth,
+        dictPopupHeight,
+        popupPadding,
+      );
+      const transPopupPos = getPopupPosition(
+        triangPos,
+        rect,
+        transPopupWidth,
+        transPopupHeight,
+        popupPadding,
+      );
+      const proofreadPopupPos = getPopupPosition(
+        triangPos,
+        rect,
+        proofreadPopupWidth,
+        proofreadPopupHeight,
+        popupPadding,
+      );
+      if (triangPos.point.x == 0 || triangPos.point.y == 0) return;
+      setAnnotPopupPosition(offsetPosition(annotPopupPos, origin));
+      setDictPopupPosition(offsetPosition(dictPopupPos, origin));
+      setTranslatorPopupPosition(offsetPosition(transPopupPos, origin));
+      setProofreadPopupPosition(offsetPosition(proofreadPopupPos, origin));
+      setTrianglePosition(offsetPosition(triangPos, origin));
+
+      // A lookup surface republishes the very selection it is anchored to:
+      // `suppressNativeSelectionHandles` empties the selection for a frame to
+      // shed the platform's grabbers, re-adds the range, and marks it
+      // `handlesSuppressed`. That lands here as a brand-new selection, and
+      // answering it with the toolbar (or, worse, re-running the quick action)
+      // closed the surface on the frame it opened (#6018). Nothing can select
+      // new text while one of these is up — they all sit over the page.
+      if (showDictionaryPopup || showDeepLPopup || showProofreadPopup) return;
+
+      const { enableAnnotationQuickActions, annotationQuickAction } = viewSettings;
+      if (wantWordLensDict) {
+        // Route through handleDictionary so a Word Lens gloss tap honours the
+        // dictionary settings (system dictionary vs the in-app popup) — same
+        // as the selection-toolbar and instant-quick-action dictionary paths.
+        handleDictionary();
+      } else if (
+        enableAnnotationQuickActions &&
+        annotationQuickAction &&
+        isTextSelected.current &&
+        !selection.quickActionHandled
+      ) {
+        handleQuickAction();
+      } else {
+        handleShowAnnotPopup();
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection, bookKey]);
+
+  // Index live annotations by the CFI spine prefix (the chapter id) so
+  // each page turn only scans the bucket for the current chapter rather
+  // than the whole booknotes array. With heavy users (>1k highlights) a
+  // naive `booknotes.filter(...)` per page turn was the dominant
+  // contributor to `c` (epubcfi parse) in the Bottom-Up profile —
+  // ~1.4 s self time over a 28 s session. The bucketed read replaces
+  // O(N) walks with O(K) where K is the number of annotations in the
+  // currently-visible chapter (typically a handful).
+  //
+  // `globals` (book-wide highlights) are split into their own pre-filtered
+  // array so we don't re-walk N items each turn just to find the same few
+  // global ones. The index is recomputed only when `booknotes` itself
+  // changes (add/remove/edit) — not on every page turn.
+  const annotationIndex = useMemo(
+    () => buildAnnotationIndex(config.booknotes ?? []),
+    [config.booknotes],
+  );
+
+  useEffect(() => {
+    if (!progress) return;
+    const { location } = progress;
+    // Single pass over the *current chapter's* candidates: classify each
+    // one into the in-page annotations / notes lists. Using the bucket
+    // keeps this fast even when the user has thousands of highlights
+    // elsewhere in the book.
+    const { annotations, notes } = selectLocationAnnotations(annotationIndex, location);
+
+    try {
+      Promise.all(annotations.map((annotation) => view?.addAnnotation(annotation)));
+      Promise.all(
+        notes.map((note) => view?.addAnnotation({ ...note, value: `${NOTE_PREFIX}${note.cfi}` })),
+      );
+      // Fan-out for any annotation flagged `global`. Semantics is
+      // book-wide, so we don't filter by `location` here: every note
+      // with `global=true` gets expanded across every section that
+      // happens to be rendered right now. Sections rendered later are
+      // covered by `onCreateOverlay`. Using the pre-built `globals`
+      // array avoids re-walking booknotes per page turn.
+      for (const annotation of annotationIndex.globals) {
+        // Same stale-index guard as selectLocationAnnotations: a global deleted
+        // in place after the memoized index was built must not be re-fanned out
+        // across sections, which would orphan its overlays (#4773).
+        if (annotation.deletedAt) continue;
+        if (view) expandAllRenderedSections(view, annotation);
+      }
+    } catch (e) {
+      console.warn(e);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progress, annotationIndex, translationEpoch]);
+
+  // Translations are appended long after a section's annotations were drawn, so
+  // a highlight anchored inside translated text has nothing to attach to at
+  // draw time. Bumping this re-runs the draw effect above once the inserts
+  // settle; they arrive in bursts, hence the debounce.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const handleTranslationInserted = (event: CustomEvent) => {
+      const detail = event.detail as { bookKey: string } | undefined;
+      if (!detail || detail.bookKey !== bookKey) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        setTranslationEpoch((epoch) => epoch + 1);
+      }, 150);
+    };
+    eventDispatcher.on('translation-inserted', handleTranslationInserted);
+    return () => {
+      if (timer) clearTimeout(timer);
+      eventDispatcher.off('translation-inserted', handleTranslationInserted);
+    };
+  }, [bookKey]);
+
+  useEffect(() => {
+    if (!config.booknotes || !selection?.cfi || !showAnnotationNotes) return;
+    const annotations = config.booknotes.filter(
+      (booknote) =>
+        booknote.type === 'annotation' && !booknote.deletedAt && booknote.cfi === selection.cfi,
+    );
+    const notes = annotations.filter((item) => item.note && item.note.trim().length > 0);
+    setAnnotationNotes(notes);
+  }, [selection?.cfi, showAnnotationNotes, config.booknotes]);
+
+  const handleShowAnnotPopup = () => {
+    if (!appService?.isMobile) {
+      containerRef.current?.focus();
+    }
+    setShowAnnotPopup(true);
+    setShowDeepLPopup(false);
+    setShowDictionaryPopup(false);
+    setShowProofreadPopup(false);
+  };
+
+  const handleCopy = (dismissPopup = true) => {
+    if (!selection || !selection.text) return;
+    const textToCopy = selection.text;
+    setTimeout(() => {
+      // Delay to ensure it won't be overridden by system clipboard actions
+      void writeTextToClipboard(textToCopy);
+    }, 100);
+    if (dismissPopup) {
+      handleDismissPopupAndSelection();
+    }
+
+    if (!viewSettings?.copyToNotebook) return;
+
+    // A popup-window range is not in a main view document; use the CFI the
+    // popup mapped into the pristine section (absent for data-attribute
+    // footnotes, which have no real text node to anchor to). Resolve it
+    // before the toast so an unanchorable excerpt isn't reported as saved.
+    const cfi = selection.popup ? selection.cfi : view?.getCFI(selection.index, selection.range);
+    if (!cfi) return;
+
+    const { booknotes: annotations = [] } = config;
+    const existingIndex = annotations.findIndex(
+      (annotation) =>
+        annotation.cfi === cfi && annotation.type === 'excerpt' && !annotation.deletedAt,
+    );
+    const existing = existingIndex === -1 ? null : annotations[existingIndex]!;
+    const now = Date.now();
+    const annotation: BookNote = {
+      id: existing?.id ?? uniqueId(),
+      type: 'excerpt',
+      cfi,
+      note: '',
+      text: selection.text,
+      page: selection.page,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: existing ? nextBooknoteStamp(existing, now) : now,
+    };
+
+    if (existingIndex !== -1) {
+      annotations[existingIndex] = annotation;
+    } else {
+      annotations.push(annotation);
+    }
+    const updatedConfig = updateBooknotes(bookKey, annotations);
+    if (updatedConfig) {
+      saveConfig(envConfig, bookKey, updatedConfig, settings);
+    }
+    eventDispatcher.dispatch('toast', {
+      type: 'info',
+      message: _('Copied to Notebook'),
+      className: 'whitespace-nowrap',
+      timeout: 2000,
+    });
+    if (!appService?.isMobile) {
+      setNotebookActiveTab('notes');
+      setNotebookVisible(true);
+    }
+  };
+
+  // Copy a permanent link to what is under the selection, so a highlight can be
+  // sent somewhere the moment it is made instead of hunting for it in the
+  // sidebar notebook (#5452). When no note is anchored here yet the link still
+  // points at the position — resolution keys off the cfi, the note id is only
+  // required to be present.
+  // A link to the selected passage, or null for a selection without a CFI
+  // (synthesized footnote text).
+  const getSelectionLink = (linkType: AnnotationLinkType): string | null => {
+    if (!selection) return null;
+    const cfi =
+      selection.cfi || (selection.popup ? null : view?.getCFI(selection.index, selection.range));
+    if (!cfi) return null;
+    const noteId = config.booknotes?.find((note) => note.cfi === cfi && !note.deletedAt)?.id;
+    return buildAnnotationUrl(
+      { bookHash: bookKey.split('-')[0]!, noteId: noteId ?? uniqueId(), cfi },
+      linkType,
+    );
+  };
+
+  const handleCopyLink = () => {
+    const url = getSelectionLink(
+      viewSettings.noteExportConfig?.linkType ?? DEFAULT_NOTE_EXPORT_CONFIG.linkType,
+    );
+    if (!url) return;
+    void writeTextToClipboard(url);
+    eventDispatcher.dispatch('toast', {
+      type: 'info',
+      message: _('Copied to clipboard'),
+      className: 'whitespace-nowrap',
+      timeout: 2000,
+    });
+    handleDismissPopupAndSelection();
+  };
+
+  const handleShare = () => {
+    if (!selection?.text) return;
+    const position = trianglePosition
+      ? {
+          x: trianglePosition.point.x,
+          y: trianglePosition.point.y,
+          preferredEdge: 'bottom' as const,
+        }
+      : undefined;
+    void shareSelectedText(selection.text, position, appService);
+    handleDismissPopupAndSelection();
+  };
+
+  const handleQuoteCard = async () => {
+    if (!selection?.text) return;
+    // The card shows the passage as rendered, without hidden translations or
+    // the source's formatting newlines.
+    const runs = getRenderedRunsFromRange(selection.range);
+    const rendered = runs
+      .map((run) => run.text)
+      .join('')
+      .trim();
+    const text = rendered || selection.text;
+    // Cameras open the HTTPS form; App Links hand it to an installed app.
+    const qrUrl = getSelectionLink('web') ?? undefined;
+    const { book } = bookData;
+    handleDismissPopupAndSelection();
+    let coverUrl: string | undefined;
+    try {
+      // A blob URL is same-origin, so drawing it doesn't taint the canvas.
+      if (book && appService) coverUrl = await appService.getCoverImageBlobUrl(book);
+    } catch {
+      // No local cover: the card is drawn without one.
+    }
+    setQuoteCard({
+      content: {
+        text,
+        title: book?.title,
+        author: book?.author,
+        chapter: progress?.sectionLabel,
+        date: new Date().toLocaleDateString(getLocale(), {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+        }),
+        runs: rendered ? runs : undefined,
+        coverUrl,
+        qrUrl,
+      },
+      readerColors: { bg: themeCode.bg, fg: themeCode.fg, accent: themeCode.primary },
+      fontFamilies: getFontFamilies(viewSettings),
+      defaultFont: viewSettings.defaultFont?.toLowerCase() === 'serif' ? 'serif' : 'sans',
+    });
+  };
+
+  const handleCloseQuoteCard = () => {
+    if (quoteCard?.content.coverUrl) URL.revokeObjectURL(quoteCard.content.coverUrl);
+    setQuoteCard(null);
+  };
+
+  // Whether a selection's own `cfi` names what it is on, rather than one
+  // recomputed from its range. A popup-window selection carries the CFI mapped
+  // into the pristine section. An annotated one keeps the CFI of the record it
+  // opened: on a copy of a global highlight the range is the copy's.
+  const keepsSelectionCfi = (sel: TextSelection) =>
+    sel.popup || (sel.annotated && (sel.segments ?? [sel]).length === 1);
+
+  // Returns the brand-new highlight records (one per page of a cross-page
+  // selection): only those are placeholders the note-cancel flow may remove;
+  // restyling/toggling an existing one must never tear down the user's record.
+  const handleHighlight = (
+    update = false,
+    highlightStyle?: HighlightStyle,
+    keepExisting = false,
+  ): BookNote[] => {
+    if (!selection || !selection.text) return [];
+    setHighlightOptionsVisible(true);
+    const { booknotes: annotations = [] } = config;
+    const style = highlightStyle || settings.globalReadSettings.highlightStyle;
+    const color = settings.globalReadSettings.highlightStyles[style];
+    setSelectedStyle(style);
+    setSelectedColor(color);
+    const views = getViewsById(bookKey.split('-')[0]!);
+    const created: BookNote[] = [];
+    let deleted = false;
+    let firstCfi: string | undefined;
+    // A selection across pages (#5809) is highlighted one page at a time: one
+    // record per part, the selection itself staying anchored on the first.
+    // Popup-window selections carry the CFI mapped into the pristine section;
+    // recomputing from the popup range would yield an unresolvable path.
+    const parts = selection.segments ?? [selection];
+    const keepCfi = keepsSelectionCfi(selection);
+    const cfis = parts.map((part) =>
+      keepCfi ? selection.cfi : view?.getCFI(part.index, part.range),
+    );
+    const findExisting = (cfi: string) =>
+      annotations.findIndex(
+        (annotation) =>
+          annotation.cfi === cfi &&
+          annotation.type === 'annotation' &&
+          annotation.style &&
+          !annotation.deletedAt,
+      );
+    // Toggling off only once every part is highlighted; otherwise the missing
+    // parts are added and the already highlighted ones left alone.
+    const allExist = cfis.every((cfi) => cfi && findExisting(cfi) !== -1);
+    for (const [i, part] of parts.entries()) {
+      const cfi = cfis[i];
+      if (!cfi) continue;
+      firstCfi ??= cfi;
+      const annotation: BookNote = {
+        id: uniqueId(),
+        type: 'annotation',
+        cfi,
+        style,
+        color,
+        text: part.text,
+        note: '',
+        page: progress.page,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      const existingIndex = findExisting(cfi);
+      if (existingIndex !== -1) {
+        if (keepExisting || (!update && !allExist)) continue;
+        const existing = annotations[existingIndex]!;
+        if (update) {
+          // Tear down the original highlight and its global fan-outs before
+          // redrawing the new style/color. Keep the note bubble at its anchor.
+          views.forEach((view) => view?.addAnnotation(existing, true));
+          if (existing.global) {
+            views.forEach((view) => removeGlobalAnnotationOverlays(view, existing));
+          }
+          // Preserve the note/text/createdAt and the `global` flag of the existing
+          // record so a restyle (color/style change) of a unified annotation
+          // doesn't wipe its note or silently demote a global highlight. The note
+          // bubble overlay (NOTE_PREFIX) isn't torn down above, so it persists; we
+          // only redraw the highlight overlay (value = cfi).
+          const merged = {
+            ...mergeRestyledAnnotation(existing, annotation),
+            updatedAt: nextBooknoteStamp(existing),
+          };
+          annotations[existingIndex] = merged;
+          views.forEach((view) => view?.addAnnotation(merged));
+          if (merged.global) {
+            views.forEach((view) => {
+              if (view) expandAllRenderedSections(view, merged);
+            });
+          }
+        } else {
+          views.forEach((view) => removeBookNoteOverlays(view, existing));
+          existing.deletedAt = nextBooknoteStamp(existing);
+          deleted = true;
+        }
+      } else {
+        annotations.push(annotation);
+        views.forEach((view) => view?.addAnnotation(annotation));
+        created.push(annotation);
+      }
+    }
+    if (!firstCfi) return [];
+    if (deleted) handleDismissPopup();
+    if (created.length > 0) setSelection({ ...selection, cfi: firstCfi, annotated: true });
+
+    const updatedConfig = updateBooknotes(bookKey, annotations);
+    if (updatedConfig) {
+      saveConfig(envConfig, bookKey, updatedConfig, settings);
+    }
+    return created;
+  };
+
+  const handleCreateTTSHighlight = (event: CustomEvent) => {
+    const detail = event.detail as { bookKey: string; cfi: string; text: string } | undefined;
+    if (!detail || detail.bookKey !== bookKey) return;
+    const { settings } = useSettingsStore.getState();
+    const style = settings.globalReadSettings.highlightStyle;
+    const color = settings.globalReadSettings.highlightStyles[style];
+    const { booknotes: annotations = [] } = getConfig(bookKey)!;
+    const page = getBookProgress(bookKey)?.page;
+    const annotation = buildTTSSentenceHighlight(
+      annotations,
+      { cfi: detail.cfi, text: detail.text, style, color, page },
+      Date.now(),
+    );
+    if (!annotation) return;
+    annotations.push(annotation);
+    const updatedConfig = updateBooknotes(bookKey, annotations);
+    if (updatedConfig) {
+      saveConfig(envConfig, bookKey, updatedConfig, settings);
+    }
+    const views = getViewsById(bookKey.split('-')[0]!);
+    views.forEach((view) => view?.addAnnotation(annotation));
+  };
+
+  /**
+   * Toggle the `global` flag on the annotation currently anchored at
+   * `selection.cfi`. When enabling, fan out overlays for every other
+   * occurrence of `selection.text` in the same section; when disabling,
+   * tear them down. The original anchor highlight at `cfi` is left
+   * untouched in either direction.
+   *
+   * Hidden for fixed-layout formats (PDF/CBZ) because they don't expose
+   * a per-section text DOM we can scan.
+   */
+  const handleToggleGlobal = () => {
+    if (!selection || !selection.cfi || !selection.text) return;
+    if (bookData.isFixedLayout) return;
+    const { booknotes: annotations = [] } = config;
+    const idx = annotations.findIndex(
+      (a) => a.type === 'annotation' && a.style && !a.deletedAt && a.cfi === selection.cfi,
+    );
+    if (idx === -1) return;
+    const existing = annotations[idx]!;
+    const nextGlobal = !existing.global;
+    annotations[idx] = { ...existing, global: nextGlobal, updatedAt: nextBooknoteStamp(existing) };
+    const updatedConfig = updateBooknotes(bookKey, annotations);
+    if (updatedConfig) {
+      saveConfig(envConfig, bookKey, updatedConfig, settings);
+    }
+
+    const views = getViewsById(bookKey.split('-')[0]!);
+    if (nextGlobal) {
+      const updated = annotations[idx]!;
+      views.forEach((v) => {
+        if (v) expandAllRenderedSections(v, updated);
+      });
+    } else {
+      views.forEach((v) => removeGlobalAnnotationOverlays(v, existing));
+    }
+  };
+
+  // The note editor replaces the selection with the annotation it just created,
+  // so the selection has no job left — and both the app-drawn range handles and
+  // (on iOS) the native selection highlight paint above web content, which is
+  // how they ended up sitting on top of the editor sheet. Drop it. The flag is
+  // cleared first: the selectionchange that deselect() fires would otherwise
+  // dismiss the very surface we are opening (#5585).
+  //
+  // The lookup popups are deliberately NOT here. A dictionary / translator /
+  // proofread lookup leaves the selection alive so dismissing it lands back on
+  // the selection toolbar (#5213, e2e-covered); they call
+  // `suppressNativeSelectionHandles` instead, which sheds the platform's
+  // grabbers without spending the selection, and `overlaySurfaceOpen` hides the
+  // app's own handles for the duration.
+  const dropSelectionForOverlay = () => {
+    isTextSelected.current = false;
+    view?.deselect();
+    // A popup-window selection lives in its own document (the footnote popup
+    // view's iframe or the host document), out of view.deselect()'s reach.
+    if (selection?.popup) {
+      selection.range.startContainer.ownerDocument?.getSelection()?.removeAllRanges();
+    }
+  };
+
+  const handleAnnotate = () => {
+    if (!selection || !selection.text) return;
+    // A popup selection without a CFI has nothing to anchor a note to (the
+    // toolbar button is disabled, this guards the keyboard shortcut).
+    if (selection.popup && !selection.cfi) return;
+    // A popup selection already carries the footnote target's href; the
+    // current reading position would file the note under the wrong section.
+    if (!selection.popup) {
+      const { sectionHref: href } = progress;
+      selection.href = href;
+    }
+    // A note goes onto an existing highlight as it is, without restyling it to
+    // the last used style and color; only unhighlighted parts get a highlight.
+    const created = handleHighlight(false, undefined, true);
+    const cfi = keepsSelectionCfi(selection)
+      ? selection.cfi
+      : view?.getCFI(selection.index, selection.range);
+    const target =
+      created[0] ??
+      getConfig(bookKey)?.booknotes?.find(
+        (annotation) =>
+          annotation.type === 'annotation' && annotation.cfi === cfi && !annotation.deletedAt,
+      );
+    if (!target) return;
+    // Open the editor on the selection itself. Routing the note through the
+    // annotations sidebar instead used to strand it: that list is in reading
+    // order and virtualized, so a note made further down the page mounted its
+    // editor off screen (#5987, #5957).
+    dropSelectionForOverlay();
+    setNoteEditorTarget({
+      annotationId: target.id,
+      placeholderIds: created.map((annotation) => annotation.id),
+    });
+  };
+
+  // The pencil on a note bubble edits that note in the same editor the Annotate
+  // action opens, so a note reads and edits the same way wherever it is opened
+  // from. No placeholder to take back: the annotation already existed.
+  const handleEditNote = (note: BookNote) => {
+    dropSelectionForOverlay();
+    setNoteEditorTarget({ annotationId: note.id, placeholderIds: [] });
+  };
+
+  // Takes back the highlight Annotate created for the note to hang on, but
+  // never one the user had already made themselves (#4791).
+  const removeNotePlaceholders = (placeholderIds: string[]) => {
+    if (placeholderIds.length === 0) return;
+    const { booknotes = [] } = getConfig(bookKey) ?? {};
+    const removed = placeholderIds
+      .map((id) => removeEmptyAnnotationPlaceholder(booknotes, id, Date.now()))
+      .filter((placeholder): placeholder is BookNote => placeholder !== null);
+    if (removed.length === 0) return;
+    const views = getViewsById(bookKey.split('-')[0]!);
+    removed.forEach((placeholder) => {
+      views.forEach((view) => removeBookNoteOverlays(view, placeholder));
+    });
+    const updatedConfig = updateBooknotes(bookKey, booknotes);
+    if (updatedConfig) saveConfig(envConfig, bookKey, updatedConfig, settings);
+  };
+
+  // That placeholder lives only as long as its editor is presented, and Cancel
+  // is not the only way it stops being presented: opening the sidebar and a
+  // page relocate both dismiss the popup from effects, and the relocate guard
+  // no longer holds now that opening the editor clears isTextSelected. So the
+  // cleanup hangs off the target going away rather than off any one dismiss
+  // path (the pre-#5928 Notebook did the same).
+  const pendingNotePlaceholdersRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (noteEditorTarget) {
+      pendingNotePlaceholdersRef.current = noteEditorTarget.placeholderIds;
+      return;
+    }
+    const placeholderIds = pendingNotePlaceholdersRef.current;
+    pendingNotePlaceholdersRef.current = [];
+    removeNotePlaceholders(placeholderIds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [noteEditorTarget]);
+
+  const handleSaveNote = async (note: string) => {
+    if (!noteEditorTarget) return;
+    if (!(await saveBooknoteNoteText(noteEditorTarget.annotationId, note))) return;
+    // The placeholder carries a note now — a real annotation, not a leftover.
+    pendingNotePlaceholdersRef.current = [];
+    setNoteEditorTarget(null);
+    handleDismissPopupAndSelection();
+  };
+
+  const handleCancelNote = () => {
+    if (!noteEditorTarget) return;
+    setNoteEditorTarget(null);
+    handleDismissPopupAndSelection();
+  };
+
+  const handleSearch = () => {
+    if (!selection || !selection.text) return;
+    handleDismissPopupAndSelection();
+
+    let term = selection.text;
+    const convertChineseVariant = viewSettings.convertChineseVariant;
+    if (convertChineseVariant && convertChineseVariant !== 'none') {
+      term = runSimpleCC(term, convertChineseVariant, true);
+    }
+    eventDispatcher.dispatch('search-term', { term, bookKey });
+  };
+
+  const handleDictionary = () => {
+    if (!selection || !selection.text) return;
+    // System-dictionary path: when the user has opted in via Settings →
+    // Languages → Dictionaries, hand the selection to the OS instead of
+    // opening the in-app popup. Exclusivity is enforced at the store
+    // level (enabling system disables everything else and vice versa),
+    // so a single check on the system flag is sufficient.
+    const dictSettings = useCustomDictionaryStore.getState().settings;
+    if (isSystemDictionaryEnabled(dictSettings)) {
+      // Build the macOS HUD anchor: the selection rect (so the HUD
+      // appears at the original word) and the underlying paragraph's
+      // text style (so AppKit re-draws the small label at the same
+      // font size / colour as the original, matching the system
+      // right-click → Look Up presentation).
+      const rect = selection.range ? getRangeRectInWebview(selection.range) : null;
+      const style = selection.range ? getRangeTextStyleInWebview(selection.range) : null;
+      void invokeSystemDictionary(
+        selection.text,
+        rect ? { rect, style: style ?? undefined } : undefined,
+      );
+      handleDismissPopupAndSelection();
+      return;
+    }
+    setShowAnnotPopup(false);
+    void suppressNativeSelectionHandles();
+    setShowDictionaryPopup(true);
+  };
+
+  const handleTranslation = () => {
+    if (!selection || !selection.text) return;
+    setShowAnnotPopup(false);
+    void suppressNativeSelectionHandles();
+    setShowDeepLPopup(true);
+  };
+
+  // `oneTime` is required rather than defaulted: it decides whether this reads
+  // the selection and stops or starts an open-ended session from it, and every
+  // entry point here means the former. Defaulting it silently turned Ctrl/Cmd+R
+  // into "start the book from this paragraph" (#5011).
+  const handleSpeakText = async (oneTime: boolean) => {
+    if (!selection || !selection.text) return;
+    // TTS walks the main view's documents; a popup-window range can't seed it
+    // (the toolbar button is disabled, this guards the keyboard shortcut).
+    if (selection.popup) return;
+    setShowAnnotPopup(false);
+    setEditingAnnotation(null);
+    eventDispatcher.dispatch('tts-speak', {
+      bookKey,
+      oneTime,
+      // Clone so clearing the live selection below can't disturb the range
+      // TTS uses to choose where to start.
+      range: selection.range.cloneRange(),
+      index: selection.index,
+    });
+    // The word was only selected to pick where to start reading; drop the
+    // selection so its highlight isn't left behind once TTS begins.
+    view?.deselect();
+  };
+
+  const handleProofread = () => {
+    // With no active selection the shortcut (Ctrl/Cmd+P) has nothing to turn
+    // into a rule, so reuse it to open the replacement-rules manager instead.
+    if (!selection || !selection.text) {
+      setProofreadRulesVisibility(true);
+      return;
+    }
+    // Proofread rules anchor to a CFI; a popup selection without one (data-
+    // attribute footnotes) has nothing to attach to.
+    if (selection.popup && !selection.cfi) return;
+    setShowAnnotPopup(false);
+    void suppressNativeSelectionHandles();
+    setShowProofreadPopup(true);
+
+    if (getWordCount(selection.text) > 30) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('Word limit of 30 words exceeded.'),
+        timeout: 3000,
+      });
+      return;
+    }
+  };
+
+  const handleStartEditAnnotation = useCallback(() => {
+    setShowAnnotPopup(false);
+  }, []);
+
+  // Keyboard shortcuts: trigger actions only if there's an active selection and popup hidden
+  useShortcuts(
+    {
+      onHighlightSelection: () => {
+        if (!selection?.text || (selection.popup && !selection.cfi)) return false;
+        handleHighlight(false, 'highlight');
+        return true;
+      },
+      onUnderlineSelection: () => {
+        if (!selection?.text || (selection.popup && !selection.cfi)) return false;
+        handleHighlight(false, 'underline');
+        return true;
+      },
+      onAnnotateSelection: () => {
+        if (!selection?.text || (selection.popup && !selection.cfi)) return false;
+        handleAnnotate();
+        return true;
+      },
+      onSearchSelection: () => {
+        if (!selection?.text) return false;
+        handleSearch();
+        return true;
+      },
+      onCopySelection: () => {
+        if (!selection?.text) return false;
+        handleCopy(false);
+        return true;
+      },
+      onTranslateSelection: () => {
+        if (!selection?.text) return false;
+        handleTranslation();
+        return true;
+      },
+      onDictionarySelection: () => {
+        if (!selection?.text) return false;
+        handleDictionary();
+        return true;
+      },
+      onReadAloudSelection: () => {
+        if (!selection?.text || selection.popup) return false;
+        handleSpeakText(true);
+        return true;
+      },
+      onProofreadSelection: () => {
+        if (selection?.popup && !selection.cfi) return false;
+        handleProofread();
+        return true;
+      },
+    },
+    [selection?.text, selection?.cfi, selection?.popup],
+  );
+
+  const handleImportAnnotations = (event: CustomEvent) => {
+    const { bookKey: importBookKey } = event.detail;
+    if (bookKey !== importBookKey) return;
+    setShowImportDialog(true);
+  };
+
+  /** Read the picked file as text on both Web (File) and Tauri (path). */
+  const readSelectedFileText = async (selectedFile: SelectedFile): Promise<string> => {
+    try {
+      if (selectedFile.file) return await selectedFile.file.text();
+      if (selectedFile.path) {
+        return (await appService?.readFile(selectedFile.path, 'None', 'text')) as string;
+      }
+    } catch (e) {
+      console.warn('Failed to read the selected annotations file:', e);
+    }
+    return '';
+  };
+
+  const importFromMoonReader = async () => {
+    setShowImportDialog(false);
+
+    const { bookDoc } = bookData;
+    if (!bookDoc) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('Book is not ready yet, please try again.'),
+        timeout: 2000,
+      });
+      return;
+    }
+
+    // Pick the .mrexpt file.
+    const result = await selectFiles({
+      type: 'generic',
+      accept: '.mrexpt,text/plain',
+      extensions: ['mrexpt', 'txt'],
+      multiple: false,
+      dialogTitle: _('Select Moon+ Reader Export File'),
+    });
+    if (result.error || result.files.length === 0) return;
+
+    const content = await readSelectedFileText(result.files[0]!);
+    if (!content) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('Failed to read the selected file.'),
+        timeout: 2000,
+      });
+      return;
+    }
+
+    const entries = parseMrexpt(content);
+    if (entries.length === 0) {
+      eventDispatcher.dispatch('toast', {
+        type: 'info',
+        message: _('No annotations found in the file.'),
+        timeout: 2000,
+      });
+      return;
+    }
+
+    setImportingAnnotations(true);
+    try {
+      let conversion;
+      try {
+        conversion = await convertMrexptEntriesToBookNotes(entries, bookDoc, {
+          highlightStyle: settings.globalReadSettings.highlightStyle,
+          highlightColor:
+            settings.globalReadSettings.highlightStyles[settings.globalReadSettings.highlightStyle],
+        });
+      } catch (e) {
+        console.warn('Failed to convert mrexpt entries:', e);
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('Failed to import annotations.'),
+          timeout: 3000,
+        });
+        return;
+      }
+
+      if (conversion.notes.length === 0) {
+        eventDispatcher.dispatch('toast', {
+          type: 'info',
+          message: _('No annotations could be located in this book.'),
+          timeout: 2500,
+        });
+        return;
+      }
+
+      // Merge into the current book config, deduplicating by note id and
+      // preferring the latest updatedAt for any conflicting entries.
+      const config = getConfig(bookKey)!;
+      const { merged, applied, added, updated } = mergeImportedBookNotes(
+        config.booknotes ?? [],
+        conversion.notes,
+      );
+      const updatedConfig = updateBooknotes(bookKey, merged);
+      if (updatedConfig) {
+        saveConfig(envConfig, bookKey, updatedConfig, settings);
+      }
+
+      // Apply imported (or resurrected) annotations to all live views so
+      // they appear immediately. We only re-draw the notes that actually
+      // changed in this round, otherwise duplicate addAnnotation calls
+      // can confuse the overlay layer.
+      const views = getViewsById(bookKey.split('-')[0]!);
+      for (const note of applied) {
+        try {
+          views.forEach((v) => v?.addAnnotation(note));
+        } catch (err) {
+          console.warn('Failed to add imported annotation', { note, err });
+        }
+      }
+
+      // A single result toast: the count if anything changed, otherwise a
+      // plain "nothing new" hint for a repeated import of the same file.
+      const imported = added + updated;
+      eventDispatcher.dispatch('toast', {
+        type: 'info',
+        message:
+          imported > 0
+            ? _('Imported {{count}} annotations', { count: imported })
+            : _('No new annotations to import'),
+        timeout: 2500,
+      });
+    } finally {
+      setImportingAnnotations(false);
+    }
+  };
+
+  /** Read the picked file as bytes on both Web (File) and Tauri (path). */
+  const readSelectedFileBytes = async (selectedFile: SelectedFile): Promise<ArrayBuffer | null> => {
+    try {
+      if (selectedFile.file) return await selectedFile.file.arrayBuffer();
+      if (selectedFile.path) {
+        return (await appService?.readFile(selectedFile.path, 'None', 'binary')) as ArrayBuffer;
+      }
+    } catch (e) {
+      console.warn('Failed to read the selected backup file:', e);
+    }
+    return null;
+  };
+
+  const importFromReadEra = async () => {
+    setShowImportDialog(false);
+
+    const { bookDoc, book, file } = bookData;
+    if (!bookDoc || !book) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('Book is not ready yet, please try again.'),
+        timeout: 2000,
+      });
+      return;
+    }
+
+    const result = await selectFiles({
+      type: 'generic',
+      accept: '.bak',
+      extensions: ['bak'],
+      multiple: false,
+      dialogTitle: _('Select ReadEra Backup File'),
+    });
+    if (result.error || result.files.length === 0) return;
+
+    setImportingAnnotations(true);
+    try {
+      const data = await readSelectedFileBytes(result.files[0]!);
+      if (!data) {
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('Failed to read the selected file.'),
+          timeout: 2000,
+        });
+        return;
+      }
+
+      const library = await extractReadEraLibrary(data);
+      const docs = library ? parseReadEraBackup(library) : null;
+      if (!docs) {
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('This is not a ReadEra backup file.'),
+          timeout: 3000,
+        });
+        return;
+      }
+
+      // The backup carries no book files, so the entry for this book is found
+      // by title/author. When that decides nothing - a renamed file, a title
+      // too short to match on - fall back to the md5 of the whole file, which
+      // is what ReadEra keys its documents by.
+      let readEraDoc = findReadEraDocForBook(docs, book);
+      if (!readEraDoc && file) {
+        readEraDoc = findReadEraDocByFileMd5(docs, await getReadEraFileMd5(book.hash, file));
+      }
+      if (!readEraDoc) {
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('This book was not found in the ReadEra backup.'),
+          timeout: 3000,
+        });
+        return;
+      }
+      let conversion;
+      try {
+        conversion = await convertReadEraDocToBookNotes(readEraDoc, bookDoc);
+      } catch (e) {
+        console.warn('Failed to convert ReadEra annotations:', e);
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('Failed to import annotations.'),
+          timeout: 3000,
+        });
+        return;
+      }
+
+      // A ReadEra document may carry nothing but a reading position, which is
+      // still worth importing.
+      if (conversion.notes.length === 0 && !conversion.location) {
+        eventDispatcher.dispatch('toast', {
+          type: 'info',
+          message: _('No annotations found in the file.'),
+          timeout: 2000,
+        });
+        return;
+      }
+
+      const config = getConfig(bookKey)!;
+      const { merged, applied, added, updated } = mergeImportedBookNotes(
+        config.booknotes ?? [],
+        conversion.notes,
+      );
+      let updatedConfig = updateBooknotes(bookKey, merged);
+      // Same rule as the Readest importer: only adopt ReadEra's reading
+      // position when this book has none of its own, so importing into a book
+      // you are midway through never moves you.
+      if (updatedConfig && conversion.location && !config.location) {
+        const position = { location: conversion.location };
+        setConfig(bookKey, position);
+        updatedConfig = { ...updatedConfig, ...position };
+      }
+      if (updatedConfig) {
+        saveConfig(envConfig, bookKey, updatedConfig, settings);
+      }
+
+      const views = getViewsById(bookKey.split('-')[0]!);
+      for (const note of applied) {
+        try {
+          views.forEach((v) => v?.addAnnotation(note));
+        } catch (err) {
+          console.warn('Failed to add imported annotation', { note, err });
+        }
+      }
+
+      const imported = added + updated;
+      const parts: string[] = [
+        imported > 0
+          ? _('Imported {{count}} annotations', { count: imported })
+          : _('No new annotations to import'),
+      ];
+      if (conversion.unmatched > 0) {
+        parts.push(_('{{count}} not found in this book', { count: conversion.unmatched }));
+      }
+      eventDispatcher.dispatch('toast', {
+        type: conversion.unmatched > 0 ? 'warning' : 'info',
+        message: parts.join(' · '),
+        timeout: 3500,
+      });
+    } finally {
+      setImportingAnnotations(false);
+    }
+  };
+
+  const importFromReadest = async () => {
+    setShowImportDialog(false);
+
+    const { bookDoc, book } = bookData;
+    if (!bookDoc || !book) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('Book is not ready yet, please try again.'),
+        timeout: 2000,
+      });
+      return;
+    }
+
+    const result = await selectFiles({
+      type: 'generic',
+      accept: '.json,application/json',
+      extensions: ['json'],
+      multiple: false,
+      dialogTitle: _('Select Readest Annotations File'),
+    });
+    if (result.error || result.files.length === 0) return;
+
+    const content = await readSelectedFileText(result.files[0]!);
+    if (!content) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('Failed to read the selected file.'),
+        timeout: 2000,
+      });
+      return;
+    }
+
+    const payload = parseAnnotationExport(content);
+    if (!payload) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('This is not a Readest annotations file.'),
+        timeout: 3000,
+      });
+      return;
+    }
+    if (payload.annotations.length === 0) {
+      eventDispatcher.dispatch('toast', {
+        type: 'info',
+        message: _('No annotations found in the file.'),
+        timeout: 2000,
+      });
+      return;
+    }
+
+    setImportingAnnotations(true);
+    try {
+      let conversion;
+      try {
+        conversion = await convertAnnotationExportToBookNotes(payload, bookDoc);
+      } catch (e) {
+        console.warn('Failed to convert Readest annotations:', e);
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('Failed to import annotations.'),
+          timeout: 3000,
+        });
+        return;
+      }
+
+      const config = getConfig(bookKey)!;
+      const { merged, applied, added, updated } = mergeImportedBookNotes(
+        config.booknotes ?? [],
+        conversion.notes,
+      );
+      let updatedConfig = updateBooknotes(bookKey, merged);
+      // Only adopt the exported reading position when this book has none of
+      // its own, so importing into a book you are midway through never moves
+      // you. A freshly re-downloaded copy does pick its position back up.
+      if (updatedConfig && payload.location && !config.location) {
+        const position = {
+          location: payload.location,
+          ...(payload.progress ? { progress: payload.progress } : {}),
+        };
+        setConfig(bookKey, position);
+        updatedConfig = { ...updatedConfig, ...position };
+      }
+      if (updatedConfig) {
+        saveConfig(envConfig, bookKey, updatedConfig, settings);
+      }
+
+      const views = getViewsById(bookKey.split('-')[0]!);
+      for (const note of applied) {
+        try {
+          views.forEach((v) => v?.addAnnotation(note));
+        } catch (err) {
+          console.warn('Failed to add imported annotation', { note, err });
+        }
+      }
+
+      const imported = added + updated;
+      const parts: string[] = [
+        imported > 0
+          ? _('Imported {{count}} annotations', { count: imported })
+          : _('No new annotations to import'),
+      ];
+      if (conversion.reanchored > 0) {
+        parts.push(_('{{count}} relocated', { count: conversion.reanchored }));
+      }
+      if (conversion.unmatched > 0) {
+        parts.push(_('{{count}} not found in this book', { count: conversion.unmatched }));
+      }
+      eventDispatcher.dispatch('toast', {
+        type: conversion.unmatched > 0 ? 'warning' : 'info',
+        message: parts.join(' · '),
+        timeout: 3500,
+      });
+    } finally {
+      setImportingAnnotations(false);
+    }
+  };
+
+  const handleExportMarkdown = async (event: CustomEvent) => {
+    const { bookKey: exportBookKey } = event.detail;
+    if (bookKey !== exportBookKey) return;
+
+    const { bookDoc, book } = bookData;
+    if (!bookDoc || !book) return;
+
+    const config = getConfig(bookKey)!;
+    const { booknotes: allNotes = [] } = config;
+    const booknotes = allNotes.filter((note) => note.type !== 'notebook' && !note.deletedAt);
+    if (booknotes.length === 0) {
+      eventDispatcher.dispatch('toast', {
+        type: 'info',
+        message: _('No annotations to export'),
+        className: 'whitespace-nowrap',
+        timeout: 2000,
+      });
+      return;
+    }
+
+    // Organize booknotes into groups by chapter
+    const booknoteGroups: { [href: string]: BooknoteGroup } = {};
+    for (const booknote of booknotes) {
+      const tocItem = findTocItemBS(bookDoc.toc ?? [], booknote.cfi);
+      const href = tocItem?.href || '';
+      const label = tocItem?.label || '';
+      const id = tocItem?.id || 0;
+      if (!booknoteGroups[href]) {
+        booknoteGroups[href] = { id, href, label, booknotes: [] };
+      }
+      booknoteGroups[href].booknotes.push(booknote);
+    }
+
+    Object.values(booknoteGroups).forEach((group) => {
+      group.booknotes.sort((a, b) => {
+        return CFI.compare(a.cfi, b.cfi);
+      });
+    });
+
+    setExportData({ booknoteGroups });
+    setShowExportDialog(true);
+  };
+
+  const handleConfirmExport = async (
+    content: string,
+    format: NoteExportFormat,
+    {
+      share,
+      sharePosition,
+    }: {
+      share: boolean;
+      sharePosition?: { x: number; y: number; preferredEdge?: 'top' | 'bottom' | 'left' | 'right' };
+    },
+  ) => {
+    const { book } = bookData;
+    if (!book) return;
+
+    // The JSON file is meant to be re-imported, not pasted somewhere, so it
+    // doesn't hijack the clipboard the way the prose formats do.
+    if (format !== 'json') {
+      setTimeout(() => {
+        // Delay to ensure it won't be overridden by system clipboard actions
+        void writeTextToClipboard(content);
+      }, 100);
+    }
+
+    const ext = format === 'json' ? 'json' : format === 'text' ? 'txt' : 'md';
+    const mimeType =
+      format === 'json' ? 'application/json' : format === 'text' ? 'text/plain' : 'text/markdown';
+    const safeTitle = makeSafeFilename(book.title);
+    const filename = format === 'json' ? `${safeTitle}-annotations.json` : `${safeTitle}.${ext}`;
+    const saved = await appService?.saveFile(filename, content, {
+      mimeType,
+      share,
+      sharePosition,
+    });
+
+    // The macOS share sheet gives its own feedback; the Save panel does not.
+    if (share && appService?.isMacOSApp) return;
+    // Without the clipboard fallback there is nothing to fall back to, so a
+    // failed JSON save has to be reported as a failure.
+    const failedJson = format === 'json' && !saved;
+    eventDispatcher.dispatch('toast', {
+      type: failedJson ? 'warning' : 'info',
+      message: failedJson
+        ? _('Failed to export annotations.')
+        : saved
+          ? _('Exported successfully')
+          : _('Copied to clipboard'),
+      timeout: 2000,
+    });
+  };
+
+  const handleCancelExport = () => {
+    setShowExportDialog(false);
+    setExportData(null);
+  };
+
+  // Show the confirm dialog when the BookMenu fires "clear-annotations"
+  // for this book. We snapshot the count up-front so the dialog shows a
+  // stable number even if `getConfig` updates underneath us.
+  const handleClearAnnotations = (event: CustomEvent) => {
+    const { bookKey: targetBookKey } = event.detail;
+    if (bookKey !== targetBookKey) return;
+    const cfg = getConfig(bookKey);
+    const count = (cfg?.booknotes ?? []).filter(
+      (n) => n.type === 'annotation' && !n.deletedAt,
+    ).length;
+    if (count === 0) return;
+    setClearAnnotationsCount(count);
+  };
+
+  // Soft-delete every type='annotation' booknote on the active book by
+  // stamping `deletedAt`. Bookmarks and excerpts are intentionally left
+  // alone — they live in distinct sidebar tabs.
+  const performClearAnnotations = () => {
+    const latestConfig = getConfig(bookKey);
+    if (!latestConfig) return;
+    const { booknotes: storedNotes = [] } = latestConfig;
+    const now = Date.now();
+    const views = getViewsById(bookKey.split('-')[0]!);
+    let cleared = 0;
+    storedNotes.forEach((note) => {
+      if (note.type === 'annotation' && !note.deletedAt) {
+        note.deletedAt = nextBooknoteStamp(note, now);
+        cleared += 1;
+        // Drop the rendered overlay so the page reflects the cleared
+        // state immediately without waiting for a relocate.
+        views.forEach((view) => removeBookNoteOverlays(view, note));
+      }
+    });
+    if (cleared === 0) return;
+
+    const updatedConfig = updateBooknotes(bookKey, storedNotes);
+    if (updatedConfig) {
+      saveConfig(envConfig, bookKey, updatedConfig, settings);
+    }
+    // Reset any browse-mode state in the annotations sidebar tab so it
+    // doesn't keep paging through stale (now soft-deleted) entries.
+    clearBooknotesNav(bookKey);
+
+    eventDispatcher.dispatch('toast', {
+      type: 'info',
+      message: _('Cleared {{count}} highlights and notes.', { count: cleared }),
+      timeout: 2000,
+    });
+  };
+
+  const selectionAnnotated = selection?.annotated;
+  // A popup-window selection without a CFI (data-attribute footnotes render
+  // synthesized text with no real text node in the book) can't anchor
+  // anything; and TTS always needs a range in a main view document.
+  const popupSelectionNoCfi = !!selection?.popup && !selection?.cfi;
+  const buildToolButton = (type: AnnotationToolType) => {
+    const def = annotationToolButtons.find((button) => button.type === type);
+    if (!def) return null;
+    const { label, Icon } = def;
+    switch (type) {
+      case 'copy':
+        return { tooltipText: _(label), Icon, onClick: handleCopy };
+      case 'copylink':
+        return {
+          tooltipText: _(label),
+          Icon,
+          onClick: handleCopyLink,
+          disabled: popupSelectionNoCfi,
+        };
+      case 'highlight':
+        return {
+          tooltipText: selectionAnnotated ? _('Delete Highlight') : _(label),
+          Icon: selectionAnnotated ? RiDeleteBinLine : Icon,
+          onClick: handleHighlight,
+          disabled: popupSelectionNoCfi,
+        };
+      case 'annotate':
+        return {
+          tooltipText: _(label),
+          Icon,
+          onClick: handleAnnotate,
+          disabled: popupSelectionNoCfi,
+        };
+      case 'search':
+        return { tooltipText: _(label), Icon, onClick: handleSearch };
+      case 'dictionary':
+        return { tooltipText: _(label), Icon, onClick: handleDictionary };
+      case 'translate':
+        return { tooltipText: _(label), Icon, onClick: handleTranslation };
+      case 'tts':
+        return {
+          tooltipText: _(label),
+          Icon,
+          onClick: () => handleSpeakText(true),
+          disabled: !!selection?.popup,
+        };
+      case 'proofread':
+        return {
+          tooltipText: _(label),
+          Icon,
+          onClick: handleProofread,
+          disabled: !supportsProofread(bookData.book?.format) || popupSelectionNoCfi,
+        };
+      case 'share':
+        return { tooltipText: _(label), Icon, onClick: handleShare };
+      case 'quotecard':
+        return { tooltipText: _(label), Icon, onClick: () => void handleQuoteCard() };
+      default:
+        return null;
+    }
+  };
+
+  const toolButtons = toolbarToolTypes
+    .map(buildToolButton)
+    .filter((button): button is NonNullable<typeof button> => button !== null);
+
+  // The lookup popups never deselect (handleDictionary / handleTranslation /
+  // handleProofread only flip popup flags), so a genuine selection is still
+  // live when one closes — return to its toolbar instead of discarding it
+  // (#5213). The instant dictionary is the one exception, and the block below
+  // puts its selection back so it lands on the same footing. Word Lens gloss taps and taps on an existing highlight
+  // synthesize their selection with isTextSelected left false, and an empty
+  // toolbar has nothing to return to: those keep the full dismiss. The
+  // consuming actions are a different class by design — copy, share, search,
+  // and TTS spend the selection (TTS deselects deliberately), and highlight /
+  // annotate replace it with the created annotation — so they are not here.
+  const handleDismissPopupShowToolbar = () => {
+    // The instant dictionary is the one lookup that deselects as it opens, so
+    // its dismiss has to put the range back before the check below — otherwise
+    // the word it just defined can never be highlighted or copied (#6213).
+    // That is opt-in: by default the dismiss returns straight to reading (#6454).
+    if (instantLookupDeselectedRef.current) {
+      instantLookupDeselectedRef.current = false;
+      if (
+        viewSettings.keepSelectionAfterLookup &&
+        selection &&
+        restoreSelectionRange(selection.range)
+      ) {
+        if (selection.popup) popupRestoredRangeRef.current = selection.range.cloneRange();
+        isTextSelected.current = true;
+        // `quickActionHandled` rides along with the selection from here on, so a
+        // later republish of it (handleHighlight stamps `annotated`) can't be
+        // read as a fresh selection and re-open the lookup we just closed.
+        setSelection({ ...selection, quickActionHandled: true });
+      }
+    }
+    if (isTextSelected.current && toolButtons.length > 0) {
+      handleShowAnnotPopup();
+    } else {
+      handleDismissPopupAndSelection();
+    }
+  };
+
+  // The range editors are fixed full-screen overlays rendered after the popups
+  // and sheets, so their handles would float on top of the dictionary, the
+  // translator, the proofreader or the note editor (#5815). They belong to the
+  // toolbar: hide them while any of those is open, and let them come back with
+  // the toolbar (or go with the dismiss).
+  const overlaySurfaceOpen =
+    showDictionaryPopup || showDeepLPopup || showProofreadPopup || !!noteEditorTarget;
+
+  // Below `sm` (or short landscape) the note editor is a bottom sheet rather
+  // than a popup pinned to the selection: an anchored editor would sit under
+  // the on-screen keyboard. Same heuristic the dictionary uses.
+  const noteEditorInSheet =
+    !!noteEditorTarget && (window.innerWidth < 640 || window.innerHeight < 640);
+  const noteEditorInPopup = !!noteEditorTarget && !noteEditorInSheet;
+  const editedNoteText =
+    config.booknotes?.find((annotation) => annotation.id === noteEditorTarget?.annotationId)
+      ?.note || '';
+
+  return (
+    <div ref={containerRef} role='toolbar' tabIndex={-1}>
+      <PageTurnHint bookKey={bookKey} contentInsets={contentInsets} hint={turnHint} />
+      {showDictionaryPopup &&
+        (() => {
+          // Below `sm` (or short landscape) we present the dictionary as a
+          // bottom sheet — the anchored popup gets cramped at this size.
+          // Matches the `isMobile` heuristic used by `Dialog`.
+          const useSheet = window.innerWidth < 640 || window.innerHeight < 640;
+          const onManage = () => {
+            // Dismiss so the user returns to the reader cleanly when they
+            // close settings; the dictionaries sub-page in SettingsDialog
+            // is enough surface for managing providers.
+            handleDismissPopupAndSelection();
+            setSettingsDialogBookKey(bookKey);
+            setActiveSettingsItemId('settings.language.dictionaries.manage');
+            setSettingsDialogOpen(true);
+          };
+          if (useSheet) {
+            return (
+              <DictionarySheet
+                word={selection?.text as string}
+                lang={bookData.bookDoc?.metadata.language as string}
+                selection={dictionarySelection}
+                capture={dictionaryCapture}
+                onDismiss={handleDismissPopupShowToolbar}
+                onManage={onManage}
+              />
+            );
+          }
+          if (!trianglePosition || !dictPopupPosition) return null;
+          return (
+            <DictionaryPopup
+              word={selection?.text as string}
+              lang={bookData.bookDoc?.metadata.language as string}
+              selection={dictionarySelection}
+              capture={dictionaryCapture}
+              position={dictPopupPosition}
+              trianglePosition={trianglePosition}
+              popupWidth={dictPopupWidth}
+              popupHeight={dictPopupHeight}
+              onDismiss={handleDismissPopupShowToolbar}
+              onManage={onManage}
+            />
+          );
+        })()}
+      {showDeepLPopup && trianglePosition && translatorPopupPosition && (
+        <TranslatorPopup
+          bookKey={bookKey}
+          text={selection?.text as string}
+          position={translatorPopupPosition}
+          trianglePosition={trianglePosition}
+          popupWidth={transPopupWidth}
+          popupHeight={transPopupHeight}
+          onDismiss={handleDismissPopupShowToolbar}
+        />
+      )}
+      {noteEditorInSheet && (
+        <NoteEditorSheet
+          value={editedNoteText}
+          onSave={handleSaveNote}
+          onCancel={handleCancelNote}
+        />
+      )}
+      {showAnnotPopup &&
+        !noteEditorInSheet &&
+        trianglePosition &&
+        annotPopupPosition &&
+        // With an empty toolbar, suppress the popup on a plain selection rather
+        // than showing an empty bar. Still allow it for editing an existing
+        // highlight (options), viewing its notes, or writing a new one.
+        (toolButtons.length > 0 ||
+          highlightOptionsVisible ||
+          annotationNotes.length > 0 ||
+          noteEditorInPopup) && (
+          <AnnotationPopup
+            bookKey={bookKey}
+            dir={viewSettings.rtl ? 'rtl' : 'ltr'}
+            isVertical={viewSettings.vertical}
+            buttons={toolButtons}
+            notes={annotationNotes}
+            onEditNote={handleEditNote}
+            noteEditor={
+              noteEditorInPopup
+                ? { value: editedNoteText, onSave: handleSaveNote, onCancel: handleCancelNote }
+                : null
+            }
+            position={annotPopupPosition}
+            trianglePosition={trianglePosition}
+            highlightOptionsVisible={highlightOptionsVisible}
+            selectedStyle={selectedStyle}
+            selectedColor={selectedColor}
+            popupWidth={annotPopupWidth}
+            popupHeight={annotPopupHeight}
+            globalToggleAvailable={globalToggleAvailable}
+            globalToggleActive={globalToggleActive}
+            onToggleGlobal={handleToggleGlobal}
+            onHighlight={handleHighlight}
+            onDismiss={noteEditorTarget ? handleCancelNote : handleDismissPopupAndSelection}
+          />
+        )}
+      {showProofreadPopup && trianglePosition && proofreadPopupPosition && selection && (
+        <ProofreadPopup
+          bookKey={bookKey}
+          selection={selection}
+          position={proofreadPopupPosition}
+          trianglePosition={trianglePosition}
+          popupWidth={proofreadPopupWidth}
+          popupHeight={proofreadPopupHeight}
+          onDismiss={handleDismissPopupShowToolbar}
+          onManage={() => {
+            handleDismissPopupAndSelection();
+            setProofreadRulesVisibility(true);
+          }}
+        />
+      )}
+      {!editingAnnotation &&
+        !overlaySurfaceOpen &&
+        selection?.handlesSuppressed &&
+        selection.range && (
+          <SelectionRangeEditor
+            bookKey={bookKey}
+            isVertical={viewSettings.vertical}
+            selection={selection}
+            handleColor={selectedColor}
+            onDragTo={dragSelectionTo}
+            onStartDrag={handleStartEditAnnotation}
+            noteAutoTurnPoint={noteAutoTurnPoint}
+            cancelAutoTurn={cancelAutoTurn}
+            onAutoTurn={onAutoTurn}
+          />
+        )}
+      {editingAnnotation && editingAnnotation.color && selection && !overlaySurfaceOpen && (
+        <AnnotationRangeEditor
+          // The editor latches its annotation on mount; going straight from
+          // one highlight to another must not reuse it.
+          key={editingAnnotation.id}
+          bookKey={bookKey}
+          isVertical={viewSettings.vertical}
+          annotation={editingAnnotation}
+          selection={selection}
+          handleColor={selectedColor}
+          externalDragPoint={externalDragPoint}
+          getAnnotationText={getAnnotationText}
+          setSelection={setSelection}
+          onStartEdit={handleStartEditAnnotation}
+          noteAutoTurnPoint={noteAutoTurnPoint}
+          cancelAutoTurn={cancelAutoTurn}
+          onAutoTurn={onAutoTurn}
+        />
+      )}
+      {quoteCard && (
+        <QuoteCardDialog
+          isOpen
+          content={quoteCard.content}
+          readerColors={quoteCard.readerColors}
+          fontFamilies={quoteCard.fontFamilies}
+          defaultFont={quoteCard.defaultFont}
+          onClose={handleCloseQuoteCard}
+        />
+      )}
+      {showExportDialog && exportData && bookData.book && (
+        <ExportMarkdownDialog
+          bookKey={bookKey}
+          isOpen={showExportDialog}
+          bookHash={bookData.book.hash}
+          bookMetaHash={bookData.book.metaHash}
+          bookTitle={bookData.book.title}
+          bookAuthor={bookData.book.author || ''}
+          bookFormat={bookData.book.format}
+          progress={getConfig(bookKey)?.progress}
+          location={getConfig(bookKey)?.location}
+          booknoteGroups={exportData.booknoteGroups}
+          onCancel={handleCancelExport}
+          onExport={handleConfirmExport}
+        />
+      )}
+      {showImportDialog && (
+        <ImportAnnotationsDialog
+          isOpen={showImportDialog}
+          onClose={() => setShowImportDialog(false)}
+          onImportMoonReader={importFromMoonReader}
+          onImportReadEra={importFromReadEra}
+          onImportReadest={importFromReadest}
+        />
+      )}
+      {clearAnnotationsCount > 0 && (
+        <ModalPortal>
+          <Alert
+            title={_('Clear Annotations')}
+            message={_('Are you sure to clear all {{count}} highlights and notes?', {
+              count: clearAnnotationsCount,
+            })}
+            onCancel={() => setClearAnnotationsCount(0)}
+            onConfirm={() => {
+              setClearAnnotationsCount(0);
+              performClearAnnotations();
+            }}
+          />
+        </ModalPortal>
+      )}
+      {importingAnnotations && (
+        <div
+          data-capture-blocking-overlay='true'
+          className='fixed inset-0 z-50 flex items-center justify-center bg-black/30'
+        >
+          <div className='modal-box bg-base-100 flex flex-col items-center gap-3 px-8 py-6 shadow-2xl'>
+            <svg className='text-primary h-8 w-8 animate-spin' viewBox='0 0 24 24' fill='none'>
+              <circle
+                className='opacity-25'
+                cx='12'
+                cy='12'
+                r='10'
+                stroke='currentColor'
+                strokeWidth='4'
+              />
+              <path
+                className='opacity-75'
+                fill='currentColor'
+                d='M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z'
+              />
+            </svg>
+            <p className='font-size-sm text-base-content'>{_('Importing annotations...')}</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default Annotator;

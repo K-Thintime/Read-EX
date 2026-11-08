@@ -1,0 +1,201 @@
+import withSerwistInit from '@serwist/next';
+import withBundleAnalyzer from '@next/bundle-analyzer';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const isDev = process.env['NODE_ENV'] === 'development';
+const appPlatform = process.env['NEXT_PUBLIC_APP_PLATFORM'];
+
+if (isDev) {
+  const { initOpenNextCloudflareForDev } = await import('@opennextjs/cloudflare');
+  initOpenNextCloudflareForDev();
+}
+
+const exportOutput = appPlatform !== 'web' && !isDev;
+// Opt-in standalone output, set only by the Docker production build
+// (Dockerfile). Every other path keeps the original behavior: Tauri `export`,
+// local `build-web` (output undefined), dev, and the Cloudflare/OpenNext
+// deploy — which forces standalone itself via NEXT_PRIVATE_STANDALONE.
+const standaloneOutput = !exportOutput && process.env['BUILD_STANDALONE'] === 'true';
+
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // Ensure Next.js uses SSG instead of SSR
+  // https://nextjs.org/docs/pages/building-your-application/deploying/static-exports
+  // The Docker production image opts into a self-contained `.next/standalone`
+  // tree (see Dockerfile) so it can ship only the traced runtime; all other
+  // web builds fall back to the default server output.
+  output: exportOutput ? 'export' : standaloneOutput ? 'standalone' : undefined,
+  // Emit browser source maps for the Tauri export build so Sentry can
+  // symbolicate crashes. `scripts/upload-sourcemaps.mjs` uploads them after the
+  // build and strips the .map files, so they never ship inside the app bundle.
+  productionBrowserSourceMaps: exportOutput,
+  // Monorepo: trace from the repo root so workspace packages land in the
+  // standalone tree. Only relevant to — and only set for — the Docker build.
+  outputFileTracingRoot: standaloneOutput ? path.join(__dirname, '../../') : undefined,
+  pageExtensions: exportOutput ? ['jsx', 'tsx'] : ['js', 'jsx', 'ts', 'tsx'],
+  // Note: This feature is required to use the Next.js Image component in SSG mode.
+  // See https://nextjs.org/docs/messages/export-image-api for different workarounds.
+  images: {
+    unoptimized: true,
+  },
+  devIndicators: false,
+  experimental: {
+    // Dev caching is on by default since Next 16.1. We deliberately turn OFF
+    // Turbopack's build cache, which Next 16.4 enables by default: a build
+    // interrupted mid-compile leaves a partial cache that the next build
+    // mishandles, fanning out workers until it exhausts RAM, and a warm cache
+    // can abort with a turbo-tasks panic (`get_disjoint_mut` was called with
+    // equal keys) when the import graph changes.
+    turbopackFileSystemCacheForDev: true,
+    turbopackFileSystemCacheForBuild: false,
+    // `middleware.ts` matches /api/*, so Next buffers a clone of every request
+    // body to let both the middleware and the route handler read it. Past this
+    // limit the clone is truncated and the handler sees a short body ending
+    // cleanly — an upload that "succeeds" while storing a corrupt file, with no
+    // error to the client (#6091).
+    //
+    // The clone is buffered in memory before any handler can reject it, which
+    // makes this ceiling an unauthenticated memory budget on every /api/* route
+    // — so only the self-hosted image, which may proxy whole book files through
+    // the Node server, gets real headroom. `standaloneOutput` is the right gate
+    // because BUILD_STANDALONE is set by the Dockerfile alone: web.readest.com
+    // runs on Cloudflare/Vercel, never on that image. (This value is baked into
+    // required-server-files.json at build time, so a runtime env var could not
+    // do the same job.)
+    //
+    // 32MB is deliberately under SEND_INBOX_FILE_MAX_BYTES (40MB): the only
+    // build that both runs the Node server and takes that route is a plain
+    // `next start`, since Cloudflare and Vercel never reach this code path, so
+    // the tighter budget is worth more there than the last 8MB of an upload.
+    proxyClientMaxBodySize: standaloneOutput ? 1024 * 1024 * 1024 : 32 * 1024 * 1024,
+  },
+  // Configure assetPrefix or else the server won't properly resolve your assets.
+  assetPrefix: '',
+  reactStrictMode: true,
+  serverExternalPackages: ['isows'],
+  allowedDevOrigins: ['192.168.2.120'],
+  webpack: (config, { isServer }) => {
+    config.resolve.alias = {
+      ...config.resolve.alias,
+      nunjucks: 'nunjucks/browser/nunjucks.js',
+      // `js-mdict` is consumed as TS source via tsconfig paths from
+      // `packages/js-mdict/src/`; its sources `import 'fflate'` directly.
+      // Without an alias, webpack walks up from that source location and
+      // can't find fflate (only installed in this app's node_modules).
+      fflate: path.resolve(__dirname, 'node_modules/fflate'),
+      ...(appPlatform !== 'web' ? { '@readest/turso-database-wasm/webpack': false } : {}),
+      // music-metadata only parses user-picked files in the browser; its
+      // file-type dependency leaves a webpackIgnore'd `import('strtok3')` in
+      // the server bundle that the OpenNext esbuild pass cannot resolve.
+      ...(isServer && appPlatform === 'web'
+        ? {
+            '@readest/turso-database-wasm/webpack': false,
+            'jieba-wasm': false,
+            'music-metadata': false,
+          }
+        : {}),
+    };
+    return config;
+  },
+  turbopack: {
+    resolveAlias: {
+      nunjucks: 'nunjucks/browser/nunjucks.js',
+      // Turbopack rejects absolute paths in resolveAlias ("server relative
+      // imports not implemented") — use a project-relative path.
+      fflate: './node_modules/fflate',
+      // Only the web build stores its database in turso's WASM build; Tauri
+      // embeds every file in `out/`, so emitting the unused WASM there would
+      // ship it inside the app.
+      ...(appPlatform !== 'web'
+        ? { '@readest/turso-database-wasm/webpack': './src/utils/stub.ts' }
+        : {}),
+    },
+  },
+  transpilePackages: [
+    'ai',
+    'ai-sdk-ollama',
+    '@ai-sdk/react',
+    '@assistant-ui/react',
+    '@assistant-ui/react-ai-sdk',
+    '@assistant-ui/react-markdown',
+    'streamdown',
+    ...(isDev
+      ? []
+      : [
+          'i18next-browser-languagedetector',
+          'react-i18next',
+          'i18next',
+          '@tauri-apps',
+          'highlight.js',
+          'foliate-js',
+          'marked',
+        ]),
+  ],
+  async rewrites() {
+    return [
+      {
+        source: '/reader/:ids',
+        destination: '/reader?ids=:ids',
+      },
+      {
+        source: '/o/book/:hash/annotation/:id',
+        destination: '/o?book=:hash&note=:id',
+      },
+      {
+        source: '/s/:token',
+        destination: '/s?token=:token',
+      },
+    ];
+  },
+  async headers() {
+    return [
+      {
+        source: '/.well-known/apple-app-site-association',
+        headers: [
+          {
+            key: 'Content-Type',
+            value: 'application/json',
+          },
+        ],
+      },
+      {
+        source: '/_next/static/:path*',
+        headers: [
+          {
+            key: 'Cross-Origin-Embedder-Policy',
+            value: 'require-corp',
+          },
+          {
+            key: 'Cache-Control',
+            value: isDev
+              ? 'public, max-age=0, must-revalidate'
+              : 'public, max-age=31536000, immutable',
+          },
+        ],
+      },
+    ];
+  },
+};
+
+const pwaDisabled = isDev || appPlatform !== 'web';
+
+const withPWA = pwaDisabled
+  ? (config) => config
+  : withSerwistInit({
+      swSrc: 'src/sw.ts',
+      swDest: 'public/sw.js',
+      cacheOnNavigation: true,
+      reloadOnOnline: true,
+      disable: false,
+      register: true,
+      scope: '/',
+    });
+
+const withAnalyzer = withBundleAnalyzer({
+  enabled: process.env.ANALYZE === 'true',
+});
+
+export default withPWA(withAnalyzer(nextConfig));

@@ -1,0 +1,743 @@
+use serde::de::DeserializeOwned;
+use std::collections::HashMap;
+use tauri::{plugin::PluginApi, AppHandle, Runtime};
+
+use crate::models::*;
+
+pub fn init<R: Runtime, C: DeserializeOwned>(
+    app: &AppHandle<R>,
+    _api: PluginApi<R, C>,
+) -> crate::Result<NativeBridge<R>> {
+    // keyring v4 split the library into `keyring-core` plus a
+    // per-platform credential-store crate. The default store is a
+    // process-wide global that must be installed before the first
+    // `Entry::new` call. `set_default_store` is idempotent — calling
+    // it again on plugin re-init just replaces the previous handle.
+    // We log and swallow errors so a misconfigured keychain doesn't
+    // block plugin init; downstream calls then fail with NoDefaultStore
+    // and the TS layer falls back to the ephemeral store.
+    install_default_keyring_store();
+    Ok(NativeBridge(app.clone()))
+}
+
+#[cfg(target_os = "macos")]
+fn install_default_keyring_store() {
+    match apple_native_keyring_store::keychain::Store::new() {
+        Ok(store) => keyring_core::set_default_store(store),
+        Err(err) => eprintln!("[native-bridge] keychain store init failed: {err}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_default_keyring_store() {
+    match windows_native_keyring_store::Store::new() {
+        Ok(store) => keyring_core::set_default_store(store),
+        Err(err) => eprintln!("[native-bridge] credential manager init failed: {err}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_default_keyring_store() {
+    match dbus_secret_service_keyring_store::Store::new() {
+        Ok(store) => keyring_core::set_default_store(store),
+        Err(err) => eprintln!("[native-bridge] secret service init failed: {err}"),
+    }
+}
+
+/// Access to the native-bridge APIs.
+pub struct NativeBridge<R: Runtime>(AppHandle<R>);
+
+impl<R: Runtime> NativeBridge<R> {
+    pub fn auth_with_safari(&self, _payload: AuthRequest) -> crate::Result<AuthResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn auth_with_custom_tab(&self, _payload: AuthRequest) -> crate::Result<AuthResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn copy_uri_to_path(&self, _payload: CopyURIRequest) -> crate::Result<CopyURIResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn render_pdf_cover(
+        &self,
+        _payload: RenderPdfCoverRequest,
+    ) -> crate::Result<RenderPdfCoverResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn save_image_to_gallery(
+        &self,
+        _payload: SaveImageToGalleryRequest,
+    ) -> crate::Result<SaveImageToGalleryResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn use_background_audio(&self, _payload: UseBackgroundAudioRequest) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn set_multicast_lock(&self, _payload: MulticastLockRequest) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn set_selection_suppressed(
+        &self,
+        _payload: SetSelectionSuppressedRequest,
+    ) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn install_package(
+        &self,
+        _payload: InstallPackageRequest,
+    ) -> crate::Result<InstallPackageResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn set_system_ui_visibility(
+        &self,
+        _payload: SetSystemUIVisibilityRequest,
+    ) -> crate::Result<SetSystemUIVisibilityResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn get_status_bar_height(&self) -> crate::Result<GetStatusBarHeightResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn get_sys_fonts_list(&self) -> crate::Result<GetSysFontsListResponse> {
+        let font_collection = font_enumeration::Collection::new().unwrap();
+        let mut fonts = HashMap::new();
+        for font in font_collection.all() {
+            if cfg!(target_os = "windows") {
+                // FIXME: temporarily disable font name with style for windows
+                fonts.insert(font.family_name.clone(), font.family_name.clone());
+            } else {
+                fonts.insert(font.font_name.clone(), font.family_name.clone());
+            }
+        }
+        Ok(GetSysFontsListResponse { fonts, error: None })
+    }
+
+    pub fn intercept_keys(&self, _payload: InterceptKeysRequest) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn lock_screen_orientation(
+        &self,
+        _payload: LockScreenOrientationRequest,
+    ) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn iap_is_available(&self) -> crate::Result<IAPIsAvailableResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn iap_initialize(
+        &self,
+        _payload: IAPInitializeRequest,
+    ) -> crate::Result<IAPInitializeResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn iap_fetch_products(
+        &self,
+        _payload: IAPFetchProductsRequest,
+    ) -> crate::Result<IAPFetchProductsResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn iap_purchase_product(
+        &self,
+        _payload: IAPPurchaseProductRequest,
+    ) -> crate::Result<IAPPurchaseProductResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn iap_restore_purchases(&self) -> crate::Result<IAPRestorePurchasesResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn get_system_color_scheme(&self) -> crate::Result<GetSystemColorSchemeResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn get_safe_area_insets(&self) -> crate::Result<GetSafeAreaInsetsResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn set_screen_wake_lock(&self, _payload: SetScreenWakeLockRequest) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn get_screen_brightness(&self) -> crate::Result<GetScreenBrightnessResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn set_screen_brightness(
+        &self,
+        _payload: SetScreenBrightnessRequest,
+    ) -> crate::Result<SetScreenBrightnessResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn has_ambient_light_sensor(&self) -> crate::Result<HasAmbientLightSensorResponse> {
+        Ok(HasAmbientLightSensorResponse {
+            available: false,
+            error: None,
+        })
+    }
+
+    pub fn start_ambient_light_updates(&self) -> crate::Result<AmbientLightUpdatesResponse> {
+        Ok(AmbientLightUpdatesResponse {
+            success: false,
+            error: Some("unsupported".to_string()),
+        })
+    }
+
+    pub fn stop_ambient_light_updates(&self) -> crate::Result<AmbientLightUpdatesResponse> {
+        Ok(AmbientLightUpdatesResponse {
+            success: true,
+            error: None,
+        })
+    }
+
+    pub fn get_external_sdcard_path(&self) -> crate::Result<GetExternalSDCardPathResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn open_external_url(
+        &self,
+        _payload: OpenExternalUrlRequest,
+    ) -> crate::Result<OpenExternalUrlResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    /// Desktop has no mobile-style "system dictionary intent" surface;
+    /// macOS's HUD is invoked through a separate top-level Tauri
+    /// command (`show_lookup_popover` in `src/macos/system_dictionary.rs`),
+    /// and Linux/Windows have no native target. Return
+    /// UnsupportedPlatformError here so the TS layer doesn't
+    /// accidentally dispatch through the mobile plugin on desktop.
+    pub fn show_lookup_popover(
+        &self,
+        _payload: ShowLookupPopoverRequest,
+    ) -> crate::Result<ShowLookupPopoverResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn get_lookup_apps(&self) -> crate::Result<GetLookupAppsResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_status(&self) -> crate::Result<AnkiStatusResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_request_permission(&self) -> crate::Result<AnkiPermissionResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_list_decks(&self) -> crate::Result<AnkiListDecksResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_read_deck(
+        &self,
+        _payload: AnkiReadDeckRequest,
+    ) -> crate::Result<AnkiReadDeckResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_add_notes(
+        &self,
+        _payload: AnkiAddNotesRequest,
+    ) -> crate::Result<AnkiAddNotesResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_update_tags(
+        &self,
+        _payload: AnkiUpdateTagsRequest,
+    ) -> crate::Result<AnkiUpdateTagsResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn set_lookup_app(&self, _payload: SetLookupAppRequest) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn select_directory(&self) -> crate::Result<SelectDirectoryResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn show_file_picker(&self) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn get_storefront_region_code(&self) -> crate::Result<GetStorefrontRegionCodeResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn request_manage_storage_permission(
+        &self,
+    ) -> crate::Result<RequestManageStoragePermissionResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    // ── Sync passphrase keychain ────────────────────────────────────────
+    //
+    // Uses `keyring-core` v1 with a platform-specific credential store
+    // installed in `init()` above:
+    //   * macOS → Security framework Keychain (apple-native-keyring-store)
+    //   * Windows → Credential Manager (windows-native-keyring-store)
+    //   * Linux → Secret Service (dbus-secret-service-keyring-store)
+    //
+    // `service` and `user` form the keychain item identity. Service is
+    // the bundle id; user is a stable string ("default") so multiple
+    // Readest installs on the same machine could coexist with distinct
+    // user values if ever needed.
+
+    pub fn set_sync_passphrase(
+        &self,
+        payload: SetSyncPassphraseRequest,
+    ) -> crate::Result<SyncPassphraseResponse> {
+        match keyring_entry().and_then(|e| e.set_password(&payload.passphrase)) {
+            Ok(()) => Ok(SyncPassphraseResponse {
+                success: true,
+                error: None,
+            }),
+            Err(err) => Ok(SyncPassphraseResponse {
+                success: false,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    pub fn get_sync_passphrase(&self) -> crate::Result<GetSyncPassphraseResponse> {
+        match keyring_entry().and_then(|e| e.get_password()) {
+            Ok(passphrase) => Ok(GetSyncPassphraseResponse {
+                passphrase: Some(passphrase),
+                error: None,
+            }),
+            Err(keyring_core::Error::NoEntry) => Ok(GetSyncPassphraseResponse {
+                passphrase: None,
+                error: None,
+            }),
+            Err(err) => Ok(GetSyncPassphraseResponse {
+                passphrase: None,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    pub fn clear_sync_passphrase(&self) -> crate::Result<SyncPassphraseResponse> {
+        match keyring_entry().and_then(|e| e.delete_credential()) {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(SyncPassphraseResponse {
+                success: true,
+                error: None,
+            }),
+            Err(err) => Ok(SyncPassphraseResponse {
+                success: false,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    pub fn is_sync_keychain_available(&self) -> crate::Result<SyncKeychainAvailableResponse> {
+        // Best-effort probe: open an entry handle. Surface the error
+        // string instead of throwing so the TS layer can fall back
+        // to the ephemeral store gracefully.
+        match keyring_entry() {
+            Ok(_) => Ok(SyncKeychainAvailableResponse {
+                available: true,
+                error: None,
+            }),
+            Err(err) => Ok(SyncKeychainAvailableResponse {
+                available: false,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    /// Desktop has its own URL-clip path (`src/clip_url.rs` spawns a
+    /// hidden `WebviewWindow` and listens on `127.0.0.1`). The plugin
+    /// branch is mobile-only — if anyone calls into it from desktop,
+    /// surface that mistake instead of silently returning empty HTML.
+    pub fn clip_url(&self, _payload: ClipUrlRequest) -> crate::Result<ClipUrlResponse> {
+        Err(crate::Error::NativeBridgeError(
+            "clip_url plugin is mobile-only; desktop callers should invoke the top-level command"
+                .to_string(),
+        ))
+    }
+
+    pub fn open_web_browser(
+        &self,
+        _payload: WebBrowserRequest,
+    ) -> crate::Result<WebBrowserResponse> {
+        Err(crate::Error::NativeBridgeError(
+            "open_web_browser plugin is mobile-only; desktop callers should invoke the top-level command"
+                .to_string(),
+        ))
+    }
+
+    pub fn set_web_browser_status(&self, _payload: WebBrowserStatusRequest) -> crate::Result<()> {
+        Err(crate::Error::NativeBridgeError(
+            "set_web_browser_status plugin is mobile-only".to_string(),
+        ))
+    }
+
+    /// Share-Extension clip files only exist in the iOS App Group
+    /// container — desktop has no share extension.
+    pub fn read_share_clip_html(
+        &self,
+        _payload: ReadShareClipHtmlRequest,
+    ) -> crate::Result<ReadShareClipHtmlResponse> {
+        Ok(ReadShareClipHtmlResponse { html: None })
+    }
+
+    // ── Keyed secure key-value store ────────────────────────────────────
+    //
+    // Same keychain backends + fail-loud/fail-soft contract as the sync
+    // passphrase above, but each item gets its own keychain entry keyed by
+    // `key` (the item's `user`/account), so many independent secrets (OAuth
+    // refresh tokens and future provider credentials) coexist under one service
+    // without colliding with the passphrase entry (user "default").
+
+    pub fn set_secure_item(
+        &self,
+        payload: SetSecureItemRequest,
+    ) -> crate::Result<SecureItemResponse> {
+        match keyring_entry_for(&payload.key)
+            .and_then(|entry| set_secure_item_value(&entry, &payload.value))
+        {
+            Ok(()) => Ok(SecureItemResponse {
+                success: true,
+                error: None,
+            }),
+            Err(err) => Ok(SecureItemResponse {
+                success: false,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    pub fn get_secure_item(
+        &self,
+        payload: GetSecureItemRequest,
+    ) -> crate::Result<GetSecureItemResponse> {
+        match keyring_entry_for(&payload.key).and_then(|entry| get_secure_item_value(&entry)) {
+            Ok(value) => Ok(GetSecureItemResponse {
+                value: Some(value),
+                error: None,
+            }),
+            Err(keyring_core::Error::NoEntry) => Ok(GetSecureItemResponse {
+                value: None,
+                error: None,
+            }),
+            Err(err) => Ok(GetSecureItemResponse {
+                value: None,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    pub fn clear_secure_item(
+        &self,
+        payload: GetSecureItemRequest,
+    ) -> crate::Result<SecureItemResponse> {
+        match keyring_entry_for(&payload.key).and_then(|e| e.delete_credential()) {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(SecureItemResponse {
+                success: true,
+                error: None,
+            }),
+            Err(err) => Ok(SecureItemResponse {
+                success: false,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    /// E-ink panels exist only on the mobile (Android) side. Desktop has no
+    /// e-ink controller, so this is unsupported here.
+    pub fn refresh_eink_screen(&self) -> crate::Result<RefreshEinkScreenResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    /// BOOX pen hardware doesn't exist on desktop; report no capability
+    /// rather than erroring so callers can treat this the same as any other
+    /// non-BOOX platform and fall back to the pointer backend.
+    pub fn query_pen_capabilities(&self) -> crate::Result<QueryPenCapabilitiesResponse> {
+        Ok(QueryPenCapabilitiesResponse::default())
+    }
+
+    pub fn start_raw_drawing(&self, _payload: StartRawDrawingRequest) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn stop_raw_drawing(&self) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    /// E-ink panels exist only on the mobile (Android) side. Desktop has no
+    /// e-ink controller, so the deep refresh is never supported here.
+    pub fn is_eink_refresh_supported(&self) -> crate::Result<EinkRefreshSupportedResponse> {
+        Ok(EinkRefreshSupportedResponse { supported: false })
+    }
+
+    pub fn update_bookshelf_widget(
+        &self,
+        _payload: UpdateBookshelfWidgetRequest,
+    ) -> crate::Result<UpdateBookshelfWidgetResponse> {
+        // Home-screen widgets are mobile-only; desktop is a no-op.
+        Ok(UpdateBookshelfWidgetResponse::default())
+    }
+
+    pub fn get_bookshelf_widget_instances(
+        &self,
+    ) -> crate::Result<GetBookshelfWidgetInstancesResponse> {
+        // No home-screen widgets on desktop.
+        Ok(GetBookshelfWidgetInstancesResponse { instances: vec![] })
+    }
+
+    pub fn set_bookshelf_widget_catalog(
+        &self,
+        _payload: BookshelfWidgetCatalog,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
+    pub fn update_reading_widget(
+        &self,
+        _payload: UpdateReadingWidgetRequest,
+    ) -> crate::Result<UpdateReadingWidgetResponse> {
+        // Home-screen widgets are mobile-only; desktop is a no-op.
+        Ok(UpdateReadingWidgetResponse::default())
+    }
+
+    pub fn get_reading_widget_instances(&self) -> crate::Result<GetReadingWidgetInstancesResponse> {
+        // No home-screen widgets on desktop.
+        Ok(GetReadingWidgetInstancesResponse { instances: vec![] })
+    }
+
+    pub fn set_reading_widget_catalog(&self, _payload: ReadingWidgetCatalog) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot a region of `window`'s webview as image bytes for the mesh
+    /// page-curl texture (#555): PNG from WKWebView on macOS, JPEG of the
+    /// whole view from the DevTools protocol on Windows (WebView2) and the
+    /// Linux CEF runtime, where the JS side crops the region.
+    /// The Linux WebKitGTK runtime (only the webdriver E2E lane) rejects,
+    /// and the JS side falls back to the renderer's own turns.
+    pub fn capture_webview_region(
+        &self,
+        window: &tauri::WebviewWindow<R>,
+        payload: CaptureWebviewRegionRequest,
+    ) -> crate::Result<Vec<u8>> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::capture_webview_region(window, payload)
+        }
+        #[cfg(windows)]
+        {
+            let _ = payload;
+            crate::platform::windows::capture_webview_region(window)
+        }
+        #[cfg(all(target_os = "linux", feature = "cef"))]
+        {
+            let _ = payload;
+            crate::platform::linux_cef::capture_webview_region(window)
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            windows,
+            all(target_os = "linux", feature = "cef")
+        )))]
+        {
+            let _ = (window, payload);
+            Err(crate::Error::UnsupportedPlatformError)
+        }
+    }
+
+    /// Native cover for the two-column page curl (#6106): not implemented on
+    /// desktop, where the leaf keeps a paper back.
+    pub fn cover_webview_region(
+        &self,
+        window: &tauri::WebviewWindow<R>,
+        payload: CaptureWebviewRegionRequest,
+    ) -> crate::Result<CoverWebviewRegionResponse> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::cover_webview_region(window, payload)
+                .map(|token| CoverWebviewRegionResponse { token })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (window, payload);
+            Err(crate::Error::UnsupportedPlatformError)
+        }
+    }
+
+    pub fn uncover_webview_region(
+        &self,
+        window: &tauri::WebviewWindow<R>,
+        payload: UncoverWebviewRegionRequest,
+    ) -> crate::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::uncover_webview_region(window, payload.token)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (window, payload);
+            Err(crate::Error::UnsupportedPlatformError)
+        }
+    }
+
+    /// Probe the iCloud ubiquity container. Non-macOS desktops report
+    /// unavailable rather than erroring: the JS side treats `available:
+    /// false` as "this backend cannot run here", the same shape as a Mac
+    /// without an iCloud session.
+    pub fn icloud_container_status(&self) -> crate::Result<ICloudContainerStatusResponse> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::icloud_container_status()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(ICloudContainerStatusResponse {
+                available: false,
+                documents_path: None,
+            })
+        }
+    }
+
+    pub fn icloud_ensure_downloaded(
+        &self,
+        payload: ICloudEnsureDownloadedRequest,
+    ) -> crate::Result<ICloudEnsureDownloadedResponse> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::icloud_ensure_downloaded(payload)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = payload;
+            Err(crate::Error::UnsupportedPlatformError)
+        }
+    }
+}
+
+const KEYRING_SERVICE: &str = "Readest Safe Storage";
+const KEYRING_USER: &str = "default";
+
+fn keyring_entry() -> std::result::Result<keyring_core::Entry, keyring_core::Error> {
+    keyring_core::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+}
+
+/// Keychain entry for a keyed secure item — same service as the passphrase,
+/// with the caller's `key` as the per-item account so each secret is distinct.
+fn keyring_entry_for(key: &str) -> std::result::Result<keyring_core::Entry, keyring_core::Error> {
+    keyring_core::Entry::new(KEYRING_SERVICE, key)
+}
+
+// Windows Credential Manager caps generic credential blobs at 2,560 bytes.
+// `set_password` encodes strings as UTF-16, halving the usable space for the
+// opaque ASCII tokens stored here. Tagged UTF-8 keeps the full byte budget;
+// untagged entries remain readable through the legacy password path.
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_SECURE_ITEM_PREFIX: &[u8] = b"readest:utf8:v1:";
+
+#[cfg(any(target_os = "windows", test))]
+fn encode_windows_secure_item_value(value: &str) -> Vec<u8> {
+    [WINDOWS_SECURE_ITEM_PREFIX, value.as_bytes()].concat()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn decode_windows_secure_item_value(
+    mut encoded: Vec<u8>,
+) -> std::result::Result<Option<String>, keyring_core::Error> {
+    if !encoded.starts_with(WINDOWS_SECURE_ITEM_PREFIX) {
+        return Ok(None);
+    }
+    encoded.drain(..WINDOWS_SECURE_ITEM_PREFIX.len());
+    String::from_utf8(encoded)
+        .map(Some)
+        .map_err(|err| keyring_core::Error::BadEncoding(err.into_bytes()))
+}
+
+fn set_secure_item_value(
+    entry: &keyring_core::Entry,
+    value: &str,
+) -> std::result::Result<(), keyring_core::Error> {
+    #[cfg(target_os = "windows")]
+    {
+        entry.set_secret(&encode_windows_secure_item_value(value))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        entry.set_password(value)
+    }
+}
+
+fn get_secure_item_value(
+    entry: &keyring_core::Entry,
+) -> std::result::Result<String, keyring_core::Error> {
+    #[cfg(target_os = "windows")]
+    {
+        let encoded = entry.get_secret()?;
+        match decode_windows_secure_item_value(encoded)? {
+            Some(value) => Ok(value),
+            None => entry.get_password(),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        entry.get_password()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decode_windows_secure_item_value, encode_windows_secure_item_value,
+        WINDOWS_SECURE_ITEM_PREFIX,
+    };
+
+    #[test]
+    fn windows_secure_item_uses_utf8_without_losing_round_trip_fidelity() {
+        let value = "x".repeat(2_000);
+
+        // The legacy password path doubles ASCII into UTF-16 and exceeds
+        // Credential Manager's 2,560-byte generic-credential limit.
+        assert!(value.encode_utf16().count() * 2 > 2_560);
+
+        let encoded = encode_windows_secure_item_value(&value);
+        assert!(encoded.len() <= 2_560);
+        assert_eq!(
+            decode_windows_secure_item_value(encoded).unwrap(),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn windows_secure_item_detects_legacy_password_encoding() {
+        let encoded = "legacy".encode_utf16().flat_map(u16::to_le_bytes).collect();
+
+        assert_eq!(decode_windows_secure_item_value(encoded).unwrap(), None);
+    }
+
+    #[test]
+    fn windows_secure_item_rejects_invalid_tagged_utf8() {
+        let encoded = [WINDOWS_SECURE_ITEM_PREFIX, &[0xff]].concat();
+
+        assert!(matches!(
+            decode_windows_secure_item_value(encoded),
+            Err(keyring_core::Error::BadEncoding(_))
+        ));
+    }
+}

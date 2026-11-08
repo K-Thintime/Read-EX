@@ -1,0 +1,130 @@
+# Platform Compatibility Fixes Reference
+
+## Android
+
+### WebView API Issues
+- **`navigator.getGamepads()`** returns null on older WebView (#3245): Always null-check before `.some()`
+- **`CompressionStream`** unavailable on some Android WebView versions (#3255): Add fallback zip compression path
+- **Annotation tools unresponsive** (#3225): Don't call `makeSelection()` immediately on pointer-up; let popup flow complete naturally
+- **Safe inset updates** (#3469): Call `onUpdateInsets()` after `setSystemUIVisibility()`
+- **Navigation bar overlap** (#3466): Use `calc(env(safe-area-inset-bottom) + 16px)` for bottom padding
+
+### General Android Rules
+- Test with older WebView versions (97+)
+- Always check API availability before calling Web APIs
+- Touch event handling differs from iOS - avoid premature re-selection
+
+## iOS
+
+### Common Issues
+- **Slider touch dead zones** (#3382): Strip native appearance, use larger hit areas (min-h-12)
+- **Safe area insets stale** (#3395): Native Swift plugin must push updated insets
+- **Section content caching** (#3242, #3206): Don't cache section content in foliate-js when updating subitems; cached content retains stale styles after mode switch
+- **CompressionStream** (#3255): Also broken on iOS 15.x; zip.js has its own native API disable
+- **zip.js native API** (#3170): Disable native `CompressionStream`/`DecompressionStream` on iOS 15.x
+
+### iPad reports a desktop UA → never branch native dispatch on `getOSPlatform()`
+- `getOSPlatform()` (utils/misc) is **user-agent based**, and iPadOS sends a desktop "Macintosh" UA → it returns `'macos'` on iPad. Any native-OS dispatch keyed on it misroutes iPad to the macOS path.
+- Symptom seen: system dictionary on iPad threw `"Command show_lookup_popover not found"` — the macOS-only Rust command (`src-tauri/src/macos/system_dictionary.rs`); iOS only registers the plugin command `plugin:native-bridge|show_lookup_popover`.
+- **Rule:** for OS-specific native dispatch/capability, use `appService.isIOSApp / isMacOSApp / isAndroidApp` (derived from the Tauri OS plugin `type()` → `OS_TYPE` in `nativeAppService.ts`), NOT `getOSPlatform()`. The misc.ts comment says this explicitly.
+- Sync, non-React modules: `getInitializedAppService()` (environment.ts) returns the cached singleton synchronously (null pre-init). Used by `systemDictionary.ts` for `isSystemDictionarySupported()` (sync) + `invokeSystemDictionary()` (async).
+
+### iOS-Specific Code
+- `src-tauri/plugins/tauri-plugin-native-bridge/ios/Sources/NativeBridgePlugin.swift`
+- Slider CSS: `-webkit-appearance: none; appearance: none` in globals.css
+- `useSafeAreaInsets.ts` hook
+
+## macOS
+
+### Traffic Lights (Window Controls)
+- Check `isFullscreen()` before hiding (#3129)
+- Use timeouts (100ms) for visibility transitions (#3488)
+- Don't hide when sidebar is open (#3488)
+
+### Input Issues
+- **Context menu steals event loop** (#3324): 100ms setTimeout before calling menu.popup()
+- **Touchpad natural scrolling** (#3127): Respect system setting in `usePagination.ts`
+- **Two-finger swipe** (#3127): Support trackpad two-finger swipe for pagination
+
+### macOS-Specific Code
+- `src-tauri/src/macos/` - Platform-specific Rust code
+- `src/store/trafficLightStore.ts`
+- `src/hooks/useTrafficLight.ts`
+
+### mix-blend-mode does NOT cross the iframe boundary in WebKit (#5790/#5930/#5943)
+
+An element with `mix-blend-mode` that sits OUTSIDE an `<iframe>` blends against
+the iframe's painted content in **Chromium** (Android WebView, WebView2, web)
+but NOT in **WebKit** (Safari, WKWebView on macOS/iOS), where it degrades to
+`normal`. Probed directly in Chrome 152 vs Safari 18.6.
+
+This is why the reader's annotation overlay (`Overlayer` SVG, a sibling of the
+content iframe) rendered PDF highlights correctly on Apple platforms and wrong
+everywhere else. WebKitGTK behaves like Chromium here per the #5790 reporter
+(Flathub build reproduced).
+
+**How to apply:** never rely on `mix-blend-mode` across an iframe boundary for
+anything load-bearing, and never verify such an effect on macOS/iOS alone: the
+Apple result is the degraded path, so it looks right when the CSS is wrong.
+Related: [[overlayer-blend-mode-follows-page-not-theme-5790]].
+
+## Linux
+
+### WebKitGTK Issues
+- **View Transitions API unsupported** (#3417): Feature-detect `document.startViewTransition` before calling
+- Use `useAppRouter.ts` to avoid transitions on Linux
+
+## E-ink Devices
+
+### Legibility Issues
+- **Low contrast colors** (#3258): Use `not-eink:` Tailwind variant prefix for colors/opacity
+- **Links invisible** (#3258): Don't apply `text-primary` (blue) on e-ink; use default text color
+- **Opacity too low** (#3258): Don't apply `opacity-60`/`opacity-75` on e-ink devices
+- **Highlight visibility** (#3299): Use foreground color for highlights in dark mode e-ink
+
+### E-ink CSS Pattern
+```
+// Instead of:
+className="text-primary opacity-60"
+// Use:
+className="not-eink:text-primary not-eink:opacity-60"
+```
+
+## Docker/Self-Hosting
+- **Missing submodules** (#3233): Run `git submodule update --init --recursive` before build
+- Simplecc WASM module must be initialized
+
+## OPDS
+- **Non-ASCII credentials** (#3436): Use `TextEncoder` + manual Base64 instead of `btoa()`
+- **Author parsing** (#3120): Handle varied metadata structures in OPDS 2.0 feeds
+- **Responsive layout** (#3418): Ensure catalog and download button layout works on small screens
+
+## Cross-Platform Testing Checklist
+1. Android (old WebView + current)
+2. iOS (15.x + current)
+3. macOS (traffic lights, trackpad)
+4. Linux (WebKitGTK)
+5. E-ink devices (contrast, colors)
+6. Web (CloudFlare Workers deployment)
+
+## Pointer index (moved from MEMORY.md)
+- Sentry #5112/#5053/#5070: native dumps = SEPARATE helper, never re-exec
+- [#5227 drop sentry NDK](sentry-crash-reporting-4914.md) READEST-P = WebView renderer death
+- Android: [hyphen selection #1553](android-hyphen-selection-bounds-1553.md); [NativeFile vs RemoteFile I/O](android-nativefile-remotefile-io.md)
+- [Window-state sanitizer #4398](window-state-sanitize-4398.md) · [Android themed icon #4733](android-themed-icon-4733.md)
+- [Open-with intent #4521](android-open-with-intent-flow.md) · [dict lookup hijack #4559](dict-lookup-browser-hijack-4559.md)
+- [Large-PDF OOM range flood #3470](pdf-oom-range-flood-3470.md) MAX_CONCURRENT_RANGES=6
+- macOS 26 Tahoe close→black window (#4875) `minimize()` not `hide()`
+- [#5295 Win fullscreen vs maximized](win-fullscreen-maximized-taskbar-5295.md) MERGED #5380; unmaximize-first on Windows
+- #4885 iOS brightness lock · [#4917 iOS share .txt stuck](ios-share-txt-stuck-supportstext.md)
+- [#3049 SteamOS Gaming Mode import dead](steamos-gamescope-file-dialog-3049.md) MERGED #5475; no FileChooser portal in gamescope; toast BEFORE dialog
+- [#1217 FireOS import no-op](fireos-import-activity-recreation-1217.md) MERGED #5531 · [iOS .txt/.md share sheet lost](ios-txt-share-sheet-tauri211-fileassoc.md) MERGED #5415
+- [Android launch crash: widget 1px cover](widget-thumbnail-degenerate-cover-crash.md) MERGED #5874; fatal every launch…
+- [#6355 iOS 16 toggle/range crash](ios16-color-mix-currentcolor-crash-6355.md) MERGED #6497 (ec556de87)…
+- [iOS <=16 fonts.ready WebContent crash](ios16-fonts-ready-webcontent-crash.md) MERGED #5654 + foliate#71; poll…
+- [#6434 PostHog opt-out traffic](posthog-telemetry-optout-6434.md) MERGED 2fd17538b…
+- [#5876 empty-library data location](migrate-data-empty-library-scan-guard-5876.md) MERGED #5878; fix = `dirScanned`…
+- [Linux is CEF-only](linux-cef-only-runtime-6218.md) MERGED #6218 (95117b03f)…
+- [iOS sync tauri::command = watchdog kill](ios-sync-command-run-mobile-plugin-deadlock.md) MERGED #5947; parks the MAIN…
+- [#6291 backup slow + stops on screen sleep](backup-keep-awake-6291.md) keep-awake + Rust…
+- [#6375 iOS backup stuck at 0%](ios-backup-share-sheet-6375.md) iOS save-dialog URL unwritable…

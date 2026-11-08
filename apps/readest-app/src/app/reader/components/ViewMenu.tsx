@@ -1,0 +1,633 @@
+import clsx from 'clsx';
+import React, { useEffect } from 'react';
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { BiMoon, BiSun } from 'react-icons/bi';
+import { PiGear, PiChartBar, PiCardsThree } from 'react-icons/pi';
+import { TbSunMoon } from 'react-icons/tb';
+import { MdZoomOut, MdZoomIn, MdCheck, MdInfoOutline, MdOutlineSensors } from 'react-icons/md';
+import { MdRemove, MdAdd, MdContrast } from 'react-icons/md';
+import { MdSync, MdSyncProblem } from 'react-icons/md';
+import { IoMdExpand } from 'react-icons/io';
+import { IoShareOutline } from 'react-icons/io5';
+import { setReadingStatsDialogVisible } from '@/components/stats/ReadingStatsDialog';
+import { setVocabularyDialogVisible } from '@/components/vocabulary/VocabularyDialog';
+import { TbArrowAutofitWidth } from 'react-icons/tb';
+import { TbColumns1, TbColumns2 } from 'react-icons/tb';
+import { TbCarouselVertical, TbCarouselHorizontal } from 'react-icons/tb';
+
+import {
+  MAX_ZOOM_LEVEL,
+  MIN_ZOOM_LEVEL,
+  ZOOM_STEP,
+  MAX_CONTRAST,
+  MIN_CONTRAST,
+  CONTRAST_STEP,
+} from '@/services/constants';
+import { useEnv } from '@/context/EnvContext';
+import { useAuth } from '@/context/AuthContext';
+import { useThemeStore } from '@/store/themeStore';
+import { useReaderStore } from '@/store/readerStore';
+import { useBookDataStore } from '@/store/bookDataStore';
+import { useSettingsStore } from '@/store/settingsStore';
+import { useTranslation } from '@/hooks/useTranslation';
+import { useCloudSyncStatus } from '@/hooks/useCloudSyncStatus';
+import { getStyles } from '@/utils/style';
+import { navigateToLogin } from '@/utils/nav';
+import { getScrollGapAttr } from '@/utils/webtoon';
+import { applyPageTurnAttributes } from '@/app/reader/hooks/useCapturedTurn';
+import { eventDispatcher } from '@/utils/event';
+import { getCurrentRendererLayout, useDuoPose } from '@/hooks/useDuoPose';
+import { nextThemeMode } from '@/utils/ambientLight';
+import { saveViewSettings } from '@/helpers/settings';
+import { canToggleFullScreen, toggleFullScreen } from '@/utils/window';
+import { setCoverSpread } from '@/utils/spread';
+import MenuItem from '@/components/MenuItem';
+import Menu from '@/components/Menu';
+
+interface ViewMenuProps {
+  bookKey: string;
+  setIsDropdownOpen?: (open: boolean) => void;
+  onShowMetaHashDialog?: () => void;
+}
+
+const ViewMenu: React.FC<ViewMenuProps> = ({
+  bookKey,
+  setIsDropdownOpen,
+  onShowMetaHashDialog,
+}) => {
+  const _ = useTranslation();
+  const router = useRouter();
+  const { user } = useAuth();
+  const { envConfig, appService } = useEnv();
+  const { getConfig, getBookData } = useBookDataStore();
+  const { setSettingsDialogOpen, setSettingsDialogBookKey } = useSettingsStore();
+  const { getView, getViewSettings, getViewState, getProgress, setViewSettings, recreateViewer } =
+    useReaderStore();
+  const config = getConfig(bookKey)!;
+  const bookData = getBookData(bookKey)!;
+  const viewSettings = getViewSettings(bookKey)!;
+  const viewState = getViewState(bookKey);
+
+  const { themeMode, setThemeMode } = useThemeStore();
+  const [isScrolledMode, setScrolledMode] = useState(viewSettings!.scrolled);
+  const [scrolledDirection, setScrolledDirection] = useState(
+    viewSettings!.scrolledDirection ?? 'vertical',
+  );
+  const [webtoonMode, setWebtoonMode] = useState(viewSettings!.webtoonMode ?? false);
+  const [lockHorizontalPan, setLockHorizontalPan] = useState(
+    viewSettings!.lockHorizontalPan ?? false,
+  );
+  const [isParagraphMode, setParagraphMode] = useState(
+    viewSettings?.paragraphMode?.enabled ?? false,
+  );
+  const [zoomLevel, setZoomLevel] = useState(viewSettings!.zoomLevel!);
+  const [contrast, setContrast] = useState(viewSettings!.contrast ?? 100);
+  const [zoomMode, setZoomMode] = useState(viewSettings!.zoomMode!);
+  const [spreadMode, setSpreadMode] = useState(viewSettings!.spreadMode!);
+  // On iPhone Duo's inner display in landscape, book mode decides the spread.
+  const duoOwnsSpread = useDuoPose() === 'inner-landscape';
+  const duoBookMode = useReaderStore(
+    (s) => s.viewStates[bookKey]?.viewSettings?.duoBookMode ?? true,
+  );
+  const shownSpreadMode = duoOwnsSpread ? (duoBookMode ? 'auto' : 'none') : spreadMode;
+  const chooseSpreadMode = (mode: 'auto' | 'none') => {
+    if (duoOwnsSpread) {
+      saveViewSettings(envConfig, bookKey, 'duoBookMode', mode === 'auto', false, false);
+    } else {
+      setSpreadMode(mode);
+    }
+  };
+  const [keepCoverSpread, setKeepCoverSpread] = useState(viewSettings!.keepCoverSpread!);
+  const [applyThemeToPDF, setApplyThemeToPDF] = useState(viewSettings!.applyThemeToPDF!);
+  const [rtlSpread, setRtlSpread] = useState(bookData?.bookDoc?.dir === 'rtl');
+
+  const zoomIn = () => setZoomLevel((prev) => Math.min(prev + ZOOM_STEP, MAX_ZOOM_LEVEL));
+  const zoomOut = () => setZoomLevel((prev) => Math.max(prev - ZOOM_STEP, MIN_ZOOM_LEVEL));
+  const resetZoom = () => setZoomLevel(100);
+  const increaseContrast = () =>
+    setContrast((prev) => Math.min(prev + CONTRAST_STEP, MAX_CONTRAST));
+  const decreaseContrast = () =>
+    setContrast((prev) => Math.max(prev - CONTRAST_STEP, MIN_CONTRAST));
+  const resetContrast = () => setContrast(100);
+  const toggleScrolledMode = () => setScrolledMode(!isScrolledMode);
+  const toggleWebtoonMode = () => setWebtoonMode(!webtoonMode);
+  const toggleLockHorizontalPan = () => setLockHorizontalPan(!lockHorizontalPan);
+  const toggleParagraphMode = () => {
+    setParagraphMode(!isParagraphMode);
+    eventDispatcher.dispatch('toggle-paragraph-mode', { bookKey });
+    setIsDropdownOpen?.(false);
+  };
+
+  const openReadingStats = () => {
+    setIsDropdownOpen?.(false);
+    setReadingStatsDialogVisible(true);
+  };
+
+  const openVocabulary = () => {
+    setIsDropdownOpen?.(false);
+    setVocabularyDialogVisible(true);
+  };
+
+  const openSettingsDialog = () => {
+    setIsDropdownOpen?.(false);
+    setSettingsDialogBookKey(bookKey);
+    setSettingsDialogOpen(true);
+  };
+
+  const cycleThemeMode = () => {
+    setThemeMode(nextThemeMode(themeMode, !!appService?.hasAmbientLightSensor));
+  };
+
+  const handleFullScreen = () => {
+    toggleFullScreen(appService);
+    setIsDropdownOpen?.(false);
+  };
+
+  // Readest Cloud's own stamps for THIS book. The per-book values are more
+  // precise than the library-wide cursors the Settings menu uses, so the reader
+  // feeds them in rather than letting the hook guess.
+  const nativeLastSyncTime = Math.max(
+    config?.lastSyncedAtConfig || 0,
+    config?.lastSyncedAtNotes || 0,
+    config?.lastPushedAtConfig || 0,
+    config?.lastPushedAtNotes || 0,
+  );
+  // Every provider the user actually selected, not just Readest Cloud (#5910).
+  const syncStatus = useCloudSyncStatus(nativeLastSyncTime, bookKey);
+
+  const handleSync = () => {
+    // Only Readest Cloud needs an account. With a third-party backend
+    // configured the row must sync, not bounce the user to a login they do not
+    // need (#5910).
+    if (syncStatus.needsSignIn) {
+      navigateToLogin(router);
+      setIsDropdownOpen?.(false);
+      return;
+    }
+    // One tap, every provider the user selected. Before #5910 this dispatched
+    // `sync-book-progress` alone, which only useProgressSync (Readest Cloud)
+    // and useHardcoverSync listen for — so for a third-party-only user the row
+    // did nothing at all.
+    eventDispatcher.dispatch('sync-book-progress', { bookKey });
+    eventDispatcher.dispatch('flush-notion-sync', { bookKey });
+    eventDispatcher.dispatch('flush-obsidian-sync', { bookKey });
+    eventDispatcher.dispatch('push-file-sync', { bookKey });
+    eventDispatcher.dispatch('pull-file-sync', { bookKey });
+    eventDispatcher.dispatch('flush-kosync', { bookKey });
+    // A tap is a manual sync, so Hardcover pushes even with its Auto Sync off.
+    if (syncStatus.providers.some((p) => p.kind === 'hardcover')) {
+      eventDispatcher.dispatch('hardcover-push-progress', { bookKey, silent: true });
+      eventDispatcher.dispatch('hardcover-push-notes', { bookKey, silent: true });
+    }
+    // BookOrbit may be in manual mode (#6029), where nothing is ever pending
+    // and the flush above does nothing, so ask it for a real push.
+    eventDispatcher.dispatch('push-kosync', { bookKey, provider: 'bookorbit' });
+  };
+
+  const handleStartRSVP = () => {
+    setIsDropdownOpen?.(false);
+    eventDispatcher.dispatch('rsvp-start', { bookKey });
+  };
+
+  const toggleAutoScroll = () => {
+    setIsDropdownOpen?.(false);
+    eventDispatcher.dispatch('autoscroll-toggle', { bookKey });
+  };
+
+  const handleShare = () => {
+    setIsDropdownOpen?.(false);
+    if (!bookData?.book) return;
+    const progress = getProgress(bookKey);
+    eventDispatcher.dispatch('show-share-dialog', {
+      book: bookData.book,
+      cfi: progress?.location ?? null,
+    });
+  };
+
+  useEffect(() => {
+    if (scrolledDirection === (viewSettings.scrolledDirection ?? 'vertical')) return;
+    viewSettings.scrolledDirection = scrolledDirection;
+    getView(bookKey)?.renderer.setAttribute('scroll-direction', scrolledDirection);
+    setViewSettings(bookKey, viewSettings);
+    saveViewSettings(envConfig, bookKey, 'scrolledDirection', scrolledDirection, true, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrolledDirection]);
+
+  useEffect(() => {
+    if (isScrolledMode === viewSettings!.scrolled) return;
+    viewSettings!.scrolled = isScrolledMode;
+    if (!isScrolledMode && webtoonMode) setWebtoonMode(false);
+    getView(bookKey)?.renderer.setAttribute('flow', isScrolledMode ? 'scrolled' : 'paginated');
+    getView(bookKey)?.renderer.setAttribute(
+      'max-inline-size',
+      `${getCurrentRendererLayout(viewSettings!).maxInlineSize}px`,
+    );
+    getView(bookKey)?.renderer.setStyles?.(getStyles(viewSettings!));
+    // `scrolled` decides which engine owns a swipe: leaving it stale keeps the
+    // paginator's `turn-style` / cleared `no-swipe` from scroll flow, so the
+    // paginator animates the swipe itself while the touch interceptor — which
+    // recomputes eligibility live — runs a captured turn over the top, and
+    // three pages slide at once.
+    const view = getView(bookKey);
+    if (view) applyPageTurnAttributes(view, viewSettings!, !!bookData?.isFixedLayout);
+    setViewSettings(bookKey, viewSettings!);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isScrolledMode]);
+
+  useEffect(() => {
+    if (webtoonMode === viewSettings.webtoonMode) return;
+    viewSettings.webtoonMode = webtoonMode;
+    getView(bookKey)?.renderer.setAttribute('scroll-gap', getScrollGapAttr(webtoonMode));
+    if (webtoonMode) {
+      // Keep an existing scroll direction so horizontal manga can be gapless too.
+      // Entering from paginated reading still defaults to a vertical webtoon strip.
+      if (!isScrolledMode) {
+        setScrolledMode(true);
+        setScrolledDirection('vertical');
+      }
+      if (zoomLevel !== 100) setZoomLevel(100);
+      saveViewSettings(envConfig, bookKey, 'scrolled', true, false, false);
+    }
+    setViewSettings(bookKey, viewSettings);
+    saveViewSettings(envConfig, bookKey, 'webtoonMode', webtoonMode, false, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webtoonMode]);
+
+  useEffect(() => {
+    if (lockHorizontalPan === (viewSettings.lockHorizontalPan ?? false)) return;
+    viewSettings.lockHorizontalPan = lockHorizontalPan;
+    getView(bookKey)?.renderer.toggleAttribute('lock-pan-x', lockHorizontalPan);
+    setViewSettings(bookKey, viewSettings);
+    saveViewSettings(envConfig, bookKey, 'lockHorizontalPan', lockHorizontalPan, true, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lockHorizontalPan]);
+
+  useEffect(() => {
+    if (zoomLevel === viewSettings.zoomLevel) return;
+    saveViewSettings(envConfig, bookKey, 'zoomLevel', zoomLevel, true, true);
+    if (bookData.bookDoc?.rendition?.layout === 'pre-paginated') {
+      getView(bookKey)?.renderer.setAttribute('scale-factor', zoomLevel);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoomLevel]);
+
+  useEffect(() => {
+    if (contrast === viewSettings.contrast) return;
+    saveViewSettings(envConfig, bookKey, 'contrast', contrast, true, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contrast]);
+
+  useEffect(() => {
+    if (applyThemeToPDF === viewSettings.applyThemeToPDF) return;
+    saveViewSettings(envConfig, bookKey, 'applyThemeToPDF', applyThemeToPDF, true, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyThemeToPDF]);
+
+  useEffect(() => {
+    if (zoomMode === viewSettings.zoomMode) return;
+    viewSettings.zoomMode = zoomMode;
+    getView(bookKey)?.renderer.setAttribute('zoom', zoomMode);
+    setViewSettings(bookKey, viewSettings);
+    saveViewSettings(envConfig, bookKey, 'zoomMode', zoomMode, true, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoomMode]);
+
+  useEffect(() => {
+    if (spreadMode === viewSettings.spreadMode) return;
+    viewSettings.spreadMode = spreadMode;
+    getView(bookKey)?.renderer.setAttribute('spread', spreadMode);
+    setViewSettings(bookKey, viewSettings);
+    saveViewSettings(envConfig, bookKey, 'spreadMode', spreadMode, true, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spreadMode]);
+
+  useEffect(() => {
+    if (keepCoverSpread === viewSettings.keepCoverSpread) return;
+    if (!bookData?.bookDoc?.sections?.length) return;
+    viewSettings.keepCoverSpread = keepCoverSpread;
+    setCoverSpread(bookData.bookDoc, keepCoverSpread);
+    // The spread in effect, which book mode decides on iPhone Duo.
+    getView(bookKey)?.renderer.setAttribute('spread', shownSpreadMode);
+    setViewSettings(bookKey, viewSettings);
+    saveViewSettings(envConfig, bookKey, 'keepCoverSpread', keepCoverSpread, true, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keepCoverSpread]);
+
+  useEffect(() => {
+    const bookDoc = bookData?.bookDoc;
+    if (!bookDoc || rtlSpread === (bookDoc.dir === 'rtl')) return;
+    // Writing mode is per-book only (no global fallback), and horizontal-rl is
+    // what flips both the spread order and the page progression, so the toggle
+    // rides the same setting the Layout panel edits instead of a new one.
+    const writingMode = rtlSpread ? 'horizontal-rl' : 'horizontal-tb';
+    viewSettings.vertical = false;
+    saveViewSettings(envConfig, bookKey, 'writingMode', writingMode, true).then(() => {
+      const view = getView(bookKey);
+      if (view) view.book.dir = rtlSpread ? 'rtl' : 'ltr';
+      recreateViewer(envConfig, bookKey);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rtlSpread]);
+
+  return (
+    <Menu
+      className={clsx(
+        'view-menu dropdown-content dropdown-right no-triangle z-20 mt-1.5 border',
+        'bgcolor-base-200 shadow-2xl',
+      )}
+      style={{ marginRight: appService?.isMobile || window.innerWidth < 640 ? '-36px' : 0 }}
+      onCancel={() => setIsDropdownOpen?.(false)}
+    >
+      {bookData.bookDoc?.rendition?.layout === 'pre-paginated' && (
+        <>
+          <div
+            title={_('Zoom Level')}
+            className={clsx('flex items-center justify-between rounded-md')}
+          >
+            <button
+              title={_('Zoom Out')}
+              onClick={zoomOut}
+              className={clsx(
+                'hover:bg-base-300 text-base-content rounded-full p-2',
+                zoomLevel <= MIN_ZOOM_LEVEL && 'btn-disabled text-gray-400',
+              )}
+            >
+              <MdZoomOut />
+            </button>
+            <button
+              title={_('Reset Zoom')}
+              className={clsx(
+                'hover:bg-base-300 text-base-content h-8 min-h-8 w-[50%] rounded-md p-1 text-center',
+              )}
+              onClick={resetZoom}
+            >
+              {Math.round(zoomLevel)}%
+            </button>
+            <button
+              title={_('Zoom In')}
+              onClick={zoomIn}
+              className={clsx(
+                'hover:bg-base-300 text-base-content rounded-full p-2',
+                zoomLevel >= MAX_ZOOM_LEVEL && 'btn-disabled text-gray-400',
+              )}
+            >
+              <MdZoomIn />
+            </button>
+          </div>
+
+          <div
+            title={_('Contrast')}
+            className={clsx('mt-2 flex items-center justify-between rounded-md')}
+          >
+            <button
+              title={_('Decrease Contrast')}
+              onClick={decreaseContrast}
+              className={clsx(
+                'hover:bg-base-300 text-base-content rounded-full p-2',
+                contrast <= MIN_CONTRAST && 'btn-disabled text-gray-400',
+              )}
+            >
+              <MdRemove />
+            </button>
+            <button
+              title={_('Reset Contrast')}
+              className={clsx(
+                'hover:bg-base-300 text-base-content flex h-8 min-h-8 w-[50%] items-center justify-center gap-1 rounded-md p-1 text-center',
+              )}
+              onClick={resetContrast}
+            >
+              <MdContrast size={16} />
+              {Math.round(contrast)}%
+            </button>
+            <button
+              title={_('Increase Contrast')}
+              onClick={increaseContrast}
+              className={clsx(
+                'hover:bg-base-300 text-base-content rounded-full p-2',
+                contrast >= MAX_CONTRAST && 'btn-disabled text-gray-400',
+              )}
+            >
+              <MdAdd />
+            </button>
+          </div>
+
+          <>
+            <div
+              title={_('Zoom Mode')}
+              className={clsx('my-2 flex items-center justify-between rounded-md')}
+            >
+              <button
+                title={_('Single Page')}
+                onClick={() => {
+                  chooseSpreadMode('none');
+                  if (isScrolledMode) setScrolledMode(false);
+                }}
+                className={clsx(
+                  'hover:bg-base-300 text-base-content rounded-full p-2',
+                  !isScrolledMode && shownSpreadMode === 'none' && 'bg-base-300/75',
+                )}
+              >
+                <TbColumns1 />
+              </button>
+              <button
+                title={_('Auto Spread')}
+                onClick={() => {
+                  chooseSpreadMode('auto');
+                  if (isScrolledMode) setScrolledMode(false);
+                }}
+                className={clsx(
+                  'hover:bg-base-300 text-base-content rounded-full p-2',
+                  !isScrolledMode && shownSpreadMode === 'auto' && 'bg-base-300/75',
+                )}
+              >
+                <TbColumns2 />
+              </button>
+              <button
+                title={_('Vertical Scrolling')}
+                onClick={() => {
+                  setScrolledDirection('vertical');
+                  if (!isScrolledMode) setScrolledMode(true);
+                }}
+                className={clsx(
+                  'hover:bg-base-300 text-base-content rounded-full p-2',
+                  isScrolledMode && scrolledDirection === 'vertical' && 'bg-base-300/75',
+                )}
+              >
+                <TbCarouselVertical />
+              </button>
+              <button
+                title={_('Horizontal Scrolling')}
+                onClick={() => {
+                  setScrolledDirection('horizontal');
+                  if (!isScrolledMode) setScrolledMode(true);
+                }}
+                className={clsx(
+                  'hover:bg-base-300 text-base-content rounded-full p-2',
+                  isScrolledMode && scrolledDirection === 'horizontal' && 'bg-base-300/75',
+                )}
+              >
+                <TbCarouselHorizontal />
+              </button>
+              <div className='bg-base-300 mx-2 h-6 w-[1px]' />
+              <button
+                title={_('Fit Page')}
+                onClick={setZoomMode.bind(null, 'fit-page')}
+                className={clsx(
+                  'hover:bg-base-300 text-base-content rounded-full p-2',
+                  zoomMode === 'fit-page' && 'bg-base-300/75',
+                )}
+              >
+                <IoMdExpand />
+              </button>
+              <button
+                title={_('Fit Width')}
+                onClick={setZoomMode.bind(null, 'fit-width')}
+                className={clsx(
+                  'hover:bg-base-300 text-base-content rounded-full p-2',
+                  zoomMode === 'fit-width' && 'bg-base-300/75',
+                )}
+              >
+                <TbArrowAutofitWidth />
+              </button>
+            </div>
+
+            <MenuItem
+              label={_('Separate Cover Page')}
+              Icon={keepCoverSpread ? MdCheck : undefined}
+              onClick={() => setKeepCoverSpread(!keepCoverSpread)}
+              disabled={isScrolledMode || shownSpreadMode === 'none'}
+            />
+            <MenuItem
+              label={_('Right-to-Left Pages')}
+              Icon={rtlSpread ? MdCheck : undefined}
+              onClick={() => setRtlSpread(!rtlSpread)}
+            />
+            <MenuItem
+              label={_('Lock Horizontal Panning')}
+              toggled={lockHorizontalPan}
+              onClick={toggleLockHorizontalPan}
+              // Horizontal scrolling reads along the x axis, so locking it there
+              // would strand the reader on one page.
+              disabled={isScrolledMode && scrolledDirection === 'horizontal'}
+            />
+          </>
+          <hr aria-hidden='true' className='border-base-300 my-1' />
+        </>
+      )}
+
+      {!bookData.isFixedLayout && (
+        <MenuItem
+          label={_('Scrolled Mode')}
+          shortcut='Shift+J'
+          Icon={isScrolledMode ? MdCheck : undefined}
+          onClick={toggleScrolledMode}
+        />
+      )}
+
+      <MenuItem
+        label={_('Auto Scroll')}
+        shortcut='Shift+A'
+        Icon={viewState?.autoScrollEnabled ? MdCheck : undefined}
+        onClick={toggleAutoScroll}
+        disabled={!isScrolledMode}
+      />
+
+      {bookData.book?.format === 'PDF' && appService?.supportsCanvasContext2DFilter && (
+        <MenuItem
+          label={_('Apply Theme Colors')}
+          Icon={applyThemeToPDF ? MdCheck : undefined}
+          onClick={() => setApplyThemeToPDF(!applyThemeToPDF)}
+        />
+      )}
+
+      <hr aria-hidden='true' className='border-base-300 my-1' />
+
+      {bookData.isFixedLayout ? (
+        <MenuItem label={_('Webtoon Mode')} toggled={webtoonMode} onClick={toggleWebtoonMode} />
+      ) : (
+        <>
+          <MenuItem
+            label={_('Paragraph Mode')}
+            shortcut='Shift+P'
+            Icon={isParagraphMode ? MdCheck : undefined}
+            onClick={toggleParagraphMode}
+          />
+          <MenuItem label={_('Speed Reading Mode')} shortcut='Shift+V' onClick={handleStartRSVP} />
+        </>
+      )}
+
+      <hr aria-hidden='true' className='border-base-300 my-1' />
+
+      <MenuItem
+        label={syncStatus.label}
+        description={
+          // Which provider the status belongs to. Only worth saying when a
+          // third-party backend is in play — with Readest Cloud alone the row
+          // means what it always meant.
+          syncStatus.providers.length > 1
+            ? // Several names in full would overrun the row; show a count.
+              // `count` (not a plain var) so i18next applies each locale's
+              // plural rule.
+              _('Synced via {{count}} providers', { count: syncStatus.providers.length })
+            : syncStatus.providers[0] && syncStatus.providers[0].kind !== 'readest'
+              ? _('Synced via {{provider}}', { provider: syncStatus.providers[0].name })
+              : undefined
+        }
+        Icon={syncStatus.needsSignIn || syncStatus.failed ? MdSyncProblem : MdSync}
+        iconClassName={
+          syncStatus.syncing || (user && viewState?.syncing) ? 'animate-reverse-spin' : ''
+        }
+        onClick={handleSync}
+        siblings={
+          <button
+            aria-label={_('Sync Info')}
+            title={_('Sync Info')}
+            className='hover:bg-base-300 text-base-content/70 mx-1 rounded-md px-2'
+            onClick={() => {
+              setIsDropdownOpen?.(false);
+              onShowMetaHashDialog?.();
+            }}
+          >
+            <MdInfoOutline size={16} />
+          </button>
+        }
+      />
+
+      <hr aria-hidden='true' className='border-base-300 my-1' />
+
+      {canToggleFullScreen(appService) && (
+        <MenuItem label={_('Fullscreen')} onClick={handleFullScreen} />
+      )}
+      <MenuItem
+        label={
+          themeMode === 'dark'
+            ? _('Dark Mode')
+            : themeMode === 'light'
+              ? _('Light Mode')
+              : themeMode === 'ambient'
+                ? _('Ambient Mode')
+                : _('Auto Mode')
+        }
+        Icon={
+          themeMode === 'dark'
+            ? BiMoon
+            : themeMode === 'light'
+              ? BiSun
+              : themeMode === 'ambient'
+                ? MdOutlineSensors
+                : TbSunMoon
+        }
+        onClick={cycleThemeMode}
+      />
+      <MenuItem label={_('Reading Statistics')} Icon={PiChartBar} onClick={openReadingStats} />
+      <MenuItem label={_('Vocabulary')} Icon={PiCardsThree} onClick={openVocabulary} />
+      <MenuItem label={_('Settings')} Icon={PiGear} onClick={openSettingsDialog} />
+      <hr aria-hidden='true' className='border-base-300 my-1' />
+
+      <MenuItem label={_('Share Book')} Icon={IoShareOutline} onClick={handleShare} />
+    </Menu>
+  );
+};
+
+export default ViewMenu;

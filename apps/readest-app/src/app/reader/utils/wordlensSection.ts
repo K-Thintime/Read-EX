@@ -1,0 +1,162 @@
+import type { ConvertChineseVariant, ViewSettings } from '@/types/book';
+import type { AppService } from '@/types/system';
+import type { ProgressHandler } from '@/utils/transfer';
+import { canTokenizeSource, getRankCutoff } from '@/services/wordlens/difficulty';
+import { loadGlossIndex } from '@/services/wordlens/glossPacks';
+import { planGlosses } from '@/services/wordlens/planner';
+import type { GlossSource, VocabularyMarks } from '@/services/wordlens/types';
+import { buildSectionTextModel, applyGlosses, clearGlosses } from '@/app/reader/utils/wordlensRuby';
+import { cutZh, isJiebaReady, initJieba } from '@/utils/jieba';
+import { initSimpleCC, runSimpleCC } from '@/utils/simplecc';
+
+/** Normalize a book language tag to its 2-letter base source code, or null. */
+export const toWordLensSource = (lang?: string | null): string | null => {
+  if (!lang) return null;
+  const base = lang.toLowerCase().split('-')[0];
+  return base || null;
+};
+
+/**
+ * The en-zh pack stores Simplified glosses (ECDICT), and a Traditional hint
+ * (zh-TW / zh-HK / zh-MO / zh-Hant) resolves to that same pack by base code.
+ * Rather than ship a second pack per script, convert the glosses at render time
+ * with the bundled OpenCC tables: Taiwan gets its phrase table (软件 → 軟體),
+ * Hong Kong / Macau the HK table, plain zh-Hant the character-only conversion.
+ */
+export const glossChineseVariant = (hintTag: string): ConvertChineseVariant | null => {
+  const subtags = hintTag.toLowerCase().split('-');
+  if (subtags[0] !== 'zh') return null;
+  const region = subtags[subtags.length - 1]; // zh-TW and zh-Hant-TW both end in tw
+  if (region === 'tw') return 's2twp';
+  if (region === 'hk' || region === 'mo') return 's2hk';
+  return subtags.includes('hant') ? 's2t' : null;
+};
+
+interface RefreshContext {
+  appService: AppService;
+  bookLang?: string | null;
+  /** App UI locale (full tag, e.g. zh-TW), used as the hint when none is selected. */
+  appLang: string;
+  /**
+   * Whether the reader may silently download an uncached pack. Threaded to
+   * loadGlossIndex → ensurePack; when false an uncached pack yields no glosses
+   * (the user downloads it explicitly from the Word Lens sub-page).
+   */
+  allowDownload?: boolean;
+  onProgress?: ProgressHandler;
+  /** The reader's Learning / Mastered words for the book's language. */
+  vocabulary?: VocabularyMarks;
+}
+
+const NO_PACK: GlossSource = { lookup: () => null };
+
+// Per-document generation counter. Dragging the difficulty slider fires the
+// settings effect repeatedly, producing overlapping refresh calls. A later call
+// supersedes earlier ones: each call stamps its generation, and any call whose
+// stamp is stale after the `await` bails before touching the DOM, so the latest
+// refresh always builds and applies against a clean, un-glossed document.
+const refreshGen = new WeakMap<Document, number>();
+
+/** Re-render glosses for one section doc. Clears first, then injects if enabled. */
+export const refreshSectionGlosses = async (
+  doc: Document,
+  viewSettings: ViewSettings,
+  ctx: RefreshContext,
+): Promise<void> => {
+  // This runs fire-and-forget (`void refreshSectionGlosses(...)`), and its
+  // post-await synchronous DOM work (buildSectionTextModel / planGlosses /
+  // applyGlosses → range.insertNode) can throw. Contain everything so a failure
+  // never escapes as an unhandledrejection.
+  try {
+    const myGen = (refreshGen.get(doc) ?? 0) + 1;
+    refreshGen.set(doc, myGen);
+    // Clearing unwraps the <ruby> under a live selection; redo the whole
+    // refresh once it clears. The bump above drops any older pending draw.
+    if (hasLiveSelection(doc)) {
+      whenSelectionClears(doc, () => void refreshSectionGlosses(doc, viewSettings, ctx));
+      return;
+    }
+    clearGlosses(doc);
+    if (!viewSettings.wordLensEnabled) return;
+    const source = toWordLensSource(ctx.bookLang);
+    if (!source || !canTokenizeSource(source)) return;
+    const hintTag = viewSettings.wordLensHintLang || ctx.appLang;
+    const hint = hintTag.toLowerCase().split('-')[0] || '';
+    // Same-language packs (e.g. en-en monolingual) are allowed; availability is
+    // decided by the manifest — loadGlossIndex returns null when no pack exists.
+    if (!hint) return;
+    const index = await loadGlossIndex(ctx.appService, source, hint, {
+      onProgress: ctx.onProgress,
+      allowDownload: ctx.allowDownload,
+    });
+    if (refreshGen.get(doc) !== myGen) return; // a newer refresh superseded us
+    // Without a pack, only Learning words with a saved hint can be drawn.
+    if (!index && !ctx.vocabulary?.learning.size) return;
+    if (source === 'zh' && !isJiebaReady()) {
+      void initJieba();
+      return;
+    }
+    const zhVariant = glossChineseVariant(hintTag);
+    if (zhVariant) {
+      await initSimpleCC();
+      if (refreshGen.get(doc) !== myGen) return;
+    }
+    const apply = () => {
+      if (refreshGen.get(doc) !== myGen) return;
+      const model = buildSectionTextModel(doc);
+      const occ = planGlosses(model.text, index ?? NO_PACK, {
+        sourceLang: source,
+        rankCutoff: getRankCutoff(source, viewSettings.wordLensLevel),
+        cutZh: source === 'zh' ? cutZh : undefined,
+        monolingual: hint === source, // en-en: gloss is a build-formatted definition
+        vocabulary: ctx.vocabulary,
+        canRender: model.canRender,
+      });
+      if (zhVariant) for (const o of occ) o.gloss = runSimpleCC(o.gloss, zhVariant);
+      if (occ.length) applyGlosses(doc, model, occ);
+    };
+    // The reader may have selected text while the pack loaded.
+    whenSelectionClears(doc, () => {
+      try {
+        apply();
+      } catch (err) {
+        console.warn('[wordlens] refresh failed', err);
+      }
+    });
+  } catch (err) {
+    console.warn('[wordlens] refresh failed', err);
+  }
+};
+
+// Latest deferred refresh per document; a newer one replaces it.
+const pendingUntilClear = new WeakMap<Document, () => void>();
+
+/**
+ * Run `fn` now, or once the document's selection collapses. Re-rendering hints
+ * unwraps the <ruby> around a hinted word, so doing it under a live selection
+ * (marking a word in the dictionary popup) would collapse the selection and
+ * close the popup the reader is using.
+ */
+const hasLiveSelection = (doc: Document) => {
+  const sel = doc.getSelection();
+  return !!sel && !sel.isCollapsed && sel.rangeCount > 0;
+};
+
+export const whenSelectionClears = (doc: Document, fn: () => void): void => {
+  if (!hasLiveSelection(doc)) {
+    pendingUntilClear.delete(doc);
+    fn();
+    return;
+  }
+  const waiting = pendingUntilClear.has(doc);
+  pendingUntilClear.set(doc, fn);
+  if (waiting) return;
+  const onChange = () => {
+    if (hasLiveSelection(doc)) return;
+    doc.removeEventListener('selectionchange', onChange);
+    const run = pendingUntilClear.get(doc);
+    pendingUntilClear.delete(doc);
+    run?.();
+  };
+  doc.addEventListener('selectionchange', onChange);
+};

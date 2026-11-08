@@ -1,0 +1,530 @@
+import clsx from 'clsx';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEnv } from '@/context/EnvContext';
+import { useSettingsStore } from '@/store/settingsStore';
+import { useTranslation } from '@/hooks/useTranslation';
+import { useLongPress } from '@/hooks/useLongPress';
+import { Menu, MenuItem } from '@tauri-apps/api/menu';
+import { LogicalPosition } from '@tauri-apps/api/dpi';
+import { invoke } from '@tauri-apps/api/core';
+import { eventDispatcher } from '@/utils/event';
+import { openExternalUrl } from '@/utils/open';
+import { getBookGoodreadsQuery, getGoodreadsSearchUrl } from '@/utils/goodreads';
+import { getOSPlatform } from '@/utils/misc';
+import { getBookPageCount, getSeriesIndex } from '@/utils/book';
+import { isAudiobook } from '@/utils/audiobook';
+import { throttle } from '@/utils/throttle';
+import { LibraryCoverFitType, LibraryViewModeType } from '@/types/settings';
+import { FILE_REVEAL_LABELS, FILE_REVEAL_PLATFORMS } from '@/utils/os';
+import { Book, BooksGroup, ReadingStatus } from '@/types/book';
+import {
+  getBookContextMenuItemIds,
+  type BookContextMenuItemId,
+} from '@/app/library/utils/libraryUtils';
+import { isTauriAppPlatform } from '@/services/environment';
+import { isLocalSendEnabled } from '@/services/localsend/devicePrefs';
+import BookItem from './BookItem';
+import GroupItem from './GroupItem';
+import BookContextMenuPopup, { type BookContextMenuItem } from './BookContextMenuPopup';
+import { useOpenBook } from '../hooks/useOpenBook';
+
+// A native popup blocks Tauri's main thread until the menu is dismissed and
+// holds the webview's resources table lock for that whole time, while
+// menu.close() destroys the resource through a *synchronous* command, which
+// runs on that same main thread. Releasing a menu while a popup is on screen
+// therefore deadlocks the app: the main thread blocks on a lock that only the
+// dismissal releases, and a blocked main thread can no longer dismiss the
+// menu. The library's startup churn (books streaming in, covers, sync) used
+// to re-render right into that window and freeze the app for good.
+// Native popups are modal and app-wide, so the gate is module scoped: a
+// release queued by any bookshelf item would freeze another item's popup.
+let openPopup: Promise<unknown> | null = null;
+
+const trackPopup = async (popup: Promise<void>) => {
+  const settled = popup.catch(() => {});
+  openPopup = settled;
+  await settled;
+  if (openPopup === settled) openPopup = null;
+};
+
+interface NativeMenu {
+  menu: Menu;
+  items: MenuItem[];
+}
+
+// Menu.new({ items: [{ text, action }] }) builds each inline item as a Rust
+// temporary: the action's channel is registered under the item id and then
+// unregistered again the moment the built menu drops the last reference to
+// that wrapper, so the menu pops up with every entry dead (issue #6142, from
+// the tauri 2.11.5 bump in #6081). Items created through MenuItem.new are
+// owned by the webview's resource table, so their channels outlive the build.
+const buildNativeMenu = async (items: BookContextMenuItem[]): Promise<NativeMenu> => {
+  // Create every item before the single Menu.new({ items }) call so the order
+  // is whatever the list says — see the Menu.append() IPC race in #4389.
+  const menuItems = await Promise.all(items.map((item) => MenuItem.new(item)));
+  return { menu: await Menu.new({ items: menuItems }), items: menuItems };
+};
+
+const releaseMenu = (built: Promise<NativeMenu>) => {
+  const close = () => {
+    if (openPopup) {
+      void openPopup.then(close);
+      return;
+    }
+    // The items are owned separately from the menu, so closing the menu alone
+    // would leak one resource per entry on every rebuild.
+    void built
+      .then(async ({ menu, items }) => {
+        await menu.close();
+        await Promise.all(items.map((item) => item.close()));
+      })
+      .catch(() => {});
+  };
+  close();
+};
+
+interface BookshelfItemProps {
+  mode: LibraryViewModeType;
+  item: Book | BooksGroup;
+  coverFit: LibraryCoverFitType;
+  skeuomorphicCovers?: boolean;
+  showPageCount?: boolean;
+  isSelectMode: boolean;
+  itemSelected: boolean;
+  transferProgress: number | null;
+  setLoading: React.Dispatch<React.SetStateAction<boolean>>;
+  toggleSelection: (hash: string) => void;
+  handleGroupBooks: () => void;
+  handleBookDownload: (
+    book: Book,
+    options?: { redownload?: boolean; queued?: boolean },
+  ) => Promise<boolean>;
+  handleBookUpload: (book: Book, syncBooks?: boolean) => Promise<boolean>;
+  handleBookDelete: (book: Book, syncBooks?: boolean) => Promise<boolean>;
+  handleSetSelectMode: (selectMode: boolean) => void;
+  handleShowDetailsBook: (book: Book) => void;
+  handleLibraryNavigation: (targetGroup: string) => void;
+  handleUpdateReadingStatus: (book: Book, status: ReadingStatus | undefined) => void;
+  showTimeRemaining: boolean;
+  showSeriesIndex?: boolean;
+}
+
+const BookshelfItem: React.FC<BookshelfItemProps> = ({
+  mode,
+  item,
+  coverFit,
+  skeuomorphicCovers,
+  showPageCount,
+  isSelectMode,
+  itemSelected,
+  transferProgress,
+  setLoading,
+  toggleSelection,
+  handleGroupBooks,
+  handleBookUpload,
+  handleBookDownload,
+  handleSetSelectMode,
+  handleShowDetailsBook,
+  handleLibraryNavigation,
+  handleUpdateReadingStatus,
+  showTimeRemaining,
+  showSeriesIndex,
+}) => {
+  const _ = useTranslation();
+  const { appService } = useEnv();
+  const { settings } = useSettingsStore();
+  const { openBook } = useOpenBook({ setLoading, handleBookDownload });
+
+  const showBookDetailsModal = useCallback(async (book: Book) => {
+    handleShowDetailsBook(book);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleBookClick = useCallback(
+    async (book: Book) => {
+      if (isSelectMode) {
+        toggleSelection(book.hash);
+        return;
+      }
+      await openBook(book);
+    },
+    [isSelectMode, openBook, toggleSelection],
+  );
+
+  const handleGroupClick = useCallback(
+    (group: BooksGroup) => {
+      if (isSelectMode) {
+        toggleSelection(group.id);
+      } else {
+        handleLibraryNavigation(group.id);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isSelectMode, handleLibraryNavigation],
+  );
+
+  const buildBookMenuItems = (book: Book): BookContextMenuItem[] => {
+    const osPlatform = getOSPlatform();
+    const fileRevealLabel =
+      FILE_REVEAL_LABELS[osPlatform as FILE_REVEAL_PLATFORMS] || FILE_REVEAL_LABELS.default;
+    // Build every item up front, then create the menu from the ordered subset
+    // in a single Menu.new({ items }) call. Appending items one-by-one with
+    // un-awaited Menu.append() promises races on the Tauri IPC boundary and
+    // shuffles the order on every open (issue #4389).
+    const itemOptions: Record<BookContextMenuItemId, BookContextMenuItem> = {
+      select: {
+        text: itemSelected ? _('Deselect Book') : _('Select Book'),
+        action: async () => {
+          if (!isSelectMode) handleSetSelectMode(true);
+          toggleSelection(book.hash);
+        },
+      },
+      group: {
+        text: _('Group Books'),
+        action: async () => {
+          if (!isSelectMode) handleSetSelectMode(true);
+          if (!itemSelected) {
+            toggleSelection(book.hash);
+          }
+          handleGroupBooks();
+        },
+      },
+      markFinished: {
+        text: _('Mark as Finished'),
+        action: async () => {
+          handleUpdateReadingStatus(book, 'finished');
+        },
+      },
+      markUnread: {
+        text: _('Mark as Unread'),
+        action: async () => {
+          handleUpdateReadingStatus(book, 'unread');
+        },
+      },
+      markAbandoned: {
+        text: _('Mark as On hold'),
+        action: async () => {
+          handleUpdateReadingStatus(book, 'abandoned');
+        },
+      },
+      clearStatus: {
+        text: _('Clear Status'),
+        action: async () => {
+          handleUpdateReadingStatus(book, undefined);
+        },
+      },
+      showDetails: {
+        text: _('Show Book Details'),
+        action: async () => {
+          showBookDetailsModal(book);
+        },
+      },
+      showInFinder: {
+        text: _(fileRevealLabel),
+        action: async () => {
+          const folder = `${settings.localBooksDir}/${book.hash}`;
+          invoke('reveal_item_in_dir', { path: folder });
+        },
+      },
+      searchGoodreads: {
+        text: _('Search on Goodreads'),
+        action: async () => {
+          openExternalUrl(getGoodreadsSearchUrl(getBookGoodreadsQuery(book)));
+        },
+      },
+      download: {
+        text: _('Download Book'),
+        action: async () => {
+          handleBookDownload(book, { queued: true });
+        },
+      },
+      upload: {
+        text: _('Upload Book'),
+        action: async () => {
+          handleBookUpload(book);
+        },
+      },
+      share: {
+        text: _('Share Book'),
+        action: async () => {
+          // Bookshelf.tsx hosts the dialog; we dispatch and let it route
+          // unauthenticated users into the login flow first.
+          eventDispatcher.dispatch('show-share-dialog', { book });
+        },
+      },
+      offlineDownload: {
+        text: _('Download for Offline'),
+        action: async () => {
+          // The library page owns the premium gate (useAbsOfflineDownload).
+          eventDispatcher.dispatch('abs-offline-download', { book });
+        },
+      },
+      offlineRemove: {
+        text: _('Remove Offline Download'),
+        action: async () => {
+          eventDispatcher.dispatch('abs-offline-remove', { book });
+        },
+      },
+      sendNearby: {
+        text: _('Send to Nearby Device'),
+        action: async () => {
+          // LocalSendManager hosts the device picker and resolves the file.
+          eventDispatcher.dispatch('localsend-send-books', { books: [book] });
+        },
+      },
+      delete: {
+        text: _('Delete'),
+        action: async () => {
+          eventDispatcher.dispatch('delete-books', { ids: [book.hash] });
+        },
+      },
+    };
+    return getBookContextMenuItemIds(book, {
+      localSend: isTauriAppPlatform() && isLocalSendEnabled(),
+      absOffline: isTauriAppPlatform(),
+    }).map((id) => itemOptions[id]);
+  };
+
+  const buildGroupMenuItems = (group: BooksGroup): BookContextMenuItem[] => {
+    // Single Menu.new({ items }) call keeps the order deterministic — see the
+    // note in bookContextMenuHandler about the Menu.append() IPC race (#4389).
+    return [
+      {
+        text: itemSelected ? _('Deselect Group') : _('Select Group'),
+        action: async () => {
+          if (!isSelectMode) handleSetSelectMode(true);
+          toggleSelection(group.id);
+        },
+      },
+      {
+        text: _('Group Books'),
+        action: async () => {
+          if (!isSelectMode) handleSetSelectMode(true);
+          if (!itemSelected) {
+            toggleSelection(group.id);
+          }
+          handleGroupBooks();
+        },
+      },
+      {
+        text: _('Delete'),
+        action: async () => {
+          // Dispatch the constituent book hashes — `group.books` is the
+          // rendered rollup and already includes books from nested sub-
+          // folders, so the deletion path doesn't need to re-derive what
+          // belongs to the group from the id alone.
+          const ids = group.books.filter((book) => !book.deletedAt).map((book) => book.hash);
+          eventDispatcher.dispatch('delete-books', { ids });
+        },
+      },
+    ];
+  };
+
+  const buildMenuItems = () =>
+    'format' in item ? buildBookMenuItems(item as Book) : buildGroupMenuItems(item as BooksGroup);
+
+  // In-app fallback for the native context menu: GTK3 menus popped over
+  // Wayland after the trigger button was already released (a touchpad
+  // two-finger tap) are dismissed as soon as they map, flashing for a single
+  // frame (issue #5360). The popup path (JS → Tauri IPC → muda → GTK) cannot
+  // beat a tap's instant release, so Linux renders the menu in-app instead.
+  const [inAppMenuPosition, setInAppMenuPosition] = useState<{ x: number; y: number } | null>(null);
+
+  // Building the menu crosses the Tauri IPC boundary and takes long enough
+  // that the popup visibly lags the right-click (issue #5181). Cache the
+  // built menu so popup() fires immediately; hovering the item prewarms the
+  // cache so even the first opening is instant.
+  const cachedMenuRef = useRef<Promise<NativeMenu> | null>(null);
+
+  const ensureMenu = () => {
+    if (!cachedMenuRef.current) {
+      const building = buildNativeMenu(buildMenuItems());
+      building.catch(() => {
+        // A failed build must not poison the cache with a rejected promise.
+        if (cachedMenuRef.current === building) cachedMenuRef.current = null;
+      });
+      cachedMenuRef.current = building;
+    }
+    return cachedMenuRef.current;
+  };
+
+  // Drop the cache whenever state baked into the items changes (selection
+  // label, book status, reveal path, language); the cleanup also runs on
+  // unmount so the native menu resource is released — but never while a popup
+  // is still on screen, see releaseMenu.
+  useEffect(() => {
+    return () => {
+      const cached = cachedMenuRef.current;
+      cachedMenuRef.current = null;
+      if (cached) releaseMenu(cached);
+    };
+  }, [item, itemSelected, isSelectMode, settings.localBooksDir, _]);
+
+  const handleSelectItem = useCallback(
+    throttle(() => {
+      if (!isSelectMode) {
+        handleSetSelectMode(true);
+      }
+      if ('format' in item) {
+        toggleSelection((item as Book).hash);
+      } else {
+        toggleSelection((item as BooksGroup).id);
+      }
+    }, 100),
+    [isSelectMode, item, handleSetSelectMode, toggleSelection],
+  );
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const handleOpenItem = useCallback(
+    throttle(() => {
+      if (isSelectMode) {
+        handleSelectItem();
+        return;
+      }
+      if ('format' in item) {
+        handleBookClick(item as Book);
+      } else {
+        handleGroupClick(item as BooksGroup);
+      }
+    }, 100),
+    [handleSelectItem, handleBookClick, handleGroupClick],
+  );
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const handleContextMenu = useCallback(
+    throttle(async (position: { x: number; y: number }) => {
+      if (!appService?.hasContextMenu) return;
+      if (appService.isLinuxApp) {
+        setInAppMenuPosition(position);
+        return;
+      }
+      const { menu } = await ensureMenu();
+      // Pop up at an explicit position so keyboard invocation (ContextMenu /
+      // Shift+F10) anchors the menu to the item instead of wherever the mouse
+      // happens to sit. On macOS and Windows — the only platforms still on the
+      // native menu — CSS px are window-logical px, so the client coordinates
+      // pass through unchanged.
+      await trackPopup(menu.popup(new LogicalPosition(position.x, position.y)));
+    }, 100),
+    [item, itemSelected, isSelectMode, settings.localBooksDir],
+  );
+
+  const { pressing, handlers } = useLongPress(
+    {
+      onLongPress: () => {
+        handleSelectItem();
+      },
+      onTap: () => {
+        handleOpenItem();
+      },
+      onContextMenu: (e) => {
+        if (appService?.hasContextMenu) {
+          handleContextMenu({ x: e.clientX, y: e.clientY });
+        } else if (appService?.isAndroidApp) {
+          handleSelectItem();
+        }
+      },
+    },
+    [isSelectMode, handleSelectItem, handleOpenItem, handleContextMenu],
+  );
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleOpenItem();
+    }
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      const rect = e.currentTarget.getBoundingClientRect();
+      handleContextMenu({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+    }
+  };
+
+  // Tag the rendered DOM with the book/group identity so feature code
+  // (e.g. the Send action's macOS share-popover anchor) can locate the
+  // exact bookshelf cell the user is acting on without threading refs
+  // through every parent. Books carry their content-hash; groups carry
+  // their full group name.
+  const seriesIndex =
+    showSeriesIndex && mode === 'grid' && 'format' in item
+      ? getSeriesIndex(item.metadata?.seriesIndex)
+      : undefined;
+  const pageCount =
+    showPageCount && 'format' in item && !isAudiobook(item) ? getBookPageCount(item) : undefined;
+  const itemDataAttrs =
+    'format' in item ? { 'data-book-hash': item.hash } : { 'data-group-name': item.name };
+
+  return (
+    <div className={clsx(mode === 'grid' ? 'h-full' : 'sm:hover:bg-base-300/50 px-4 sm:px-6')}>
+      <div
+        className={clsx(
+          'visible-focus-inset-2 group',
+          mode === 'grid' &&
+            'sm:hover:bg-base-300/50 flex h-full flex-col px-0 py-2 sm:rounded-md sm:px-4 sm:py-4',
+          mode === 'list' && 'border-base-300 flex flex-col border-b py-2',
+          appService?.isMobileApp && 'no-context-menu',
+          pressing && mode === 'grid' ? 'not-eink:scale-95' : 'scale-100',
+        )}
+        role='button'
+        tabIndex={0}
+        aria-label={
+          'format' in item
+            ? [
+                seriesIndex !== undefined ? `${item.title} #${seriesIndex}` : item.title,
+                pageCount && _('{{count}} pages', { count: pageCount }),
+              ]
+                .filter(Boolean)
+                .join(', ')
+            : item.name
+        }
+        style={{
+          transition: 'transform 0.2s',
+        }}
+        onKeyDown={handleKeyDown}
+        onPointerEnter={() => {
+          if (appService?.hasContextMenu && !appService.isLinuxApp) void ensureMenu();
+        }}
+        {...itemDataAttrs}
+        {...handlers}
+      >
+        <div className='flex h-full flex-col justify-end'>
+          {'format' in item ? (
+            <BookItem
+              mode={mode}
+              book={item}
+              coverFit={coverFit}
+              skeuomorphicCovers={skeuomorphicCovers}
+              isSelectMode={isSelectMode}
+              bookSelected={itemSelected}
+              transferProgress={transferProgress}
+              handleBookUpload={handleBookUpload}
+              handleBookDownload={handleBookDownload}
+              showBookDetailsModal={showBookDetailsModal}
+              showTimeRemaining={showTimeRemaining}
+              seriesIndex={seriesIndex}
+              pageCount={pageCount}
+            />
+          ) : (
+            <GroupItem
+              mode={mode}
+              group={item}
+              coverFit={coverFit}
+              skeuomorphicCovers={skeuomorphicCovers}
+              isSelectMode={isSelectMode}
+              groupSelected={itemSelected}
+            />
+          )}
+        </div>
+      </div>
+      {inAppMenuPosition && (
+        <BookContextMenuPopup
+          position={inAppMenuPosition}
+          items={buildMenuItems()}
+          onClose={() => setInAppMenuPosition(null)}
+        />
+      )}
+    </div>
+  );
+};
+
+export default BookshelfItem;

@@ -1,0 +1,934 @@
+/**
+ * DictionarySheet tests — the mobile / narrow-viewport bottom sheet that
+ * replaces DictionaryPopup for `< sm` viewports.
+ *
+ * Lookups go through real providers backed by the on-disk dict fixtures in
+ * `src/__tests__/fixtures/data/dicts/`. The registry module is mocked per
+ * test so we can hand the sheet a controlled provider list (real StarDict /
+ * DICT instances + a couple of tiny in-test providers for navigation and
+ * abort assertions).
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  render,
+  screen,
+  cleanup,
+  fireEvent,
+  waitFor as waitForWithOptions,
+  act,
+} from '@testing-library/react';
+import type { ReactNode } from 'react';
+
+import type {
+  DictionaryLookupContext,
+  DictionaryLookupOutcome,
+  DictionaryProvider,
+  DictionarySelectionContext,
+} from '@/services/dictionaries/types';
+import { BUILTIN_WEB_SEARCH_IDS } from '@/services/dictionaries/types';
+import type { ImportedDictionary } from '@/services/dictionaries/types';
+import type { BaseDir } from '@/types/system';
+import { createStarDictProvider } from '@/services/dictionaries/providers/starDictProvider';
+import { createDictProvider } from '@/services/dictionaries/providers/dictProvider';
+import { useCustomDictionaryStore } from '@/store/customDictionaryStore';
+
+const waitFor = <T,>(callback: () => T | Promise<T>) =>
+  waitForWithOptions(callback, { interval: 1 });
+
+import {
+  IFO_FIXTURE_NAME,
+  IDX_FIXTURE_NAME,
+  DICT_FIXTURE_NAME,
+  readIfoFile,
+  readIdxFile,
+  readDictFile as readStarDictFile,
+} from '../../../services/dictionaries/_stardictFixtures';
+import {
+  INDEX_FIXTURE_NAME,
+  DICT_FIXTURE_NAME as DICTD_FIXTURE_NAME,
+  readIndexFile,
+  readDictFile as readDictdFile,
+} from '../../../services/dictionaries/_dictFixtures';
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+// Replace Dialog with a thin shell so the sheet's internals are testable
+// without dragging in theme/device/responsive/haptics dependencies.
+vi.mock('@/components/Dialog', () => ({
+  default: ({
+    children,
+    header,
+    isOpen,
+    onClose,
+  }: {
+    children: ReactNode;
+    header?: ReactNode;
+    isOpen: boolean;
+    onClose: () => void;
+    snapHeight?: number;
+    contentClassName?: string;
+    dismissible?: boolean;
+  }) =>
+    isOpen ? (
+      <div role='dialog' data-testid='dialog'>
+        <div data-testid='dialog-header'>{header}</div>
+        <div data-testid='dialog-body'>{children}</div>
+        <button data-testid='dialog-overlay-close' onClick={onClose} aria-label='backdrop' />
+      </div>
+    ) : null,
+}));
+
+vi.mock('@/hooks/useTranslation', () => ({
+  useTranslation: () => (s: string) => s,
+}));
+
+// The word pronouncer talks to Edge/WebAudio; stub it so the sheet's speak
+// button can be exercised without real audio. (#4876)
+vi.mock('@/services/tts/wordPronouncer', () => ({
+  pronounceWord: vi.fn().mockResolvedValue(undefined),
+  warmWordAudio: vi.fn(),
+  cancelWordPronounce: vi.fn(),
+}));
+
+const mockOpenUrl = vi.fn().mockResolvedValue(undefined);
+vi.mock('@tauri-apps/plugin-opener', () => ({
+  openUrl: (...args: unknown[]) => mockOpenUrl(...args),
+}));
+
+// Blob -> data URL conversion needs a real `fetch` for `blob:` URLs, which
+// jsdom doesn't provide; the viewer only cares that it receives a data URL.
+const mockConvertBlobUrlToDataUrl = vi.fn(async (src: string) => `data:image/png;base64,${src}`);
+vi.mock('@/libs/document', async () => {
+  const actual = await vi.importActual<typeof import('@/libs/document')>('@/libs/document');
+  return {
+    ...actual,
+    convertBlobUrlToDataUrl: (src: string) => mockConvertBlobUrlToDataUrl(src),
+  };
+});
+
+// Thin stand-in for the reader's full-screen image viewer.
+vi.mock('@/app/reader/components/ImageViewer', () => ({
+  default: ({ src, onClose }: { src: string | null; onClose: () => void }) =>
+    src ? (
+      <div data-testid='dict-image-viewer' data-src={src}>
+        <button type='button' aria-label='Close image viewer' onClick={onClose} />
+      </div>
+    ) : null,
+}));
+
+vi.mock('@/services/environment', async () => {
+  const actual =
+    await vi.importActual<typeof import('@/services/environment')>('@/services/environment');
+  return {
+    ...actual,
+    isTauriAppPlatform: () => false,
+  };
+});
+
+// Mock the registry: every test pushes its own providers onto this list.
+const providersForNextRender: DictionaryProvider[] = [];
+vi.mock('@/services/dictionaries/registry', () => ({
+  getEnabledProviders: () => [...providersForNextRender],
+  __resetRegistryForTests: vi.fn(),
+  evictProvider: vi.fn(),
+}));
+
+// EnvProvider needs an appService; provide one with the file API the
+// (unmocked) StarDict provider uses for fixture reads.
+vi.mock('@/context/EnvContext', () => ({
+  useEnv: () => ({
+    envConfig: { getAppService: vi.fn().mockResolvedValue(null) },
+    appService: { openFile: vi.fn() },
+  }),
+}));
+
+// ---------------------------------------------------------------------------
+// Fixture-backed real providers
+// ---------------------------------------------------------------------------
+
+const realStarDictDict: ImportedDictionary = {
+  id: 'stardict:cmudict',
+  kind: 'stardict',
+  name: 'CMU American English spelling',
+  bundleDir: 'cmudict-bundle',
+  files: { ifo: IFO_FIXTURE_NAME, idx: IDX_FIXTURE_NAME, dict: DICT_FIXTURE_NAME },
+  addedAt: 1,
+};
+
+const realDictdDict: ImportedDictionary = {
+  id: 'dict:freedict-eng-nld',
+  kind: 'dict',
+  name: 'FreeDict English-Dutch',
+  bundleDir: 'freedict-eng-nld-bundle',
+  files: { dict: DICTD_FIXTURE_NAME, index: INDEX_FIXTURE_NAME },
+  addedAt: 2,
+};
+
+const makeStarDictFs = () => ({
+  openFile: async (p: string, _base: BaseDir) => {
+    const base = p.split('/').pop()!;
+    if (base === IFO_FIXTURE_NAME) return readIfoFile();
+    if (base === IDX_FIXTURE_NAME) return readIdxFile();
+    if (base === DICT_FIXTURE_NAME) return readStarDictFile();
+    throw new Error(`Unknown stardict fixture: ${base}`);
+  },
+});
+
+const makeDictdFs = () => ({
+  openFile: async (p: string, _base: BaseDir) => {
+    const base = p.split('/').pop()!;
+    if (base === INDEX_FIXTURE_NAME) return readIndexFile();
+    if (base === DICTD_FIXTURE_NAME) return readDictdFile();
+    throw new Error(`Unknown dictd fixture: ${base}`);
+  },
+});
+
+const buildRealStarDictProvider = (): DictionaryProvider =>
+  createStarDictProvider({ dict: realStarDictDict, fs: makeStarDictFs() });
+
+const buildRealDictdProvider = (): DictionaryProvider =>
+  createDictProvider({ dict: realDictdDict, fs: makeDictdFs() });
+
+// ---------------------------------------------------------------------------
+// In-test providers — small fakes for behaviors that real fixture data
+// can't easily exercise (in-content navigation, slow lookups for abort).
+// ---------------------------------------------------------------------------
+
+const buildNavProvider = (nextWord: string): DictionaryProvider => ({
+  id: 'nav-test',
+  kind: 'stardict',
+  label: 'Nav Test',
+  async lookup(word, ctx) {
+    const a = document.createElement('a');
+    a.href = '#';
+    a.textContent = `→ ${nextWord}`;
+    a.setAttribute('rel', 'mw:WikiLink');
+    a.setAttribute('data-testid', 'nav-link');
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      ctx.onNavigate?.(nextWord);
+    });
+    ctx.container.append(document.createTextNode(`current: ${word} `));
+    ctx.container.append(a);
+    return { ok: true, headword: word, sourceLabel: 'Nav Test' };
+  },
+});
+
+const buildSlowProvider = (abortObserver: { aborted: boolean }): DictionaryProvider => ({
+  id: 'slow',
+  kind: 'stardict',
+  label: 'Slow',
+  async lookup(_word, ctx): Promise<DictionaryLookupOutcome> {
+    return new Promise<DictionaryLookupOutcome>((resolve) => {
+      ctx.signal.addEventListener('abort', () => {
+        abortObserver.aborted = true;
+        resolve({ ok: false, reason: 'error', message: 'aborted' });
+      });
+    });
+  },
+});
+
+// Mimics the MDict provider's rendering: the entry body lives in a shadow
+// root, so a click's `target` is retargeted to the host and only the composed
+// path names the image that was actually tapped.
+const buildShadowImageProvider = (): DictionaryProvider => ({
+  id: 'shadow-img',
+  kind: 'mdict',
+  label: 'Shadow Image Dict',
+  async lookup(word, ctx) {
+    const host = document.createElement('div');
+    host.setAttribute('data-testid', 'img-shadow-host');
+    ctx.container.appendChild(host);
+    const shadow = host.attachShadow({ mode: 'open' });
+    const img = document.createElement('img');
+    img.setAttribute('src', 'blob:test/pic-1');
+    shadow.appendChild(img);
+    const linked = document.createElement('a');
+    linked.setAttribute('href', 'https://example.com/more');
+    const linkedImg = document.createElement('img');
+    linkedImg.setAttribute('src', 'blob:test/pic-2');
+    linked.appendChild(linkedImg);
+    shadow.appendChild(linked);
+    // OALD9 wraps its illustrations in a hrefless `<a class="topic no-href">`,
+    // so the wrapper is markup, not a link, and must not swallow the tap.
+    const hrefless = document.createElement('a');
+    hrefless.className = 'topic no-href';
+    const heldImg = document.createElement('img');
+    heldImg.setAttribute('src', 'blob:test/pic-3');
+    hrefless.appendChild(heldImg);
+    shadow.appendChild(hrefless);
+    // OALD9 ships each illustration twice inside `<div class="ox-enlarge">`: a
+    // hidden full-resolution copy followed by the `thumb` that is laid out.
+    const pair = document.createElement('a');
+    pair.className = 'topic no-href';
+    const fullsize = document.createElement('img');
+    fullsize.setAttribute('src', 'blob:test/pic-fullsize');
+    fullsize.style.display = 'none';
+    Object.defineProperty(fullsize, 'naturalWidth', { value: 720 });
+    const thumb = document.createElement('img');
+    thumb.className = 'thumb';
+    thumb.setAttribute('src', 'blob:test/pic-thumb');
+    Object.defineProperty(thumb, 'naturalWidth', { value: 100 });
+    pair.append(fullsize, thumb);
+    shadow.appendChild(pair);
+    return { ok: true, headword: word, sourceLabel: 'Shadow Image Dict' };
+  },
+});
+
+const buildEmptyProvider = (id: string, label: string): DictionaryProvider => ({
+  id,
+  kind: 'stardict',
+  label,
+  async lookup() {
+    return { ok: false, reason: 'empty' };
+  },
+});
+
+// A case-sensitive, whitespace-sensitive provider that only resolves the
+// exact stored headword — mimics mdict's lookup path. Used to assert the
+// query-normalization fallback (trim + case folding).
+const buildExactProvider = (storedHeadword: string): DictionaryProvider => {
+  const provider: DictionaryProvider = {
+    id: 'exact',
+    kind: 'mdict',
+    label: 'Exact Match',
+    async lookup(word, ctx) {
+      if (word !== storedHeadword) return { ok: false, reason: 'empty' };
+      ctx.container.append(document.createTextNode(`def for ${word}`));
+      return { ok: true, headword: word, sourceLabel: 'Exact Match' };
+    },
+  };
+  return provider;
+};
+
+// ---------------------------------------------------------------------------
+// Sheet harness
+// ---------------------------------------------------------------------------
+
+import DictionarySheet from '@/app/reader/components/annotator/DictionarySheet';
+import { pronounceWord, warmWordAudio } from '@/services/tts/wordPronouncer';
+
+const renderSheet = (
+  props: Partial<{
+    word: string;
+    lang: string;
+    selection: DictionarySelectionContext;
+    onDismiss: () => void;
+    onManage: () => void;
+  }> = {},
+) =>
+  render(
+    <DictionarySheet
+      word={props.word ?? 'hello'}
+      lang={props.lang}
+      selection={props.selection}
+      onDismiss={props.onDismiss ?? (() => {})}
+      onManage={props.onManage}
+    />,
+  );
+
+const resetStoreToEmpty = () => {
+  useCustomDictionaryStore.setState({
+    dictionaries: [],
+    settings: {
+      providerOrder: [],
+      providerEnabled: {},
+      webSearches: [],
+    },
+  });
+};
+
+beforeEach(() => {
+  providersForNextRender.length = 0;
+  mockOpenUrl.mockClear();
+  mockConvertBlobUrlToDataUrl.mockClear();
+  resetStoreToEmpty();
+});
+
+afterEach(() => {
+  cleanup();
+});
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('DictionarySheet — header', () => {
+  it('renders the looked-up word and a manage button; no back button at history length 1', async () => {
+    providersForNextRender.push(buildRealStarDictProvider());
+    renderSheet({ word: 'hello', onManage: vi.fn() });
+
+    expect((await waitFor(() => screen.getByTestId('dict-title'))).textContent).toBe('hello');
+    expect(screen.getByLabelText('Manage Dictionaries')).toBeTruthy();
+    expect(screen.queryByLabelText('Back')).toBeNull();
+  });
+});
+
+describe('DictionarySheet — speak button', () => {
+  it('warms audio and pronounces the current word when the speaker is tapped', async () => {
+    providersForNextRender.push(buildRealStarDictProvider());
+    renderSheet({ word: 'hello', lang: 'en' });
+
+    const speak = await waitFor(() => screen.getByLabelText('Speak'));
+    fireEvent.click(speak);
+
+    expect(warmWordAudio).toHaveBeenCalledTimes(1);
+    expect(pronounceWord).toHaveBeenCalledWith(
+      'hello',
+      'en',
+      expect.any(Object),
+      expect.any(Function),
+    );
+  });
+});
+
+describe('DictionarySheet — concurrent lookup', () => {
+  it('fans out lookups across every enabled definition provider', async () => {
+    const stardict = buildRealStarDictProvider();
+    const dictd = buildRealDictdProvider();
+    const stardictSpy = vi.spyOn(stardict, 'lookup');
+    const dictdSpy = vi.spyOn(dictd, 'lookup');
+    providersForNextRender.push(stardict, dictd);
+
+    renderSheet({ word: 'hello' });
+
+    await waitFor(() => {
+      expect(stardictSpy).toHaveBeenCalledWith('hello', expect.any(Object));
+      expect(dictdSpy).toHaveBeenCalledWith('hello', expect.any(Object));
+    });
+  });
+
+  it('renders the cmudict card after the lookup settles', async () => {
+    providersForNextRender.push(buildRealStarDictProvider());
+    renderSheet({ word: 'hello' });
+
+    await waitFor(() => screen.getByText('CMU American English spelling'));
+  });
+
+  it('hides cards from providers that return empty', async () => {
+    providersForNextRender.push(
+      buildRealStarDictProvider(),
+      buildEmptyProvider('empty:1', 'Empty One'),
+      buildEmptyProvider('empty:2', 'Empty Two'),
+    );
+    renderSheet({ word: 'hello' });
+
+    // The cmudict card eventually appears.
+    await waitFor(() => screen.getByText('CMU American English spelling'));
+    // The two empty providers never render a card.
+    expect(screen.queryByText('Empty One')).toBeNull();
+    expect(screen.queryByText('Empty Two')).toBeNull();
+  });
+
+  it('finds a known word after an empty lookup without closing the sheet', async () => {
+    providersForNextRender.push(buildRealStarDictProvider());
+    const { rerender } = renderSheet({ word: 'not-in-cmudict' });
+
+    await waitFor(() => expect(screen.queryByTestId('dict-card')).toBeNull());
+
+    rerender(<DictionarySheet word='hello' onDismiss={() => {}} />);
+
+    await waitFor(() => screen.getByText('CMU American English spelling'));
+  });
+});
+
+describe('DictionarySheet — query normalization', () => {
+  it.each([
+    ['Café', 'cafe'],
+    ['rūpa', 'rupa'],
+    ['niño', 'nino'],
+    ['café', 'cafe\u0301'],
+    ['cafe\u0301', 'café'],
+  ])('resolves %s against the stored headword %s', async (word, headword) => {
+    providersForNextRender.push(buildExactProvider(headword));
+    renderSheet({ word });
+    await waitFor(() => screen.getByText(`def for ${headword}`));
+  });
+
+  it('keeps an accented exact match ahead of folding', async () => {
+    const exact = buildExactProvider('café');
+    const spy = vi.spyOn(exact, 'lookup');
+    providersForNextRender.push(exact);
+    renderSheet({ word: 'café' });
+    await waitFor(() => screen.getByText('Exact Match'));
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves a lowercase-stored entry from a capitalized selection', async () => {
+    const exact = buildExactProvider('hello');
+    const spy = vi.spyOn(exact, 'lookup');
+    providersForNextRender.push(exact);
+    renderSheet({ word: 'Hello' });
+
+    await waitFor(() => screen.getByText('Exact Match'));
+    // First probe is the selection as-is; the lowercase fallback hits.
+    expect(spy).toHaveBeenCalledWith('Hello', expect.any(Object));
+    expect(spy).toHaveBeenCalledWith('hello', expect.any(Object));
+  });
+
+  it('resolves an entry from a selection with trailing whitespace', async () => {
+    providersForNextRender.push(buildExactProvider('world'));
+    renderSheet({ word: 'world ' });
+
+    await waitFor(() => screen.getByText('Exact Match'));
+  });
+
+  it('trims trailing whitespace from the displayed title', async () => {
+    providersForNextRender.push(buildExactProvider('world'));
+    renderSheet({ word: 'world ' });
+
+    expect((await waitFor(() => screen.getByTestId('dict-title'))).textContent).toBe('world');
+  });
+
+  it('stops at the first matching variant without probing the rest', async () => {
+    const exact = buildExactProvider('hello');
+    const spy = vi.spyOn(exact, 'lookup');
+    providersForNextRender.push(exact);
+    renderSheet({ word: 'hello' });
+
+    await waitFor(() => screen.getByText('Exact Match'));
+    // 'hello' hits immediately — no title-case / upper-case probes follow.
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('DictionarySheet — expand / collapse', () => {
+  it('toggles aria-expanded when a card is tapped', async () => {
+    providersForNextRender.push(buildRealStarDictProvider());
+    renderSheet({ word: 'hello' });
+
+    // Wait for the lookup to finish (source label visible).
+    await waitFor(() => screen.getByText('CMU American English spelling'));
+    // Re-query the card and poll on every step: asserting synchronously on a
+    // captured node flaked on slow CI runners, where a late async re-render
+    // could race the click (stale node → the toggle never reaches React).
+    const expanded = () => screen.getByTestId('dict-card').getAttribute('aria-expanded');
+    // With ≤ 3 results the sheet defaults to expanded.
+    await waitFor(() => expect(expanded()).toBe('true'));
+
+    fireEvent.click(screen.getByTestId('dict-card'));
+    await waitFor(() => expect(expanded()).toBe('false'));
+
+    fireEvent.click(screen.getByTestId('dict-card'));
+    await waitFor(() => expect(expanded()).toBe('true'));
+  });
+
+  it('keeps a tap that lands before the auto-expand effects settle', async () => {
+    providersForNextRender.push(buildRealStarDictProvider());
+    renderSheet({ word: 'hello' });
+
+    // Tap the moment the card first renders expanded, before React flushes
+    // that render's effects: the pending auto-expand pass must not undo it.
+    const card = () => screen.queryByTestId('dict-card');
+    let tapped = false;
+    const observer = new MutationObserver(() => {
+      if (tapped || card()?.getAttribute('aria-expanded') !== 'true') return;
+      tapped = true;
+      card()!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    observer.observe(screen.getByTestId('dialog-body'), {
+      attributes: true,
+      attributeFilter: ['aria-expanded'],
+      subtree: true,
+    });
+    await waitFor(() => expect(tapped).toBe(true));
+    observer.disconnect();
+
+    await waitFor(() => expect(card()?.getAttribute('aria-expanded')).toBe('false'));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(card()?.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('defaults to collapsed when more than 3 providers have results', async () => {
+    // Four providers, all with content → > 3 → default-collapsed.
+    const providers: DictionaryProvider[] = [];
+    for (let i = 0; i < 4; i++) {
+      providers.push({
+        id: `pseudo:${i}`,
+        kind: 'stardict',
+        label: `Pseudo ${i}`,
+        async lookup(word, ctx) {
+          ctx.container.append(document.createTextNode(`def for ${word} #${i}`));
+          return { ok: true, headword: word, sourceLabel: `Pseudo ${i}` };
+        },
+      });
+    }
+    providersForNextRender.push(...providers);
+    renderSheet({ word: 'hello' });
+
+    await waitFor(() => screen.getByText('Pseudo 0'));
+    const cards = screen.getAllByTestId('dict-card');
+    expect(cards).toHaveLength(4);
+    for (const card of cards) {
+      expect(card.getAttribute('aria-expanded')).toBe('false');
+    }
+  });
+});
+
+describe('DictionarySheet — in-content navigation', () => {
+  it('pushes onto the history stack when a provider link triggers onNavigate; back button appears', async () => {
+    providersForNextRender.push(buildNavProvider('world'));
+    renderSheet({ word: 'hello' });
+
+    expect((await waitFor(() => screen.getByTestId('dict-title'))).textContent).toBe('hello');
+    expect(screen.queryByLabelText('Back')).toBeNull();
+
+    const navLink = await waitFor(() => screen.getByTestId('nav-link'));
+    await act(async () => {
+      fireEvent.click(navLink);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('dict-title').textContent).toBe('world');
+    });
+    expect(screen.getByLabelText('Back')).toBeTruthy();
+  });
+
+  it('back button pops the history stack and restores the previous word', async () => {
+    providersForNextRender.push(buildNavProvider('world'));
+    renderSheet({ word: 'hello' });
+
+    const navLink = await waitFor(() => screen.getByTestId('nav-link'));
+    await act(async () => {
+      fireEvent.click(navLink);
+    });
+    await waitFor(() => expect(screen.getByTestId('dict-title').textContent).toBe('world'));
+
+    fireEvent.click(screen.getByLabelText('Back'));
+    await waitFor(() => expect(screen.getByTestId('dict-title').textContent).toBe('hello'));
+    expect(screen.queryByLabelText('Back')).toBeNull();
+  });
+});
+
+describe('DictionarySheet — selection context (#5544)', () => {
+  it('hands the selection context to providers for the selected word only', async () => {
+    const seen: Record<string, DictionaryLookupContext['selection']> = {};
+    const nav = buildNavProvider('world');
+    providersForNextRender.push({
+      ...nav,
+      lookup: (word, ctx) => {
+        seen[word] = ctx.selection;
+        return nav.lookup(word, ctx);
+      },
+    });
+    const selection = { before: 'Say', after: 'to everyone.', targetLang: 'fr' };
+    renderSheet({ word: 'hello', selection });
+
+    const navLink = await waitFor(() => screen.getByTestId('nav-link'));
+    expect(seen['hello']).toEqual(selection);
+
+    await act(async () => {
+      fireEvent.click(navLink);
+    });
+    await waitFor(() => expect('world' in seen).toBe(true));
+    expect(seen['world']).toBeUndefined();
+  });
+});
+
+describe('DictionarySheet — republished selection (#5544)', () => {
+  it('does not restart lookups when the same selection context arrives as a new object', async () => {
+    let calls = 0;
+    const nav = buildNavProvider('world');
+    providersForNextRender.push({
+      ...nav,
+      lookup: (word, ctx) => {
+        calls++;
+        return nav.lookup(word, ctx);
+      },
+    });
+    const { rerender } = renderSheet({
+      word: 'hello',
+      selection: { before: 'Say', after: 'now.' },
+    });
+    await waitFor(() => screen.getByTestId('nav-link'));
+    expect(calls).toBe(1);
+
+    rerender(
+      <DictionarySheet
+        word='hello'
+        selection={{ before: 'Say', after: 'now.' }}
+        onDismiss={() => {}}
+      />,
+    );
+    await act(async () => {});
+    expect(calls).toBe(1);
+  });
+});
+
+describe('DictionarySheet — web search row', () => {
+  it('renders a link with the resolved URL and target="_blank" on the web build', async () => {
+    // Real built-in Google web-search provider, via the registry mock.
+    const googleEntry: DictionaryProvider = {
+      id: BUILTIN_WEB_SEARCH_IDS.google,
+      kind: 'web',
+      label: 'Google',
+      async lookup() {
+        return { ok: true };
+      },
+    };
+    // Enable the google entry in the store so the sheet can resolve its
+    // urlTemplate from BUILTIN_WEB_SEARCHES.
+    useCustomDictionaryStore.setState({
+      dictionaries: [],
+      settings: {
+        providerOrder: [BUILTIN_WEB_SEARCH_IDS.google],
+        providerEnabled: { [BUILTIN_WEB_SEARCH_IDS.google]: true },
+        webSearches: [],
+      },
+    });
+    providersForNextRender.push(googleEntry);
+
+    renderSheet({ word: 'hello world' });
+
+    // The test setup mocks `isTauriAppPlatform: () => false`, so we
+    // exercise the web-build path: anchor with href + target="_blank",
+    // openUrl untouched.
+    const link = (await waitFor(() =>
+      screen.getByRole('link', { name: /Google/i }),
+    )) as HTMLAnchorElement;
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toContain('noopener');
+    const url = link.getAttribute('href') ?? '';
+    expect(url.startsWith('https://www.google.com/search')).toBe(true);
+    expect(url).toContain(encodeURIComponent('hello world'));
+
+    fireEvent.click(link);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+});
+
+describe('DictionarySheet — section order', () => {
+  // The registry hands the sheet its providers already sorted by
+  // `settings.providerOrder`, so the first entry of `providersForNextRender`
+  // is whatever the user dragged to the top in settings.
+  const buildWebEntry = (): DictionaryProvider => ({
+    id: BUILTIN_WEB_SEARCH_IDS.google,
+    kind: 'web',
+    label: 'Google',
+    async lookup() {
+      return { ok: true };
+    },
+  });
+
+  const sectionHeadings = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('section > h3')).map((h) => h.textContent);
+
+  it('puts the web-search section first when a web entry is top of the configured order (#5083)', async () => {
+    providersForNextRender.push(buildWebEntry(), buildRealStarDictProvider());
+    const { container } = renderSheet({ word: 'hello' });
+
+    await waitFor(() => screen.getByText('CMU American English spelling'));
+    expect(sectionHeadings(container)).toEqual(['Search the web', 'Dictionaries']);
+  });
+
+  it('keeps the dictionaries section first when a dictionary is top of the configured order', async () => {
+    providersForNextRender.push(buildRealStarDictProvider(), buildWebEntry());
+    const { container } = renderSheet({ word: 'hello' });
+
+    await waitFor(() => screen.getByText('CMU American English spelling'));
+    expect(sectionHeadings(container)).toEqual(['Dictionaries', 'Search the web']);
+  });
+});
+
+describe('DictionarySheet — empty state', () => {
+  it('renders "No dictionaries enabled" + manage gear when zero providers are configured', async () => {
+    // providersForNextRender stays empty.
+    const onManage = vi.fn();
+    renderSheet({ word: 'hello', onManage });
+
+    expect(await waitFor(() => screen.getByText('No dictionaries enabled'))).toBeTruthy();
+    const gear = screen.getByLabelText('Manage Dictionaries');
+    fireEvent.click(gear);
+    expect(onManage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('DictionarySheet — streaming results', () => {
+  it('reveals an entry while its provider is still generating (#7279)', async () => {
+    let context!: DictionaryLookupContext;
+    let finish!: (outcome: DictionaryLookupOutcome) => void;
+    providersForNextRender.push({
+      id: 'streaming',
+      kind: 'builtin',
+      label: 'Streaming',
+      lookup(_word, ctx) {
+        context = ctx;
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      },
+    });
+    renderSheet({ word: 'bank' });
+    await waitFor(() => expect(context).toBeDefined());
+    await act(async () => {
+      context.container.textContent = 'A river side';
+      (context as DictionaryLookupContext & { onUpdate?: () => void }).onUpdate?.();
+    });
+    expect(context.container.classList.contains('hidden')).toBe(false);
+    expect(screen.queryByTestId('dict-card-skeleton')).toBeNull();
+    await act(async () => {
+      finish({ ok: true });
+    });
+  });
+});
+
+describe('DictionarySheet — abort on unmount', () => {
+  it('aborts in-flight provider lookups when the sheet unmounts', async () => {
+    const observer = { aborted: false };
+    providersForNextRender.push(buildSlowProvider(observer));
+
+    const { unmount } = renderSheet({ word: 'hello' });
+
+    // Wait until the lookup has been kicked off (the provider hasn't
+    // resolved yet — it's pending on its abort listener).
+    await waitFor(() => {
+      // Skeleton card rendered while loading.
+      expect(screen.queryByTestId('dict-card-skeleton')).toBeTruthy();
+    });
+
+    unmount();
+
+    await waitFor(() => {
+      expect(observer.aborted).toBe(true);
+    });
+  });
+});
+
+describe('DictionarySheet - image zoom', () => {
+  it('opens the full-screen viewer when an image in a shadow-rendered entry is tapped (#6018)', async () => {
+    providersForNextRender.push(buildShadowImageProvider());
+    renderSheet({ word: 'hello' });
+
+    const host = await waitFor(() => {
+      const el = screen.getByTestId('img-shadow-host');
+      if (!el.shadowRoot) throw new Error('shadow root not attached');
+      return el;
+    });
+    const img = host.shadowRoot!.querySelector('img[src="blob:test/pic-1"]') as HTMLImageElement;
+
+    fireEvent.click(img);
+
+    const viewer = await waitFor(() => screen.getByTestId('dict-image-viewer'));
+    expect(viewer.getAttribute('data-src')).toBe('data:image/png;base64,blob:test/pic-1');
+
+    fireEvent.click(screen.getByLabelText('Close image viewer'));
+    await waitFor(() => expect(screen.queryByTestId('dict-image-viewer')).toBeNull());
+  });
+
+  it('leaves an image wrapped in a link to the link handler', async () => {
+    providersForNextRender.push(buildShadowImageProvider());
+    renderSheet({ word: 'hello' });
+
+    const host = await waitFor(() => {
+      const el = screen.getByTestId('img-shadow-host');
+      if (!el.shadowRoot) throw new Error('shadow root not attached');
+      return el;
+    });
+    const linkedImg = host.shadowRoot!.querySelector(
+      'img[src="blob:test/pic-2"]',
+    ) as HTMLImageElement;
+
+    fireEvent.click(linkedImg);
+
+    await act(async () => {});
+    expect(screen.queryByTestId('dict-image-viewer')).toBeNull();
+    expect(mockConvertBlobUrlToDataUrl).not.toHaveBeenCalled();
+  });
+
+  it('zooms an image wrapped in an anchor that has no href (#6018)', async () => {
+    providersForNextRender.push(buildShadowImageProvider());
+    renderSheet({ word: 'hello' });
+
+    const host = await waitFor(() => {
+      const el = screen.getByTestId('img-shadow-host');
+      if (!el.shadowRoot) throw new Error('shadow root not attached');
+      return el;
+    });
+    const heldImg = host.shadowRoot!.querySelector(
+      'img[src="blob:test/pic-3"]',
+    ) as HTMLImageElement;
+
+    fireEvent.click(heldImg);
+
+    const viewer = await waitFor(() => screen.getByTestId('dict-image-viewer'));
+    expect(viewer.getAttribute('data-src')).toBe('data:image/png;base64,blob:test/pic-3');
+  });
+
+  it('zooms the hidden full-resolution twin, not the thumbnail (#6018)', async () => {
+    providersForNextRender.push(buildShadowImageProvider());
+    renderSheet({ word: 'hello' });
+
+    const host = await waitFor(() => {
+      const el = screen.getByTestId('img-shadow-host');
+      if (!el.shadowRoot) throw new Error('shadow root not attached');
+      return el;
+    });
+    const thumb = host.shadowRoot!.querySelector('img.thumb') as HTMLImageElement;
+
+    fireEvent.click(thumb);
+
+    const viewer = await waitFor(() => screen.getByTestId('dict-image-viewer'));
+    expect(viewer.getAttribute('data-src')).toBe('data:image/png;base64,blob:test/pic-fullsize');
+  });
+});
+
+describe('DictionarySheet — auto-play pronunciation fan-out (#6265)', () => {
+  const buildRecordingProvider = (
+    id: string,
+    seen: { id: string; autoPlay: boolean | undefined }[],
+  ): DictionaryProvider => ({
+    id,
+    kind: 'mdict',
+    label: id,
+    async lookup(word, ctx): Promise<DictionaryLookupOutcome> {
+      seen.push({ id, autoPlay: ctx.autoPlayPronunciation });
+      ctx.container.textContent = `${id}:${word}`;
+      return { ok: true, headword: word };
+    },
+  });
+
+  it('arms auto-play on the first MDict provider only, so concurrent lookups cannot interrupt each other', async () => {
+    const seen: { id: string; autoPlay: boolean | undefined }[] = [];
+    useCustomDictionaryStore.setState({
+      dictionaries: [],
+      settings: {
+        providerOrder: ['mdict:first', 'mdict:second'],
+        providerEnabled: { 'mdict:first': true, 'mdict:second': true },
+        webSearches: [],
+        autoPlayPronunciation: true,
+      },
+    });
+    providersForNextRender.push(
+      buildRecordingProvider('mdict:first', seen),
+      buildRecordingProvider('mdict:second', seen),
+    );
+
+    renderSheet({ word: 'hello' });
+    await waitFor(() => expect(seen).toHaveLength(2));
+
+    // They share one module-scoped <audio>, so arming both lets whichever
+    // resolves its bytes last cut off the other.
+    expect(seen.find((s) => s.id === 'mdict:first')?.autoPlay).toBe(true);
+    expect(seen.find((s) => s.id === 'mdict:second')?.autoPlay).toBe(false);
+  });
+
+  it('arms nothing while the setting is off', async () => {
+    const seen: { id: string; autoPlay: boolean | undefined }[] = [];
+    useCustomDictionaryStore.setState({
+      dictionaries: [],
+      settings: {
+        providerOrder: ['mdict:first'],
+        providerEnabled: { 'mdict:first': true },
+        webSearches: [],
+      },
+    });
+    providersForNextRender.push(buildRecordingProvider('mdict:first', seen));
+
+    renderSheet({ word: 'hello' });
+    await waitFor(() => expect(seen).toHaveLength(1));
+
+    expect(seen[0]!.autoPlay).toBe(false);
+  });
+});

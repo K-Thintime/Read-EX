@@ -1,0 +1,214 @@
+import { redirect, useRouter } from 'next/navigation';
+import { getCurrentWindow, ScrollBarStyle } from '@tauri-apps/api/window';
+import { getAllWebviewWindows, WebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { isPWA, isTauriAppPlatform, isWebAppPlatform } from '@/services/environment';
+import { BOOK_IDS_SEPARATOR } from '@/services/constants';
+import { AppService } from '@/types/system';
+import { windowNeedsClientOutline } from '@/utils/window';
+
+// Labels handed out whose windows are not created yet, so two overlapping
+// launches that read the same window list do not pick the same label.
+const pendingLabels = new Set<string>();
+
+// Take the first label no open or pending window holds. A counter of open
+// windows would hand out the label of a window that is still open once an
+// earlier one closes, and Tauri refuses to create a second window with that
+// label (#6363).
+const reserveWindowLabel = async (prefix: string) => {
+  const labels = new Set((await getAllWebviewWindows()).map((w) => w.label));
+  let index = 0;
+  while (labels.has(`${prefix}-${index}`) || pendingLabels.has(`${prefix}-${index}`)) index += 1;
+  const label = `${prefix}-${index}`;
+  pendingLabels.add(label);
+  return label;
+};
+
+const createReaderWindow = async (appService: AppService, url: string) => {
+  const currentWindow = getCurrentWindow();
+  const label = currentWindow.label;
+  const newLabelPrefix = label === 'main' ? 'reader' : label;
+  const newLabel = await reserveWindowLabel(newLabelPrefix);
+  const win = new WebviewWindow(newLabel, {
+    url,
+    width: 800,
+    height: 600,
+    center: true,
+    resizable: true,
+    title: 'Readest',
+    decorations: !!appService.isMacOSApp,
+    // Linux stays opaque: a transparent WebKitGTK window turns invisible when
+    // its web process is busy (#3682). macOS uses native decorations instead.
+    transparent: !appService.isMacOSApp && !appService.isLinuxApp,
+    shadow: appService.isMacOSApp ? undefined : !windowNeedsClientOutline(appService),
+    titleBarStyle: appService.isMacOSApp ? 'overlay' : undefined,
+    // Enum ScrollBarStyle is exported as type by tauri, so it cannot be used directly.
+    scrollBarStyle: (appService.osPlatform === 'windows'
+      ? 'fluentOverlay'
+      : 'default') as unknown as ScrollBarStyle,
+  });
+  win.once('tauri://created', () => {
+    pendingLabels.delete(newLabel);
+  });
+  win.once('tauri://error', (e) => {
+    pendingLabels.delete(newLabel);
+    console.error('error creating window', e);
+  });
+};
+
+export const showReaderWindow = (
+  appService: AppService,
+  bookIds: string[],
+  queryParams?: string,
+) => {
+  const ids = bookIds.join(BOOK_IDS_SEPARATOR);
+  const params = new URLSearchParams(queryParams || '');
+  params.set('ids', ids);
+  const url = `/reader?${params.toString()}`;
+  return createReaderWindow(appService, url);
+};
+
+export const showLibraryWindow = (appService: AppService, filenames: string[]) => {
+  const params = new URLSearchParams();
+  filenames.forEach((filename) => params.append('file', filename));
+  const url = `/library?${params.toString()}`;
+  return createReaderWindow(appService, url);
+};
+
+// Bring the main library window back when a reader window asks to "go to library".
+// If main was hidden (macOS close-to-hide) we re-show it. If it was destroyed
+// (Windows/Linux default close), we recreate a window with the same 'main'
+// label so the existing emitTo('main', 'close-reader-window', ...) wiring
+// continues to work.
+export const ensureMainLibraryWindow = async (appService: AppService) => {
+  const existing = await WebviewWindow.getByLabel('main');
+  if (existing) {
+    await existing.show();
+    await existing.unminimize();
+    await existing.setFocus();
+    return;
+  }
+  const win = new WebviewWindow('main', {
+    url: '/library',
+    width: 800,
+    height: 600,
+    center: true,
+    resizable: true,
+    title: 'Readest',
+    decorations: !!appService.isMacOSApp,
+    // Linux stays opaque: a transparent WebKitGTK window turns invisible when
+    // its web process is busy (#3682). macOS uses native decorations instead.
+    transparent: !appService.isMacOSApp && !appService.isLinuxApp,
+    shadow: appService.isMacOSApp ? undefined : !windowNeedsClientOutline(appService),
+    titleBarStyle: appService.isMacOSApp ? 'overlay' : undefined,
+    scrollBarStyle: (appService.osPlatform === 'windows'
+      ? 'fluentOverlay'
+      : 'default') as unknown as ScrollBarStyle,
+  });
+  win.once('tauri://error', (e) => {
+    console.error('error recreating main window', e);
+  });
+};
+
+export const navigateToReader = (
+  router: ReturnType<typeof useRouter>,
+  bookIds: string[],
+  queryParams?: string,
+  navOptions?: { scroll?: boolean },
+) => {
+  const ids = bookIds.join(BOOK_IDS_SEPARATOR);
+  if (isWebAppPlatform() && !isPWA()) {
+    router.push(`/reader/${ids}${queryParams ? `?${queryParams}` : ''}`, navOptions);
+  } else {
+    const params = new URLSearchParams(queryParams || '');
+    params.set('ids', ids);
+    router.push(`/reader?${params.toString()}`, navOptions);
+  }
+};
+
+export const navigateToLogin = (router: ReturnType<typeof useRouter>) => {
+  const pathname = window.location.pathname;
+  const search = window.location.search;
+  const currentPath = pathname !== '/auth' ? pathname + search : '/';
+  router.push(`/auth?redirect=${encodeURIComponent(currentPath)}`);
+};
+
+export const navigateToHardcoverConnect = (router: ReturnType<typeof useRouter>) => {
+  const redirect = encodeURIComponent(window.location.pathname + window.location.search);
+  router.push(`/hardcover/connect?redirect=${redirect}`);
+};
+
+// Remember the opener so leaving the profile returns to it, e.g. the book
+// being read when Plans was opened from the reader settings (#6607). The
+// direction picks the slide of the route view transition (useAppRouter).
+export const navigateToProfile = (router: ReturnType<typeof useRouter>) => {
+  const { pathname, search } = window.location;
+  document.documentElement.setAttribute('data-nav-direction', 'forward');
+  router.push(`/user?redirect=${encodeURIComponent(pathname + search)}`);
+};
+
+export const navigateBackFromProfile = (
+  router: ReturnType<typeof useRouter>,
+  redirect: string | null | undefined,
+) => {
+  document.documentElement.setAttribute('data-nav-direction', 'back');
+  // Browsers read a backslash as '/', so a redirect like '/\host' leaves the app.
+  if (redirect?.startsWith('/') && !redirect.startsWith('//') && !redirect.includes('\\')) {
+    router.replace(redirect);
+  } else {
+    navigateToLibrary(router);
+  }
+};
+
+export const navigateToLibrary = (
+  router: ReturnType<typeof useRouter>,
+  queryParams?: string,
+  navOptions?: { scroll?: boolean },
+  navBack?: boolean,
+) => {
+  const lastLibraryParams =
+    typeof window !== 'undefined' ? sessionStorage.getItem('lastLibraryParams') : null;
+  if (navBack && lastLibraryParams) {
+    queryParams = lastLibraryParams;
+  }
+
+  router.replace(`/library${queryParams ? `?${queryParams}` : ''}`, navOptions);
+};
+
+// Recovery action when a reader has nothing to display — e.g. all books were
+// closed, or a book failed to load in a freshly-opened reader window.
+// In a dedicated reader window we close the window itself, ensuring the main
+// library window is visible first; routing the reader window to /library
+// instead would leave a leftover window the user has to close manually.
+// In the main window or on web, fall back to /library navigation.
+export const closeReaderWindowOrGoToLibrary = async (
+  appService: AppService | null,
+  router: ReturnType<typeof useRouter>,
+) => {
+  if (isTauriAppPlatform() && appService?.hasWindow) {
+    const currentWindow = getCurrentWindow();
+    if (currentWindow.label !== 'main') {
+      await ensureMainLibraryWindow(appService);
+      await currentWindow.close();
+      return;
+    }
+  }
+  navigateToLibrary(router, '', undefined, true);
+};
+
+export const redirectToLibrary = () => {
+  redirect('/library');
+};
+
+export const navigateToResetPassword = (router: ReturnType<typeof useRouter>) => {
+  const pathname = window.location.pathname;
+  const search = window.location.search;
+  const currentPath = pathname !== '/auth' ? pathname + search : '/';
+  router.push(`/auth/recovery?redirect=${encodeURIComponent(currentPath)}`);
+};
+
+export const navigateToUpdatePassword = (router: ReturnType<typeof useRouter>) => {
+  const pathname = window.location.pathname;
+  const search = window.location.search;
+  const currentPath = pathname !== '/auth' ? pathname + search : '/';
+  router.push(`/auth/update?redirect=${encodeURIComponent(currentPath)}`);
+};

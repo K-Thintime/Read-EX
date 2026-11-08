@@ -1,0 +1,298 @@
+import {
+  Book,
+  BookConfig,
+  BookFormat,
+  BookNote,
+  BookNoteType,
+  HighlightColor,
+  HighlightStyle,
+  ReadingStatus,
+} from '@/types/book';
+import { DBBookConfig, DBBook, DBBookNote } from '@/types/records';
+import { buildFeedBookUrl } from '@/services/rss/feedBookUrl';
+import { restoreAbsBookFields } from './audiobook';
+
+// Postgres text columns reject NUL. Kept here rather than in sanitize.ts, which
+// loads DOMPurify: the sync API route imports this module on every cold start.
+const sanitizeString = (str?: string) => {
+  if (!str) return str;
+  return str.replace(/\u0000/g, '');
+};
+
+export const transformBookConfigToDB = (bookConfig: unknown, userId: string): DBBookConfig => {
+  const {
+    bookHash,
+    metaHash,
+    progress,
+    location,
+    xpointer,
+    rsvpPosition,
+    searchConfig,
+    viewSettings,
+    ttsPacks,
+    updatedAt,
+  } = bookConfig as BookConfig;
+
+  return {
+    user_id: userId,
+    book_hash: bookHash!,
+    meta_hash: metaHash,
+    location: location,
+    xpointer: xpointer,
+    progress: progress && JSON.stringify(progress),
+    rsvp_position: rsvpPosition && JSON.stringify(rsvpPosition),
+    search_config: searchConfig && JSON.stringify(searchConfig),
+    view_settings: viewSettings && JSON.stringify(viewSettings),
+    // Only a book with Read Aloud history writes the column.
+    ...(ttsPacks ? { tts_packs: JSON.stringify(ttsPacks) } : {}),
+    updated_at: new Date(updatedAt ?? Date.now()).toISOString(),
+  };
+};
+
+export const transformBookConfigFromDB = (dbBookConfig: DBBookConfig): BookConfig => {
+  const {
+    book_hash,
+    meta_hash,
+    progress,
+    location,
+    xpointer,
+    rsvp_position,
+    search_config,
+    view_settings,
+    tts_packs,
+    updated_at,
+  } = dbBookConfig;
+  return {
+    bookHash: book_hash,
+    metaHash: meta_hash,
+    location,
+    xpointer,
+    progress: progress && JSON.parse(progress),
+    rsvpPosition: rsvp_position && JSON.parse(rsvp_position),
+    searchConfig: search_config && JSON.parse(search_config),
+    viewSettings: view_settings && JSON.parse(view_settings),
+    ...(tts_packs ? { ttsPacks: JSON.parse(tts_packs) } : {}),
+    updatedAt: new Date(updated_at!).getTime(),
+  } as BookConfig;
+};
+
+export const transformBookToDB = (book: unknown, userId: string): DBBook => {
+  const {
+    hash,
+    metaHash,
+    format,
+    title,
+    sourceTitle,
+    originalFilename,
+    author,
+    groupId,
+    groupName,
+    groupUpdatedAt,
+    tags,
+    progress,
+    readingStatus,
+    readingStatusUpdatedAt,
+    coverHash,
+    coverUpdatedAt,
+    pageCount,
+    metadata,
+    metadataUpdatedAt,
+    createdAt,
+    updatedAt,
+    deletedAt,
+    uploadedAt,
+  } = book as Book;
+
+  return {
+    user_id: userId,
+    book_hash: hash,
+    meta_hash: metaHash,
+    format,
+    title: sanitizeString(title)!,
+    author: sanitizeString(author)!,
+    group_id: groupId,
+    group_name: sanitizeString(groupName),
+    group_updated_at: groupUpdatedAt ? new Date(groupUpdatedAt).toISOString() : null,
+    tags: tags,
+    progress: progress,
+    reading_status: readingStatus,
+    reading_status_updated_at: readingStatusUpdatedAt
+      ? new Date(readingStatusUpdatedAt).toISOString()
+      : null,
+    cover_hash: coverHash ?? null,
+    cover_updated_at: coverUpdatedAt ? new Date(coverUpdatedAt).toISOString() : null,
+    page_count: pageCount ?? null,
+    source_title: sanitizeString(sourceTitle),
+    original_filename: sanitizeString(originalFilename),
+    metadata: metadata ? sanitizeString(JSON.stringify(metadata)) : null,
+    metadata_updated_at: metadataUpdatedAt ? new Date(metadataUpdatedAt).toISOString() : null,
+    created_at: new Date(createdAt ?? Date.now()).toISOString(),
+    updated_at: new Date(updatedAt ?? Date.now()).toISOString(),
+    deleted_at: deletedAt ? new Date(deletedAt).toISOString() : null,
+    uploaded_at: uploadedAt ? new Date(uploadedAt).toISOString() : null,
+  };
+};
+
+export const transformBookFromDB = (dbBook: DBBook): Book => {
+  const {
+    book_hash,
+    meta_hash,
+    format,
+    title,
+    author,
+    group_id,
+    group_name,
+    group_updated_at,
+    tags,
+    progress,
+    reading_status,
+    reading_status_updated_at,
+    cover_hash,
+    cover_updated_at,
+    page_count,
+    source_title,
+    original_filename,
+    metadata,
+    metadata_updated_at,
+    created_at,
+    updated_at,
+    deleted_at,
+    uploaded_at,
+  } = dbBook;
+
+  const book: Book = {
+    hash: book_hash,
+    metaHash: meta_hash,
+    format: format as BookFormat,
+    title,
+    author,
+    groupId: group_id,
+    groupName: group_name,
+    groupUpdatedAt: group_updated_at ? new Date(group_updated_at).getTime() : null,
+    tags: tags,
+    progress: progress,
+    readingStatus: reading_status as ReadingStatus,
+    readingStatusUpdatedAt: reading_status_updated_at
+      ? new Date(reading_status_updated_at).getTime()
+      : undefined,
+    coverHash: cover_hash ?? null,
+    coverUpdatedAt: cover_updated_at ? new Date(cover_updated_at).getTime() : null,
+    sourceTitle: source_title,
+    metadata: metadata ? JSON.parse(metadata) : null,
+    metadataUpdatedAt: metadata_updated_at ? new Date(metadata_updated_at).getTime() : null,
+    createdAt: new Date(created_at!).getTime(),
+    updatedAt: new Date(updated_at!).getTime(),
+    deletedAt: deleted_at ? new Date(deleted_at).getTime() : null,
+    uploadedAt: uploaded_at ? new Date(uploaded_at).getTime() : null,
+  };
+  // Only when set: an undefined key would wipe the local count in the pull
+  // merge's `{ ...local, ...remote }` spread.
+  if (page_count != null) book.pageCount = page_count;
+  if (original_filename != null) book.originalFilename = original_filename;
+  // Native cloud DBBook has no `url` column; a feed book carries its feed URL in
+  // metadata so the reader can rebuild the feed:// descriptor here.
+  if (!book.url && book.metadata?.feedUrl) {
+    book.url = buildFeedBookUrl(book.metadata.feedUrl);
+  }
+  // Same story for an ABS stub, whose identity is its `abs://` filePath: no
+  // column carries it (and the push strips filePath as device-local), so it
+  // rides in metadata and is rebuilt here along with the badge fields.
+  if (book.format === 'ABS') {
+    restoreAbsBookFields(book);
+  }
+  return book;
+};
+
+export const transformBookNoteToDB = (bookNote: unknown, userId: string): DBBookNote => {
+  const {
+    bookHash,
+    metaHash,
+    id,
+    type,
+    cfi,
+    xpointer0,
+    xpointer1,
+    page,
+    text,
+    style,
+    color,
+    note,
+    global,
+    ink,
+    crosspoint,
+    createdAt,
+    updatedAt,
+    deletedAt,
+  } = bookNote as BookNote;
+
+  return {
+    user_id: userId,
+    book_hash: bookHash!,
+    meta_hash: metaHash,
+    id,
+    type,
+    cfi,
+    xpointer0,
+    xpointer1,
+    page,
+    text: sanitizeString(text),
+    style,
+    color,
+    note,
+    global,
+    // Absent for other notes, so an upsert never clears stored strokes.
+    ink,
+    // Absent until a reader or app anchors the highlight for CrossPoint.
+    crosspoint,
+    created_at: new Date(createdAt ?? Date.now()).toISOString(),
+    updated_at: new Date(updatedAt ?? Date.now()).toISOString(),
+    // note that only null deleted_at is updated to the database, undefined is not
+    deleted_at: deletedAt ? new Date(deletedAt).toISOString() : null,
+  };
+};
+
+export const transformBookNoteFromDB = (dbBookNote: DBBookNote): BookNote => {
+  const {
+    book_hash,
+    meta_hash,
+    id,
+    type,
+    cfi,
+    xpointer0,
+    xpointer1,
+    page,
+    text,
+    style,
+    color,
+    note,
+    global,
+    ink,
+    crosspoint,
+    created_at,
+    updated_at,
+    deleted_at,
+  } = dbBookNote;
+
+  return {
+    bookHash: book_hash,
+    metaHash: meta_hash,
+    id,
+    type: type as BookNoteType,
+    cfi: cfi ?? '',
+    xpointer0,
+    xpointer1,
+    page,
+    text,
+    style: style as HighlightStyle,
+    color: color as HighlightColor,
+    note,
+    global,
+    // No key without strokes: a pulled note is merged over the local one, and
+    // a server without the column must not wipe strokes held locally.
+    ...(ink ? { ink } : {}),
+    ...(crosspoint ? { crosspoint } : {}),
+    createdAt: new Date(created_at!).getTime(),
+    updatedAt: new Date(updated_at!).getTime(),
+    deletedAt: deleted_at ? new Date(deleted_at).getTime() : null,
+  };
+};

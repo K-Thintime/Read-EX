@@ -1,0 +1,759 @@
+// @vitest-environment happy-dom
+import { beforeEach, describe, expect, test, vi } from 'vitest';
+
+vi.mock('@/utils/image', () => ({
+  fetchImageAsBase64: vi.fn().mockResolvedValue('data:image/png;base64,x'),
+}));
+
+const notifyCarPlayMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('@/services/tts/carPlaySession', () => ({
+  notifyCarPlayState: (...a: unknown[]) => notifyCarPlayMock(...a),
+}));
+
+import { TTSMediaBridge, releaseUnblockAudio, unblockAudio } from '@/services/tts/ttsMediaBridge';
+import { fetchImageAsBase64 } from '@/utils/image';
+import { TauriMediaSession, type MediaSessionState } from '@/libs/mediaSession';
+import type { TTSController } from '@/services/tts/TTSController';
+
+// A controller stand-in: EventTarget + the surface the bridge consumes.
+class FakeController extends EventTarget {
+  state = 'playing';
+  terminated = false;
+  pause = vi.fn().mockResolvedValue(true);
+  start = vi.fn().mockResolvedValue(undefined);
+  resume = vi.fn().mockResolvedValue(undefined);
+  forward = vi.fn().mockResolvedValue(undefined);
+  backward = vi.fn().mockResolvedValue(undefined);
+  seekToTime = vi.fn().mockResolvedValue(undefined);
+  ensureTimeline = vi.fn().mockResolvedValue(null);
+  getPlaybackInfo = vi.fn().mockReturnValue({ position: 12, duration: 60, measuredFraction: 1 });
+
+  emitMark(text: string, name: string) {
+    this.dispatchEvent(new CustomEvent('tts-speak-mark', { detail: { text, name } }));
+  }
+  emitState(state: string) {
+    this.state = state;
+    this.dispatchEvent(new CustomEvent('tts-state-change', { detail: { state } }));
+  }
+}
+
+interface FakeWebMediaSession {
+  metadata: unknown;
+  playbackState: string;
+  handlers: Map<string, (details: MediaSessionActionDetails) => void>;
+  setActionHandler: ReturnType<typeof vi.fn>;
+  setPositionState: ReturnType<typeof vi.fn>;
+}
+
+const makeFakeMediaSession = (): FakeWebMediaSession => {
+  const handlers = new Map<string, (details: MediaSessionActionDetails) => void>();
+  return {
+    metadata: null,
+    playbackState: 'none',
+    handlers,
+    setActionHandler: vi.fn(
+      (action: string, cb: ((d: MediaSessionActionDetails) => void) | null) => {
+        if (cb) handlers.set(action, cb);
+        else handlers.delete(action);
+      },
+    ),
+    setPositionState: vi.fn(),
+  };
+};
+
+const meta = (overrides = {}) => ({
+  bookKey: 'hash-abc',
+  title: 'Alice',
+  author: 'Carroll',
+  coverImageUrl: null,
+  metadataMode: 'sentence' as const,
+  ...overrides,
+});
+
+// jsdom lacks MediaMetadata; the bridge constructs it for the web path.
+class FakeMediaMetadata {
+  title: string;
+  artist: string;
+  album: string;
+  constructor(init: { title: string; artist: string; album: string }) {
+    this.title = init.title;
+    this.artist = init.artist;
+    this.album = init.album;
+  }
+}
+vi.stubGlobal('MediaMetadata', FakeMediaMetadata);
+
+describe('TTSMediaBridge', () => {
+  let controller: FakeController;
+  let fake: FakeWebMediaSession;
+  let bridge: TTSMediaBridge;
+
+  beforeEach(() => {
+    controller = new FakeController();
+    fake = makeFakeMediaSession();
+    bridge = new TTSMediaBridge(() => fake as unknown as MediaSession);
+  });
+
+  const bind = () => bridge.bind(controller as unknown as TTSController, meta());
+
+  test('bind registers transport handlers that drive the controller', async () => {
+    await bind();
+    expect(fake.handlers.has('play')).toBe(true);
+    fake.handlers.get('pause')!({} as MediaSessionActionDetails);
+    expect(controller.pause).toHaveBeenCalled();
+    controller.state = 'stop-paused';
+    fake.handlers.get('play')!({} as MediaSessionActionDetails);
+    expect(controller.start).toHaveBeenCalled();
+    fake.handlers.get('seekto')!({ seekTime: 42 } as MediaSessionActionDetails);
+    expect(controller.seekToTime).toHaveBeenCalledWith(42);
+    fake.handlers.get('nexttrack')!({} as MediaSessionActionDetails);
+    expect(controller.forward).toHaveBeenCalled();
+  });
+
+  // 'play'/'pause' are reused by audio-focus events (iOS interruptions,
+  // Android focus loss, headphone unplug). As toggles they would INVERT when
+  // state already matches — unplugging headphones while paused would start
+  // speaking from the phone speaker.
+  test('play and pause handlers are directional, not toggles', async () => {
+    await bind();
+    controller.state = 'playing';
+    fake.handlers.get('play')!({} as MediaSessionActionDetails);
+    expect(controller.start).not.toHaveBeenCalled();
+    controller.state = 'paused';
+    fake.handlers.get('pause')!({} as MediaSessionActionDetails);
+    expect(controller.pause).not.toHaveBeenCalled();
+    // The web MediaSession vocabulary has no 'toggle'; it is Tauri-only.
+    expect(fake.handlers.has('toggle')).toBe(false);
+  });
+
+  test('the Tauri session gets a toggle action that toggles both ways', async () => {
+    class RecordingTauriSession extends TauriMediaSession {
+      actions = new Map<string, (() => void) | ((position: number) => void)>();
+      override setActionHandler(
+        action: string,
+        handler: (() => void) | ((position: number) => void) | null,
+      ) {
+        if (handler) this.actions.set(action, handler);
+        else this.actions.delete(action);
+      }
+      override async setActive() {}
+      override async updateMetadata() {}
+      override async updatePlaybackState() {}
+    }
+    const tauriSession = new RecordingTauriSession();
+    bridge = new TTSMediaBridge(() => tauriSession as unknown as MediaSession);
+    await bridge.bind(controller as unknown as TTSController, meta());
+    const toggle = tauriSession.actions.get('toggle') as () => void;
+    expect(toggle).toBeDefined();
+    controller.state = 'playing';
+    toggle();
+    expect(controller.pause).toHaveBeenCalled();
+    controller.state = 'forward-paused';
+    toggle();
+    expect(controller.start).toHaveBeenCalled();
+  });
+
+  // #7048: a media key after a mid-sentence pause re-read the sentence from
+  // its start, while Space continued in place. An exact 'paused' resumes the
+  // audio where it stopped, like the in-app play button; the other paused
+  // flavours (stop/forward/setrate/...) still need a full start().
+  test('play and toggle resume a mid-sentence pause in place', async () => {
+    class RecordingTauriSession extends TauriMediaSession {
+      actions = new Map<string, (() => void) | ((position: number) => void)>();
+      override setActionHandler(
+        action: string,
+        handler: (() => void) | ((position: number) => void) | null,
+      ) {
+        if (handler) this.actions.set(action, handler);
+        else this.actions.delete(action);
+      }
+      override async setActive() {}
+      override async updateMetadata() {}
+      override async updatePlaybackState() {}
+    }
+    const tauriSession = new RecordingTauriSession();
+    bridge = new TTSMediaBridge(() => tauriSession as unknown as MediaSession);
+    await bridge.bind(controller as unknown as TTSController, meta());
+    controller.state = 'paused';
+    (tauriSession.actions.get('toggle') as () => void)();
+    (tauriSession.actions.get('play') as () => void)();
+    expect(controller.resume).toHaveBeenCalledTimes(2);
+    expect(controller.start).not.toHaveBeenCalled();
+  });
+
+  test('play restarts a source that has no resume()', async () => {
+    const audiobookLike = controller as Partial<FakeController>;
+    delete audiobookLike.resume;
+    await bind();
+    controller.state = 'paused';
+    fake.handlers.get('play')!({} as MediaSessionActionDetails);
+    expect(controller.start).toHaveBeenCalled();
+  });
+
+  // Android relays a synthetic media-session-pause on audio-focus loss. An
+  // audiobook's audio plays through a WebView <audio> element, for which
+  // Chromium requests audio focus in the app's own uid; the media service
+  // requesting focus as well loses it to that request and relays the loss as a
+  // pause, killing playback ~300ms after it started. Sessions whose audio the
+  // app renders itself (TTS, native narration) keep the service as the owner.
+  test('the activation payload carries who owns audio focus', async () => {
+    class RecordingTauriSession extends TauriMediaSession {
+      activations: { active: boolean; sessionId?: string; ownsAudioFocus?: boolean }[] = [];
+      override setActionHandler() {}
+      override async setActive(state: {
+        active: boolean;
+        sessionId?: string;
+        ownsAudioFocus?: boolean;
+      }) {
+        this.activations.push(state);
+      }
+      override async updateMetadata() {}
+      override async updatePlaybackState() {}
+    }
+    const tauriSession = new RecordingTauriSession();
+    bridge = new TTSMediaBridge(() => tauriSession as unknown as MediaSession);
+
+    await bridge.bind(controller as unknown as TTSController, meta());
+    expect(tauriSession.activations[0]!.ownsAudioFocus).toBe(true);
+    expect(tauriSession.activations[0]!.sessionId).toBe('hash-abc');
+
+    await bridge.bind(
+      new FakeController() as unknown as TTSController,
+      meta({ ownsAudioFocus: false }),
+    );
+    expect(tauriSession.activations.at(-1)!.ownsAudioFocus).toBe(false);
+  });
+
+  test('speak-mark events update metadata and clamped position state headless', async () => {
+    await bind();
+    controller.getPlaybackInfo.mockReturnValue({ position: 90, duration: 60, measuredFraction: 1 });
+    controller.emitMark('Hello there, reader.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.metadata).toBeTruthy();
+    expect((fake.metadata as FakeMediaMetadata).artist).toContain('Alice');
+    expect(fake.setPositionState).toHaveBeenCalledWith({
+      duration: 60,
+      position: 60, // clamped, never skipped
+      playbackRate: 1,
+    });
+  });
+
+  test('state changes surface playing/paused but not transit stopped', async () => {
+    await bind();
+    controller.emitState('paused');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('paused');
+    controller.emitState('stopped'); // transit: paragraph advance
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('paused'); // unchanged
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('playing');
+  });
+
+  // #6433: Chromium reports the session as playing while ANY media element
+  // plays, ignoring playbackState 'paused'. With the looping keep-alive still
+  // running after a pause, the hardware play/pause key kept sending 'pause'
+  // and TTS could never be resumed from the keyboard.
+  test('pauses the keep-alive element while paused so media keys can resume', async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined);
+    const pause = vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {});
+    unblockAudio();
+    play.mockClear();
+    await bind();
+    controller.emitState('paused');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pause).toHaveBeenCalledTimes(1);
+    controller.emitState('stopped'); // transit: paragraph advance
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(play).toHaveBeenCalledTimes(1);
+    releaseUnblockAudio();
+    play.mockRestore();
+    pause.mockRestore();
+  });
+
+  // Every paragraph advance transits 'playing' -> 'stopped' -> 'playing'. A
+  // position push triggered by the transit 'stopped' (or resolving during it)
+  // reads a non-playing state and lands a rate-0 write; when it arrives after
+  // the follow-up 'playing' write, the lock screen / CarPlay shows paused with
+  // a frozen clock while audio keeps playing (and CarPlay's play button then
+  // toggle-PAUSES the live session).
+  test('a transit stopped state change never pushes a paused position state', async () => {
+    await bind();
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    fake.setPositionState.mockClear();
+
+    controller.emitState('stopped'); // transit: paragraph advance
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.setPositionState).not.toHaveBeenCalledWith(
+      expect.objectContaining({ playbackRate: 0 }),
+    );
+  });
+
+  test('a mark position push that resolves mid-transit is dropped, not sent paused', async () => {
+    await bind();
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    fake.setPositionState.mockClear();
+
+    // The timeline await yields, and the paragraph transit begins meanwhile.
+    let releaseTimeline!: () => void;
+    controller.ensureTimeline.mockReturnValueOnce(
+      new Promise<null>((resolve) => {
+        releaseTimeline = () => resolve(null);
+      }),
+    );
+    controller.emitMark('Sentence.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    controller.state = 'stopped'; // transit begins while the push is in flight
+    releaseTimeline();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(fake.setPositionState).not.toHaveBeenCalledWith(
+      expect.objectContaining({ playbackRate: 0 }),
+    );
+  });
+
+  test('a real pause pushes a frozen position state (rate 0)', async () => {
+    await bind();
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    fake.setPositionState.mockClear();
+
+    controller.emitState('paused');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.setPositionState).toHaveBeenCalledWith(
+      expect.objectContaining({ playbackRate: 0 }),
+    );
+  });
+
+  test('rebinding the same controller refreshes meta without duplicate listeners', async () => {
+    await bind();
+    await bridge.bind(controller as unknown as TTSController, meta({ bookKey: 'hash-abc-2' }));
+    controller.emitMark('Once more.', '1');
+    await new Promise((r) => setTimeout(r, 0));
+    // One metadata update per mark, not two.
+    expect(fake.setPositionState).toHaveBeenCalledTimes(1);
+  });
+
+  test('unbind clears handlers and stops reacting to controller events', async () => {
+    await bind();
+    bridge.unbind();
+    expect(fake.handlers.size).toBe(0);
+    fake.setPositionState.mockClear();
+    controller.emitMark('After unbind.', '2');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.setPositionState).not.toHaveBeenCalled();
+    expect(bridge.isBound).toBe(false);
+  });
+
+  // Android Auto (and the lock screen) drive nexttrack/previoustrack. The
+  // native onSkipToNext/Previous fire an event into the WebView, where
+  // forward()/backward() run stop() then advance a paragraph — a ~1s round
+  // trip. During that window the controller churns (stop -> transient
+  // paused), which surfaced to the car as a pause flicker / progress-bar
+  // reset with no track change, i.e. "the forward button does not work".
+  // The bridge must give instant, coherent feedback: assert playing at once
+  // and swallow the transient churn until the next segment's mark lands.
+  test('skip asserts playing immediately (no dead zone before the round trip)', async () => {
+    await bind();
+    expect(fake.playbackState).toBe('none');
+    fake.handlers.get('nexttrack')!({} as MediaSessionActionDetails);
+    expect(controller.forward).toHaveBeenCalled();
+    expect(fake.playbackState).toBe('playing');
+  });
+
+  test('skip suppresses the transient stop/pause churn until the next mark', async () => {
+    await bind();
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('playing');
+
+    // press "forward" in the car
+    fake.handlers.get('previoustrack')!({} as MediaSessionActionDetails);
+    expect(controller.backward).toHaveBeenCalled();
+
+    // backward() internally stops then re-speaks; the transient paused must
+    // not flicker to the car while the skip is in flight.
+    controller.emitState('paused');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('playing'); // held, not flickered
+
+    // the new segment starts speaking -> the guard clears, metadata updates
+    controller.state = 'playing';
+    controller.emitMark('The new sentence.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.metadata).toBeTruthy();
+
+    // once the skip has landed, real state changes surface again
+    controller.emitState('paused');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('paused');
+  });
+
+  test('a stray mark mid-skip (aborted segment) keeps the hold, no flicker', async () => {
+    await bind();
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    // A state change now also pushes the position/rate (so a mid-sentence
+    // pause reaches the car); clear it so the assertion below isolates the
+    // skip window, where the position must stay suppressed.
+    fake.setPositionState.mockClear();
+
+    fake.handlers.get('previoustrack')!({} as MediaSessionActionDetails);
+    expect(fake.playbackState).toBe('playing');
+
+    // stop() aborts the old segment and emits a stray mark while NOT playing;
+    // it must not clear the hold or push a paused/position update.
+    controller.state = 'stopped';
+    controller.emitMark('aborted tail', '3');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('playing'); // held
+    expect(fake.setPositionState).not.toHaveBeenCalled(); // position suppressed
+
+    // the real new segment plays -> hold ends, updates resume
+    controller.state = 'playing';
+    controller.emitMark('the previous sentence', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.metadata).toBeTruthy();
+    expect(fake.setPositionState).toHaveBeenCalled();
+  });
+
+  test('a terminal stop during a skip (end of book) still surfaces', async () => {
+    await bind();
+    controller.emitState('playing');
+    await new Promise((r) => setTimeout(r, 0));
+    fake.handlers.get('nexttrack')!({} as MediaSessionActionDetails);
+    // forward() ran off the end of the book -> terminate.
+    controller.terminated = true;
+    controller.emitState('stopped');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.playbackState).toBe('paused'); // terminal stop is not swallowed
+  });
+
+  test('section label falls back to the last known value when the source dies', async () => {
+    let label: string | undefined = 'Chapter 7';
+    await bridge.bind(controller as unknown as TTSController, {
+      ...meta({ metadataMode: 'chapter' as const }),
+      getSectionLabel: () => label,
+    });
+    controller.emitMark('First.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    const first = fake.metadata as FakeMediaMetadata;
+    label = undefined; // hook unmounted
+    controller.emitMark('Second.', '1');
+    await new Promise((r) => setTimeout(r, 0));
+    // Metadata still reflects the last known chapter, no crash, no blanking.
+    expect(first).toBeTruthy();
+    expect(bridge.isBound).toBe(true);
+  });
+
+  // The Update Frequency setting is the only thing choosing what the lock
+  // screen names. Hardcoding one shape here is how it silently went dead.
+  test('metadataMode drives what Now Playing names', async () => {
+    await bridge.bind(controller as unknown as TTSController, {
+      ...meta(),
+      getSectionLabel: () => 'Chapter I',
+    });
+    controller.emitMark('The queen without love walked on.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    const sentence = fake.metadata as FakeMediaMetadata;
+    expect(sentence.title).toBe('The queen without love walked on.');
+    expect(sentence.artist).toBe('Chapter I');
+
+    await bridge.bind(controller as unknown as TTSController, {
+      ...meta({ metadataMode: 'chapter' as const }),
+      getSectionLabel: () => 'Chapter I',
+    });
+    controller.emitMark('The queen without love walked on.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    const chapter = fake.metadata as FakeMediaMetadata;
+    expect(chapter.title).toBe('Chapter I');
+    expect(chapter.artist).toBe('Carroll');
+  });
+
+  test('bind reports an active CarPlay state', async () => {
+    notifyCarPlayMock.mockClear();
+    await bind();
+    expect(notifyCarPlayMock).toHaveBeenCalledWith({
+      active: true,
+      title: 'Alice',
+      author: 'Carroll',
+    });
+  });
+
+  test('unbind reports an inactive CarPlay state', async () => {
+    await bind();
+    notifyCarPlayMock.mockClear();
+    bridge.unbind();
+    expect(notifyCarPlayMock).toHaveBeenCalledWith({ active: false });
+  });
+
+  test('a fresh bind does not emit an inactive CarPlay state', async () => {
+    // bind() calls unbind() internally before (re)activating; on a fresh
+    // bridge that internal unbind must be a no-op w.r.t. CarPlay signaling
+    // (no controller was ever bound), so no {active:false} should surface.
+    notifyCarPlayMock.mockClear();
+    await bind();
+    expect(notifyCarPlayMock).not.toHaveBeenCalledWith({ active: false });
+  });
+});
+
+describe('TTSMediaBridge bind teardown race (READEST-1A)', () => {
+  test('first pause works while native activation is still pending', async () => {
+    let releaseActivation!: () => void;
+    const actions = new Map<string, (() => void) | ((position: number) => void)>();
+    const tauriSession = new TauriMediaSession();
+    tauriSession.setActive = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        releaseActivation = resolve;
+      });
+    });
+    tauriSession.updateMetadata = vi.fn().mockResolvedValue(undefined);
+    tauriSession.updatePlaybackState = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn((action, handler) => {
+      if (handler) actions.set(action, handler);
+      else actions.delete(action);
+    });
+    const controller = new FakeController();
+    const bridge = new TTSMediaBridge(() => tauriSession);
+
+    const binding = bridge.bind(controller as unknown as TTSController, meta());
+    await Promise.resolve();
+    (actions.get('pause') as () => void)();
+
+    expect(controller.pause).toHaveBeenCalledOnce();
+    releaseActivation();
+    await binding;
+  });
+
+  test('activates the foreground session before a deferred cover fetch resolves', async () => {
+    let resolveCover!: (value: string) => void;
+    vi.mocked(fetchImageAsBase64).mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveCover = resolve;
+      }),
+    );
+    const tauriSession = new TauriMediaSession();
+    tauriSession.setActive = vi.fn().mockResolvedValue(undefined);
+    tauriSession.updateMetadata = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn();
+    const bridge = new TTSMediaBridge(() => tauriSession);
+
+    await bridge.bind(new FakeController() as unknown as TTSController, meta());
+
+    expect(tauriSession.setActive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        active: true,
+        sessionId: 'hash-abc',
+        foregroundServiceTitle: 'Alice',
+        foregroundServiceText: 'Carroll',
+      }),
+    );
+    resolveCover('data:image/png;base64,cover');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  test('a new book never inherits the previous book cover', async () => {
+    // Artwork loads asynchronously after bind(), so the first metadata push of
+    // the next book used to carry the previous book's cover — and consumed the
+    // one-shot #pushArtwork flag, so the correction never landed.
+    const tauriSession = new TauriMediaSession();
+    tauriSession.setActive = vi.fn().mockResolvedValue(undefined);
+    tauriSession.updateMetadata = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn();
+    const bridge = new TTSMediaBridge(() => tauriSession);
+
+    vi.mocked(fetchImageAsBase64).mockResolvedValueOnce('data:image/png;base64,first');
+    await bridge.bind(new FakeController() as unknown as TTSController, meta());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(tauriSession.updateMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({ artwork: 'data:image/png;base64,first' }),
+    );
+
+    bridge.unbind();
+    vi.mocked(tauriSession.updateMetadata).mockClear();
+
+    // Second book: both the cover and the bundled fallback fail to load.
+    vi.mocked(fetchImageAsBase64).mockRejectedValueOnce(new Error('no cover'));
+    vi.mocked(fetchImageAsBase64).mockRejectedValueOnce(new Error('no fallback'));
+    await bridge.bind(
+      new FakeController() as unknown as TTSController,
+      meta({ bookKey: 'hash-def', title: 'Second', coverImageUrl: 'missing.png' }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    for (const call of vi.mocked(tauriSession.updateMetadata).mock.calls) {
+      expect(call[0]?.artwork).not.toBe('data:image/png;base64,first');
+    }
+  });
+
+  test('a stale artwork push does not consume the new binding cover slot', async () => {
+    // The artwork updateMetadata() for book A can still be in flight when
+    // unbind() + a new bind for book B reset #pushArtwork to true. Clearing the
+    // flag when the stale call finally resolves would eat B's one-shot cover
+    // push and leave B without artwork.
+    let releaseFirstMetadata!: () => void;
+    const tauriSession = new TauriMediaSession();
+    tauriSession.setActive = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn();
+    tauriSession.updateMetadata = vi
+      .fn()
+      .mockImplementation(async (payload: { artwork?: string }) => {
+        if (payload.artwork === 'data:image/png;base64,first') {
+          await new Promise<void>((resolve) => {
+            releaseFirstMetadata = resolve;
+          });
+        }
+      });
+    const bridge = new TTSMediaBridge(() => tauriSession);
+
+    vi.mocked(fetchImageAsBase64).mockResolvedValueOnce('data:image/png;base64,first');
+    await bridge.bind(new FakeController() as unknown as TTSController, meta());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Book B takes over while A's artwork push is still pending.
+    bridge.unbind();
+    vi.mocked(fetchImageAsBase64).mockResolvedValueOnce('data:image/png;base64,second');
+    const controllerB = new FakeController();
+    await bridge.bind(controllerB as unknown as TTSController, meta({ bookKey: 'hash-def' }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // A's push now completes, too late.
+    releaseFirstMetadata();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    vi.mocked(tauriSession.updateMetadata).mockClear();
+    controllerB.emitMark('x', 'mark-1');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const pushed = vi.mocked(tauriSession.updateMetadata).mock.calls.map((c) => c[0]?.artwork);
+    expect(pushed).not.toContain('data:image/png;base64,first');
+  });
+
+  test('stop during native activation finishes inactive', async () => {
+    let releaseActivation!: () => void;
+    const states: MediaSessionState[] = [];
+    const tauriSession = new TauriMediaSession();
+    tauriSession.setActive = vi.fn(async (state: MediaSessionState) => {
+      states.push(state);
+      if (state.active) {
+        await new Promise<void>((resolve) => {
+          releaseActivation = resolve;
+        });
+      }
+    });
+    tauriSession.updateMetadata = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn();
+    const bridge = new TTSMediaBridge(() => tauriSession);
+
+    const binding = bridge.bind(new FakeController() as unknown as TTSController, meta());
+    await Promise.resolve();
+    bridge.unbind();
+    releaseActivation();
+    await binding;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(states.map((state) => state.active)).toEqual([true, false]);
+    expect(bridge.isBound).toBe(false);
+  });
+
+  test('rapid stop and restart leaves the newest session active', async () => {
+    let releaseFirstActivation!: () => void;
+    const states: MediaSessionState[] = [];
+    const tauriSession = new TauriMediaSession();
+    tauriSession.setActive = vi.fn(async (state: MediaSessionState) => {
+      states.push(state);
+      if (states.length === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirstActivation = resolve;
+        });
+      }
+    });
+    tauriSession.updateMetadata = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn();
+    const bridge = new TTSMediaBridge(() => tauriSession);
+
+    const first = bridge.bind(
+      new FakeController() as unknown as TTSController,
+      meta({ title: 'Old book' }),
+    );
+    await Promise.resolve();
+    bridge.unbind();
+    const second = bridge.bind(
+      new FakeController() as unknown as TTSController,
+      meta({ bookKey: 'new-hash', title: 'New book' }),
+    );
+    releaseFirstActivation();
+    await Promise.all([first, second]);
+
+    expect(states.map((state) => state.active)).toEqual([true, false, true]);
+    expect(states[1]).toEqual(expect.objectContaining({ sessionId: 'hash-abc' }));
+    expect(states.at(-1)).toEqual(expect.objectContaining({ active: true, bookTitle: 'New book' }));
+    expect(tauriSession.updateMetadata).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Old book' }),
+    );
+    expect(tauriSession.updateMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'New book' }),
+    );
+    expect(bridge.isBound).toBe(true);
+  });
+
+  test('reconciles playback that started while native activation was pending', async () => {
+    const tauriSession = new TauriMediaSession();
+    let releaseActivation!: () => void;
+    let reportActivationStarted!: () => void;
+    const activationStarted = new Promise<void>((resolve) => {
+      reportActivationStarted = resolve;
+    });
+    tauriSession.setActive = vi.fn(async () => {
+      reportActivationStarted();
+      await new Promise<void>((resolve) => {
+        releaseActivation = resolve;
+      });
+    });
+    tauriSession.updateMetadata = vi.fn().mockResolvedValue(undefined);
+    tauriSession.updatePlaybackState = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn();
+    const bridge = new TTSMediaBridge(() => tauriSession);
+    const controller = new FakeController();
+    controller.state = 'stopped';
+
+    const binding = bridge.bind(controller as unknown as TTSController, meta());
+    await activationStarted;
+    // Playback begins before bind() has registered its state listener.
+    controller.state = 'playing';
+    releaseActivation();
+    await binding;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(tauriSession.updatePlaybackState).toHaveBeenCalledWith({ playing: true });
+  });
+
+  test('does not crash when unbound while the cover loads', async () => {
+    // A real TauriMediaSession instance so bind() takes the Tauri branch; its
+    // native methods are stubbed so nothing hits `invoke`.
+    const tauriSession = new TauriMediaSession();
+    tauriSession.setActive = vi.fn().mockResolvedValue(undefined);
+    tauriSession.updateMetadata = vi.fn().mockResolvedValue(undefined);
+    tauriSession.setActionHandler = vi.fn();
+
+    const bridge = new TTSMediaBridge(() => tauriSession);
+    const controller = new FakeController();
+
+    // Tear the session down mid-flight, exactly like a stop during startup:
+    // #mediaSession becomes null before the awaited setActive/updateMetadata.
+    vi.mocked(fetchImageAsBase64).mockImplementationOnce(async () => {
+      bridge.unbind();
+      return 'data:image/png;base64,x';
+    });
+
+    await expect(
+      bridge.bind(controller as unknown as TTSController, meta({ coverImageUrl: 'cover.png' })),
+    ).resolves.toBeUndefined();
+    // The bind aborted after teardown; no handlers were wired on a dead session.
+    expect(bridge.isBound).toBe(false);
+  });
+});

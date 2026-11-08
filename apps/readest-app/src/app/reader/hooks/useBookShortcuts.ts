@@ -1,0 +1,606 @@
+import { useEffect, useRef } from 'react';
+import { useReaderStore } from '@/store/readerStore';
+import { useNotebookStore } from '@/store/notebookStore';
+import { isTauriAppPlatform } from '@/services/environment';
+import { useSidebarStore } from '@/store/sidebarStore';
+import { useSettingsStore } from '@/store/settingsStore';
+import { useBookDataStore } from '@/store/bookDataStore';
+import { tauriHandleClose, tauriHandleToggleFullScreen, tauriQuitApp } from '@/utils/window';
+import { eventDispatcher } from '@/utils/event';
+import { useEnv } from '@/context/EnvContext';
+import { saveViewSettings } from '@/helpers/settings';
+import {
+  DEFAULT_BOOK_FONT,
+  FONT_SIZE_STEP,
+  MAX_FONT_SIZE,
+  MAX_ZOOM_LEVEL,
+  MIN_FONT_SIZE,
+  MIN_ZOOM_LEVEL,
+  ZOOM_STEP,
+} from '@/services/constants';
+import { getParagraphActionForKey } from '@/utils/paragraphPresentation';
+import { getScrollGapAttr } from '@/utils/webtoon';
+import { applyVimMotion, extendSelectionFromContents, KeyModifiers } from '@/utils/sel';
+import { getLiveVimFind, useVimFindStore } from '@/store/vimFindStore';
+import { getReadingAreaRect, keyboardTurnDirection } from './useAutoPageTurn';
+import { viewPagination } from './usePagination';
+import useShortcuts from '@/hooks/useShortcuts';
+import { loadShortcuts } from '@/helpers/shortcuts';
+import { matchesShortcut } from '@/utils/shortcutKeys';
+import useBooksManager from './useBooksManager';
+import { getReadingRulerMoveDirection, isReadingRulerMoveKey } from '../utils/readingRuler';
+
+interface UseBookShortcutsProps {
+  sideBarBookKey: string | null;
+  bookKeys: string[];
+}
+
+const useBookShortcuts = ({ sideBarBookKey, bookKeys }: UseBookShortcutsProps) => {
+  const { getView, getViewState, getViewSettings, setViewSettings, setHoveredBookKey } =
+    useReaderStore();
+  const { toggleSideBar, setSideBarBookKey, setSideBarVisible, setSearchBarVisible } =
+    useSidebarStore();
+  const { settings, setSettingsDialogOpen, setSettingsDialogBookKey } = useSettingsStore();
+  const { envConfig } = useEnv();
+  const { getBookData, getConfig, setConfig } = useBookDataStore();
+  const { toggleNotebook } = useNotebookStore();
+  const { getNextBookKey } = useBooksManager();
+  const lastParagraphToggleRef = useRef(0);
+  const viewSettings = getViewSettings(sideBarBookKey ?? '');
+  const fontSize = viewSettings?.defaultFontSize ?? 16;
+  const lineHeight = viewSettings?.lineHeight ?? 1.6;
+  const distance = fontSize * lineHeight * 3;
+
+  const moveReadingRuler = (side: 'left' | 'right' | 'up' | 'down') => {
+    if (!sideBarBookKey) return false;
+
+    const viewSettings = getViewSettings(sideBarBookKey);
+    if (!viewSettings?.readingRulerEnabled) return false;
+    // In vertical layout, only Up/Down move the ruler; Left/Right turn pages.
+    if (!isReadingRulerMoveKey(side, !!viewSettings.vertical)) return false;
+
+    return eventDispatcher.dispatchSync('reading-ruler-move', {
+      bookKey: sideBarBookKey,
+      direction: getReadingRulerMoveDirection(side, getView(sideBarBookKey)?.book.dir),
+    });
+  };
+
+  const toggleScrollMode = () => {
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    if (viewSettings && sideBarBookKey) {
+      viewSettings.scrolled = !viewSettings.scrolled;
+      // Webtoon Mode requires scrolled flow; leaving scrolled exits Webtoon Mode
+      // and restores the default page gap (mirror the View menu's behavior).
+      if (!viewSettings.scrolled && viewSettings.webtoonMode) {
+        viewSettings.webtoonMode = false;
+        getView(sideBarBookKey)?.renderer.setAttribute('scroll-gap', getScrollGapAttr(false));
+      }
+      setViewSettings(sideBarBookKey, viewSettings!);
+      const flowMode = viewSettings.scrolled ? 'scrolled' : 'paginated';
+      getView(sideBarBookKey)?.renderer.setAttribute('flow', flowMode);
+    }
+    return true;
+  };
+
+  const switchSideBar = () => {
+    if (sideBarBookKey) setSideBarBookKey(getNextBookKey(sideBarBookKey));
+  };
+
+  const openTableOfContents = (event?: KeyboardEvent | MessageEvent) => {
+    const eventBookKey =
+      event instanceof MessageEvent && typeof event.data?.bookKey === 'string'
+        ? event.data.bookKey
+        : null;
+    const bookKey = eventBookKey || sideBarBookKey;
+    if (!bookKey) return false;
+    const config = getConfig(bookKey);
+    const {
+      isSideBarPinned,
+      isSideBarVisible,
+      sideBarBookKey: visibleBookKey,
+    } = useSidebarStore.getState();
+    const isCurrentTableOfContents =
+      isSideBarVisible && visibleBookKey === bookKey && config?.viewSettings?.sideBarTab === 'toc';
+    if (isCurrentTableOfContents) {
+      if (!isSideBarPinned) setSideBarVisible(false);
+      return true;
+    }
+    if (config?.viewSettings) {
+      setConfig(bookKey, {
+        viewSettings: { ...config.viewSettings, sideBarTab: 'toc' },
+      });
+    }
+    setSideBarBookKey(bookKey);
+    setSearchBarVisible(false);
+    setHoveredBookKey('');
+    setSideBarVisible(true);
+    return true;
+  };
+
+  // Standard desktop selection shortcuts (#4728). After a selection the reader
+  // container holds focus, so Shift+←/→ keystrokes land here in the parent (not
+  // the iframe). Extend the iframe selection ourselves; for keys forwarded from
+  // a focused iframe (the browser already extended natively) just report that a
+  // selection exists. Returning true stops the page-turn shortcut from firing.
+  const adjustTextSelection = (event?: KeyboardEvent | MessageEvent) => {
+    const isNative = event instanceof KeyboardEvent;
+    const src: KeyModifiers | undefined = isNative ? event : event?.data;
+    if (!src?.key) return false;
+    const view = getView(sideBarBookKey ?? '');
+    const contents = view?.renderer?.getContents?.() ?? [];
+    const extended = extendSelectionFromContents(contents, src, isNative);
+    // Keyboard turn-on-cross (#4741): when the extended selection's focus leaves
+    // the visible page in paginated mode, turn the page so the growing selection
+    // stays in view. Only for keys we extended ourselves (the native parent
+    // path); the focused-iframe path lets the browser scroll the focus in.
+    if (extended && isNative && !getViewSettings(sideBarBookKey ?? '')?.scrolled) {
+      const dir = keyboardTurnDirection(contents, getReadingAreaRect(sideBarBookKey ?? ''));
+      if (dir === 'next') view?.next();
+      else if (dir === 'prev') view?.prev();
+    }
+    return extended;
+  };
+
+  // Vim-style find (#7281). Each returns false unless this book's search is
+  // live, so the same keys turn pages and open the Notebook otherwise.
+  const openVimFind = () => {
+    if (!sideBarBookKey) return false;
+    useVimFindStore.getState().openFind(sideBarBookKey);
+    return true;
+  };
+
+  const stepVimMatch = (step: 1 | -1) => {
+    const find = getLiveVimFind(sideBarBookKey);
+    if (!find) return false;
+    const { matches, searching } = find;
+    const next = Math.max(find.index, 0) + step;
+    // Wrap around only once every match is in: mid-search, the end of the
+    // list so far isn't the end of the book.
+    if (matches.length === 0 || (searching && (next < 0 || next >= matches.length))) return true;
+    const index = (next + matches.length) % matches.length;
+    useVimFindStore.setState({ index });
+    getView(sideBarBookKey)?.select(matches[index]!);
+    return true;
+  };
+
+  const extendVimSelection = (event?: KeyboardEvent | MessageEvent) => {
+    if (!getLiveVimFind(sideBarBookKey)) return false;
+    const key = event instanceof KeyboardEvent ? event.key : event?.data?.key;
+    const view = getView(sideBarBookKey);
+    const contents = view?.renderer?.getContents?.() ?? [];
+    const sel = contents.map(({ doc }) => doc.getSelection()).find((s) => s && !s.isCollapsed);
+    if (!sel || !key || !applyVimMotion(sel, key)) return false;
+    // Turn the page when the moving end leaves it, as Shift+←/→ does (#4741).
+    if (!getViewSettings(sideBarBookKey ?? '')?.scrolled) {
+      const dir = keyboardTurnDirection(contents, getReadingAreaRect(sideBarBookKey ?? ''));
+      if (dir === 'next') view?.next();
+      else if (dir === 'prev') view?.prev();
+    }
+    return true;
+  };
+
+  const exitVimFind = () => {
+    if (!getLiveVimFind(sideBarBookKey)) return false;
+    useVimFindStore.getState().closeFind();
+    getView(sideBarBookKey)?.deselect();
+    return true;
+  };
+
+  const goLeft = () => {
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    // If paragraph mode is enabled, navigate to previous paragraph instead
+    if (viewSettings?.paragraphMode?.enabled && sideBarBookKey) {
+      const action = getParagraphActionForKey('ArrowLeft', viewSettings);
+      eventDispatcher.dispatch(action === 'next' ? 'paragraph-next' : 'paragraph-prev', {
+        bookKey: sideBarBookKey,
+      });
+      return;
+    }
+    if (moveReadingRuler('left')) return;
+    viewPagination(getView(sideBarBookKey), viewSettings, 'left', 'pan', distance);
+  };
+
+  const goRight = () => {
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    // If paragraph mode is enabled, navigate to next paragraph instead
+    if (viewSettings?.paragraphMode?.enabled && sideBarBookKey) {
+      const action = getParagraphActionForKey('ArrowRight', viewSettings);
+      eventDispatcher.dispatch(action === 'prev' ? 'paragraph-prev' : 'paragraph-next', {
+        bookKey: sideBarBookKey,
+      });
+      return;
+    }
+    if (moveReadingRuler('right')) return;
+    viewPagination(getView(sideBarBookKey), viewSettings, 'right', 'pan', distance);
+  };
+
+  const goUp = (event?: KeyboardEvent | MessageEvent) => {
+    const view = getView(sideBarBookKey);
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    // If paragraph mode is enabled, navigate to previous paragraph instead
+    if (viewSettings?.paragraphMode?.enabled && sideBarBookKey) {
+      const action = getParagraphActionForKey('ArrowUp', viewSettings);
+      eventDispatcher.dispatch(action === 'next' ? 'paragraph-next' : 'paragraph-prev', {
+        bookKey: sideBarBookKey,
+      });
+      return true;
+    }
+    if (moveReadingRuler('up')) return true;
+    if (view?.renderer.scrolled && event instanceof MessageEvent) return false;
+    viewPagination(view, viewSettings, 'up', 'pan', distance);
+    return true;
+  };
+
+  const goDown = (event?: KeyboardEvent | MessageEvent) => {
+    const view = getView(sideBarBookKey);
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    // If paragraph mode is enabled, navigate to next paragraph instead
+    if (viewSettings?.paragraphMode?.enabled && sideBarBookKey) {
+      const action = getParagraphActionForKey('ArrowDown', viewSettings);
+      eventDispatcher.dispatch(action === 'prev' ? 'paragraph-prev' : 'paragraph-next', {
+        bookKey: sideBarBookKey,
+      });
+      return true;
+    }
+    if (moveReadingRuler('down')) return true;
+    if (view?.renderer.scrolled && event instanceof MessageEvent) return false;
+    viewPagination(view, viewSettings, 'down', 'pan', distance);
+    return true;
+  };
+
+  const goPrevSection = () => {
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    viewPagination(getView(sideBarBookKey), viewSettings, 'up', 'section');
+  };
+
+  const goNextSection = () => {
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    viewPagination(getView(sideBarBookKey), viewSettings, 'down', 'section');
+  };
+
+  const goLeftSection = () => {
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    viewPagination(getView(sideBarBookKey), viewSettings, 'left', 'section');
+  };
+
+  const goRightSection = () => {
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    viewPagination(getView(sideBarBookKey), viewSettings, 'right', 'section');
+  };
+
+  const goPrev = () => {
+    if (moveReadingRuler('up')) return;
+    getView(sideBarBookKey)?.prev(distance);
+  };
+
+  const goNext = () => {
+    if (moveReadingRuler('down')) return;
+    getView(sideBarBookKey)?.next(distance);
+  };
+
+  // Home / End (#5660). The view is registered in the store before its opening
+  // navigation runs, so a jump fired in that window is discarded by it anyway —
+  // after needlessly paging in the far end of the book. Wait for `inited`.
+  const goBookStart = () => {
+    if (!getViewState(sideBarBookKey ?? '')?.inited) return;
+    getView(sideBarBookKey)?.goToFraction(0);
+  };
+
+  const goBookEnd = () => {
+    if (!getViewState(sideBarBookKey ?? '')?.inited) return;
+    getView(sideBarBookKey)?.goToFraction(1);
+  };
+
+  const goBack = () => {
+    getView(sideBarBookKey)?.history.back();
+  };
+
+  const goHalfPageDown = () => {
+    const view = getView(sideBarBookKey);
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    if (view && viewSettings && viewSettings.scrolled) {
+      view.next(view.renderer.size / 2);
+    }
+  };
+
+  const goHalfPageUp = () => {
+    const view = getView(sideBarBookKey);
+    const viewSettings = getViewSettings(sideBarBookKey ?? '');
+    if (view && viewSettings && viewSettings.scrolled) {
+      view.prev(view.renderer.size / 2);
+    }
+  };
+
+  const goForward = () => {
+    getView(sideBarBookKey)?.history.forward();
+  };
+
+  const reloadPage = () => {
+    window.location.reload();
+  };
+
+  const toggleFullscreen = () => {
+    if (!isTauriAppPlatform()) return false;
+    return tauriHandleToggleFullScreen().then(() => true);
+  };
+
+  const closeWindow = () => {
+    if (!isTauriAppPlatform()) return false;
+    return tauriHandleClose().then(() => true);
+  };
+
+  const quitApp = () => {
+    // on web platform use browser's default shortcut to close the tab
+    if (!isTauriAppPlatform()) return false;
+    return tauriQuitApp().then(() => true);
+  };
+
+  const showSearchBar = () => {
+    setTimeout(() => {
+      eventDispatcher.dispatch('search-term', { term: null, bookKey: sideBarBookKey });
+    }, 100);
+  };
+
+  const applyZoomLevel = (zoomLevel: number) => {
+    if (!sideBarBookKey) return;
+    const view = getView(sideBarBookKey);
+    const bookData = getBookData(sideBarBookKey);
+    const viewSettings = getViewSettings(sideBarBookKey)!;
+    if (bookData?.isFixedLayout) {
+      view?.renderer.setAttribute('scale-factor', zoomLevel);
+      viewSettings!.zoomLevel = zoomLevel;
+      setViewSettings(sideBarBookKey, viewSettings!);
+    }
+  };
+
+  // Reflowable books scale by text, not by page (issue #5694). The new size is
+  // saved with skipGlobal so zooming one book never resizes the whole library.
+  const applyFontSize = (fontSize: number) => {
+    const viewSettings = sideBarBookKey ? getViewSettings(sideBarBookKey) : null;
+    if (!sideBarBookKey || !viewSettings) return;
+    const clamped = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, Math.round(fontSize)));
+    if (clamped === viewSettings.defaultFontSize) return;
+    saveViewSettings(envConfig, sideBarBookKey, 'defaultFontSize', clamped, true);
+  };
+
+  const isFixedLayout = () => !!getBookData(sideBarBookKey ?? '')?.isFixedLayout;
+
+  const zoomInFactor = (factor = 1.0) => {
+    if (!sideBarBookKey) return;
+    const viewSettings = getViewSettings(sideBarBookKey)!;
+    if (!isFixedLayout()) {
+      applyFontSize(viewSettings.defaultFontSize + FONT_SIZE_STEP * factor);
+      return;
+    }
+    const zoomLevel = viewSettings!.zoomLevel + ZOOM_STEP * factor;
+    applyZoomLevel(Math.min(zoomLevel, MAX_ZOOM_LEVEL));
+  };
+
+  const zoomOutFactor = (factor = 1.0) => {
+    if (!sideBarBookKey) return;
+    const viewSettings = getViewSettings(sideBarBookKey)!;
+    if (!isFixedLayout()) {
+      applyFontSize(viewSettings.defaultFontSize - FONT_SIZE_STEP * factor);
+      return;
+    }
+    const zoomLevel = viewSettings!.zoomLevel - ZOOM_STEP * factor;
+    applyZoomLevel(Math.max(zoomLevel, MIN_ZOOM_LEVEL));
+  };
+
+  const zoomIn = () => {
+    zoomInFactor();
+  };
+
+  const zoomOut = () => {
+    zoomOutFactor();
+  };
+
+  const handleZoomIn = (event: CustomEvent) => {
+    const factor = event.detail?.factor || 1.0;
+    zoomInFactor(factor);
+  };
+
+  const handleZoomOut = (event: CustomEvent) => {
+    const factor = event.detail?.factor || 1.0;
+    zoomOutFactor(factor);
+  };
+
+  const resetZoom = () => {
+    if (!sideBarBookKey) return;
+    if (!isFixedLayout()) {
+      applyFontSize(
+        settings.globalViewSettings?.defaultFontSize ?? DEFAULT_BOOK_FONT.defaultFontSize,
+      );
+      return;
+    }
+    applyZoomLevel(100);
+  };
+
+  const toggleToolbar = () => {
+    if (!sideBarBookKey) return false;
+    // Don't intercept Enter when a button is focused (let native click fire)
+    const active = document.activeElement;
+    if (active && active.tagName === 'BUTTON') return false;
+    const { hoveredBookKey, setHoveredBookKey } = useReaderStore.getState();
+    setHoveredBookKey(hoveredBookKey === sideBarBookKey ? '' : sideBarBookKey);
+    return true;
+  };
+
+  const toggleTTS = () => {
+    if (!sideBarBookKey) return;
+    const bookKey = sideBarBookKey;
+    const viewState = getViewState(bookKey);
+    eventDispatcher.dispatch(viewState?.ttsEnabled ? 'tts-stop' : 'tts-speak', { bookKey });
+  };
+
+  const ttsPlayPause = () => {
+    if (!sideBarBookKey) return false;
+    const viewState = getViewState(sideBarBookKey);
+    if (!viewState?.ttsEnabled) return false;
+    eventDispatcher.dispatch('tts-toggle-play', { bookKey: sideBarBookKey });
+    return true;
+  };
+
+  const ttsGoNextSentence = () => {
+    if (!sideBarBookKey) return;
+    eventDispatcher.dispatch('tts-forward', { bookKey: sideBarBookKey, byMark: true });
+  };
+
+  const ttsGoPreviousSentence = () => {
+    if (!sideBarBookKey) return;
+    eventDispatcher.dispatch('tts-backward', { bookKey: sideBarBookKey, byMark: true });
+  };
+
+  const ttsGoNextParagraph = () => {
+    if (!sideBarBookKey) return;
+    eventDispatcher.dispatch('tts-forward', { bookKey: sideBarBookKey, byMark: false });
+  };
+
+  const ttsGoPreviousParagraph = () => {
+    if (!sideBarBookKey) return;
+    eventDispatcher.dispatch('tts-backward', { bookKey: sideBarBookKey, byMark: false });
+  };
+
+  const ttsHighlightSentence = () => {
+    if (!sideBarBookKey) return;
+    eventDispatcher.dispatch('tts-highlight-sentence', { bookKey: sideBarBookKey });
+  };
+
+  const toggleBookmark = () => {
+    if (!sideBarBookKey) return;
+    eventDispatcher.dispatch('toggle-bookmark', { bookKey: sideBarBookKey });
+  };
+
+  const toggleParagraphMode = (event?: KeyboardEvent | MessageEvent) => {
+    if (!sideBarBookKey) return false;
+    if (event instanceof KeyboardEvent && event.repeat) return true;
+
+    const now = Date.now();
+    if (now - lastParagraphToggleRef.current < 300) return true;
+    lastParagraphToggleRef.current = now;
+
+    eventDispatcher.dispatch('toggle-paragraph-mode', { bookKey: sideBarBookKey });
+    return true;
+  };
+
+  const startRSVP = () => {
+    if (!sideBarBookKey) return;
+    eventDispatcher.dispatch('rsvp-start', { bookKey: sideBarBookKey });
+  };
+
+  const toggleAutoScroll = () => {
+    if (!sideBarBookKey) return;
+    // Auto Scroll only exists in scrolled mode (#4998); the View menu item is
+    // disabled outside it, so the shortcut silently no-ops there too.
+    if (!getViewSettings(sideBarBookKey)?.scrolled) return;
+    eventDispatcher.dispatch('autoscroll-toggle', { bookKey: sideBarBookKey });
+  };
+
+  const handlePinchZoom = (event: CustomEvent) => {
+    const zoomLevel = event.detail?.zoomLevel;
+    if (zoomLevel != null) {
+      applyZoomLevel(zoomLevel);
+    }
+  };
+
+  useEffect(() => {
+    eventDispatcher.on('zoom-in', handleZoomIn);
+    eventDispatcher.on('zoom-out', handleZoomOut);
+    eventDispatcher.on('reset-zoom', resetZoom);
+    eventDispatcher.on('pinch-zoom', handlePinchZoom);
+    return () => {
+      eventDispatcher.off('zoom-in', handleZoomIn);
+      eventDispatcher.off('zoom-out', handleZoomOut);
+      eventDispatcher.off('reset-zoom', resetZoom);
+      eventDispatcher.off('pinch-zoom', handlePinchZoom);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sideBarBookKey]);
+
+  // A mouse Back/Forward release on the page is handled in the iframe
+  // (handleMouseup in iframeEventHandlers). One outside it, on a bar, a
+  // sidebar or the gap between pages, reaches this document, where the
+  // webview would go back out of the reader (#6960). Go back in the book
+  // instead, unless the button is bound to an action useShortcuts runs.
+  useEffect(() => {
+    const handleMouseUp = (event: MouseEvent) => {
+      if (event.button !== 3 && event.button !== 4) return;
+      if (!sideBarBookKey) return;
+      event.preventDefault();
+      const { ctrlKey, altKey, metaKey, shiftKey } = event;
+      const key = event.button === 3 ? 'MouseX1' : 'MouseX2';
+      const eventLike = { key, ctrlKey, altKey, metaKey, shiftKey };
+      const bound = Object.values(loadShortcuts()).some(({ keys }) =>
+        matchesShortcut(eventLike, keys),
+      );
+      if (bound) return;
+      if (event.button === 3) goBack();
+      else goForward();
+    };
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => window.removeEventListener('mouseup', handleMouseUp);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sideBarBookKey]);
+
+  useShortcuts(
+    {
+      // Listed first so an active selection intercepts Shift+←/→ before the
+      // page-navigation actions below can turn the page (#4728).
+      onAdjustTextSelection: adjustTextSelection,
+      // Ahead of page navigation and the Notebook for the same reason (#7281).
+      onVimFind: openVimFind,
+      onVimNextMatch: () => stepVimMatch(1),
+      onVimPrevMatch: () => stepVimMatch(-1),
+      onVimExtendSelection: extendVimSelection,
+      onEscape: exitVimFind,
+      onSwitchSideBar: switchSideBar,
+      onToggleSideBar: toggleSideBar,
+      onOpenTableOfContents: openTableOfContents,
+      onToggleNotebook: toggleNotebook,
+      onToggleScrollMode: toggleScrollMode,
+      onToggleBookmark: toggleBookmark,
+      onToggleParagraphMode: toggleParagraphMode,
+      onStartRSVP: startRSVP,
+      onToggleAutoScroll: toggleAutoScroll,
+      onToggleToolbar: toggleToolbar,
+      onOpenFontLayoutSettings: () => {
+        if (sideBarBookKey) setSettingsDialogBookKey(sideBarBookKey);
+        setSettingsDialogOpen(true);
+      },
+      onShowSearchBar: showSearchBar,
+      onToggleFullscreen: toggleFullscreen,
+      onToggleTTS: toggleTTS,
+      onTTSPlayPause: ttsPlayPause,
+      onTTSGoNextSentence: ttsGoNextSentence,
+      onTTSGoPreviousSentence: ttsGoPreviousSentence,
+      onTTSGoNextParagraph: ttsGoNextParagraph,
+      onTTSGoPreviousParagraph: ttsGoPreviousParagraph,
+      onTTSHighlightSentence: ttsHighlightSentence,
+      onReloadPage: reloadPage,
+      onCloseWindow: closeWindow,
+      onQuitApp: quitApp,
+      onGoLeft: goLeft,
+      onGoRight: goRight,
+      onGoUp: goUp,
+      onGoDown: goDown,
+      onGoPrev: goPrev,
+      onGoNext: goNext,
+      onGoHalfPageDown: goHalfPageDown,
+      onGoHalfPageUp: goHalfPageUp,
+      onGoPrevSection: goPrevSection,
+      onGoNextSection: goNextSection,
+      onGoLeftSection: goLeftSection,
+      onGoRightSection: goRightSection,
+      onGoBookStart: goBookStart,
+      onGoBookEnd: goBookEnd,
+      onGoBack: goBack,
+      onGoForward: goForward,
+      onZoomIn: zoomIn,
+      onZoomOut: zoomOut,
+      onResetZoom: resetZoom,
+    },
+    [sideBarBookKey, bookKeys],
+  );
+};
+
+export default useBookShortcuts;

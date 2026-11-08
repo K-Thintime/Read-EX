@@ -1,0 +1,1191 @@
+import clsx from 'clsx';
+import React, { useEffect, useState } from 'react';
+import { MdChevronRight } from 'react-icons/md';
+import {
+  RiBookOpenLine,
+  RiPlanetLine,
+  RiRssLine,
+  RiBookReadLine,
+  RiBook3Line,
+  RiBookmark3Line,
+  RiFileList3Line,
+  RiMarkdownLine,
+  RiDiscordLine,
+  RiSendPlaneLine,
+  RiWifiLine,
+  RiCloudLine,
+  RiCloudFill,
+  RiDatabase2Line,
+  RiGoogleLine,
+  RiMicrosoftLine,
+  RiAppleLine,
+  RiHardDrive2Line,
+  RiHeadphoneLine,
+  RiBookShelfLine,
+  RiAlertLine,
+  RiInformationLine,
+} from 'react-icons/ri';
+import { useAppRouter } from '@/hooks/useAppRouter';
+import { useEnv } from '@/context/EnvContext';
+import { useAuth } from '@/context/AuthContext';
+import { useTranslation } from '@/hooks/useTranslation';
+import { useKeyDownActions } from '@/hooks/useKeyDownActions';
+import { useQuotaStats } from '@/hooks/useQuotaStats';
+import { useSettingsStore } from '@/store/settingsStore';
+import { useCustomOPDSStore } from '@/store/customOPDSStore';
+import { useABSServerStore } from '@/store/absServerStore';
+import { useFileSyncStore } from '@/store/fileSyncStore';
+import { useLocalSendStore } from '@/store/localsendStore';
+import { CatalogManager } from '@/app/opds/components/CatalogManager';
+import { saveSysSettings } from '@/helpers/settings';
+import { isCloudSyncAllowed } from '@/utils/access';
+import { isTauriAppPlatform, isWebAppPlatform } from '@/services/environment';
+import {
+  getLocalSendAlias,
+  isLocalSendEnabled,
+  setLocalSendEnabled,
+} from '@/services/localsend/devicePrefs';
+import { getGoogleWebClientId } from '@/services/sync/providers/gdrive/buildGoogleDriveProvider';
+import { getMicrosoftClientId } from '@/services/sync/providers/onedrive/buildOneDriveProvider';
+import { isICloudSupportedPlatform } from '@/services/sync/providers/icloud/buildICloudProvider';
+import { getICloudContainerStatus } from '@/utils/bridge';
+import { navigateToLogin, navigateToProfile } from '@/utils/nav';
+import { eventDispatcher } from '@/utils/event';
+import ABSForm from './integrations/ABSForm';
+import BookOrbitForm from './integrations/BookOrbitForm';
+import GrimmoryForm from './integrations/GrimmoryForm';
+import KOSyncForm from './integrations/KOSyncForm';
+import ReadwiseForm from './integrations/ReadwiseForm';
+import HardcoverForm from './integrations/HardcoverForm';
+import PageboundForm from './integrations/PageboundForm';
+import NotionForm from './integrations/NotionForm';
+import ObsidianForm from './integrations/ObsidianForm';
+import SendToReadestForm from './integrations/SendToReadestForm';
+import LocalSendForm from './integrations/LocalSendForm';
+import WebDAVForm from './integrations/WebDAVForm';
+import GoogleDriveForm from './integrations/GoogleDriveForm';
+import OneDriveForm from './integrations/OneDriveForm';
+import ICloudForm from './integrations/ICloudForm';
+import S3Form from './integrations/S3Form';
+import OpenListForm from './integrations/OpenListForm';
+import { persistCloudProviderEnabled } from './integrations/cloudSync';
+import {
+  canToggleCloudProvider,
+  getReadestCloudRowStatus,
+  getThirdPartyRowStatus,
+  shouldShowCloudProviderBadge,
+} from './integrations/cloudSyncStatus';
+import {
+  getCloudSyncProviders,
+  isReadestCloudEnabled,
+  resolveCloudSyncGate,
+  settingsKeyForBackend,
+  type CloudSyncProviderKind,
+} from '@/services/sync/cloudSyncProvider';
+import type { FileSyncBackendKind } from '@/services/sync/file/providerRegistry';
+import { canBackendRun } from '@/services/sync/file/runLibrarySync';
+import { getConnectorHealth } from '@/services/sync/dataFlow/log';
+import DataFlowPage from './integrations/DataFlowPage';
+import { useFlowConnectors, useFlowState } from './integrations/useFlowConnectors';
+import SubPageHeader from './SubPageHeader';
+import { BoxedList, NavigationRow, SectionTitle, SettingLabel, Tips } from './primitives';
+
+type SubPage =
+  | 'kosync'
+  | 'bookorbit'
+  | 'grimmory'
+  | 'webdav'
+  | 'gdrive'
+  | 's3'
+  | 'onedrive'
+  | 'icloud'
+  | 'openlist'
+  | 'readest-cloud'
+  | 'readwise'
+  | 'hardcover'
+  | 'pagebound'
+  | 'notion'
+  | 'obsidian'
+  | 'opds'
+  | 'audiobookshelf'
+  | 'send'
+  | 'localsend'
+  | 'data-flow'
+  | null;
+
+/**
+ * Integrations panel — single point of discovery for external service config:
+ * KOReader Sync, Readwise, Hardcover, and OPDS Catalogs.
+ *
+ * Pattern: boxed list of NavigationRows. Each row pushes the panel into an
+ * inline sub-page (with breadcrumb back-navigation matching the Dictionaries
+ * pattern) — no nested modals.
+ *
+ * TODO(design-system): Once we extract BoxedList / NavigationRow primitives,
+ * this panel and CustomDictionaries should both consume them instead of
+ * inlining the chassis.
+ */
+const IntegrationsPanel: React.FC = () => {
+  const _ = useTranslation();
+  const router = useAppRouter();
+  const { envConfig, appService } = useEnv();
+  const { user } = useAuth();
+  const { settings, requestedSubPage, setRequestedSubPage } = useSettingsStore();
+  const opdsCatalogs = useCustomOPDSStore((s) => s.catalogs);
+  const opdsCount = opdsCatalogs.filter((c) => !c.deletedAt).length;
+  const absServers = useABSServerStore((s) => s.servers);
+  const absCount = absServers.filter((s) => !s.deletedAt).length;
+  // The device name Nearby BookDrop announces once its service is running,
+  // so the integrations row can show it in place of a bare "On".
+  const localSendAlias = useLocalSendStore((s) => s.status?.alias);
+  // Toggled inline here or on the BookDrop sub-page; both announce the change
+  // with `localsend-prefs-changed`, which also starts/stops the service.
+  const [localSendEnabled, setLocalSendEnabledState] = useState(isLocalSendEnabled);
+  useEffect(() => {
+    const onPrefsChanged = () => setLocalSendEnabledState(isLocalSendEnabled());
+    eventDispatcher.on('localsend-prefs-changed', onPrefsChanged);
+    return () => eventDispatcher.off('localsend-prefs-changed', onPrefsChanged);
+  }, []);
+  // Surface a library-wide WebDAV sync that's mid-flight in the row's
+  // status line. Keeps the user from feeling like the run was lost
+  // when they back out of the WebDAV sub-page or close the dialog.
+  const isWebDAVSyncing = useFileSyncStore((s) => s.byKind.webdav?.isSyncing ?? false);
+  const isGDriveSyncing = useFileSyncStore((s) => s.byKind.gdrive?.isSyncing ?? false);
+  const isS3Syncing = useFileSyncStore((s) => s.byKind.s3?.isSyncing ?? false);
+  const isOneDriveSyncing = useFileSyncStore((s) => s.byKind.onedrive?.isSyncing ?? false);
+  const webdavLastError = useFileSyncStore((s) => s.lastErrorByKind.webdav);
+  const gdriveLastError = useFileSyncStore((s) => s.lastErrorByKind.gdrive);
+  const s3LastError = useFileSyncStore((s) => s.lastErrorByKind.s3);
+  const onedriveLastError = useFileSyncStore((s) => s.lastErrorByKind.onedrive);
+  const isICloudSyncing = useFileSyncStore((s) => s.byKind.icloud?.isSyncing ?? false);
+  const icloudLastError = useFileSyncStore((s) => s.lastErrorByKind.icloud);
+  const isOpenListSyncing = useFileSyncStore((s) => s.byKind.openlist?.isSyncing ?? false);
+  const openlistLastError = useFileSyncStore((s) => s.lastErrorByKind.openlist);
+  // "Configured" for iCloud = the container is reachable (an entitled build
+  // with an iCloud session). Probed once; Apple Tauri platforms only.
+  const [icloudAvailable, setICloudAvailable] = useState(false);
+  useEffect(() => {
+    if (!isICloudSupportedPlatform()) return;
+    getICloudContainerStatus()
+      .then((s) => setICloudAvailable(!!s.available && !!s.documentsPath))
+      .catch(() => setICloudAvailable(false));
+  }, []);
+  // Third-party cloud sync will be a premium feature (any paid plan), but it is
+  // temporarily UNGATED while the feature stabilises — `isCloudSyncAllowed`
+  // returns true for every plan until `CLOUD_SYNC_REQUIRES_PREMIUM` is flipped
+  // back on. The `?? 'free'` keeps the (re-gated) loading state non-premium.
+  const { userProfilePlan, customizationPurchased } = useQuotaStats();
+  const isCloudSyncPremium = isCloudSyncAllowed(userProfilePlan ?? 'free', customizationPurchased);
+  const premiumBadge = shouldShowCloudProviderBadge({
+    signedIn: !!user,
+    planLoading: userProfilePlan === undefined,
+    isPremium: isCloudSyncPremium,
+  })
+    ? _('Premium')
+    : undefined;
+
+  const [subPage, setSubPage] = useState<SubPage>(null);
+  const flowConnectors = useFlowConnectors();
+  const flowState = useFlowState();
+
+  // Hydrate the OPDS store from settings so the row's catalog count is
+  // accurate on first open. Without this the store starts empty and the
+  // count reads zero until the user drills into the OPDS sub-page (where
+  // CatalogManager loads it). Loading happens once per mount; the store
+  // handles backfilling contentId for legacy entries.
+  useEffect(() => {
+    void useCustomOPDSStore.getState().loadCustomOPDSCatalogs(envConfig);
+  }, [envConfig]);
+
+  // Same hydration as above, for the Audiobookshelf server list — keeps the
+  // Content Sources row's server count accurate on first open.
+  useEffect(() => {
+    void useABSServerStore.getState().loadABSServers(envConfig);
+  }, [envConfig]);
+
+  // Android Back / Esc: when any integrations sub-page (KOSync, WebDAV,
+  // Readwise, Hardcover, OPDS, Send-to-Readest) is open, intercept and
+  // step back to the integrations list instead of letting <Dialog>'s
+  // listener close the whole Settings dialog. The hook registers its
+  // sync `native-key-down` listener *after* <Dialog>'s, and
+  // `dispatchSync` walks listeners LIFO — so this one claims Back first
+  // when enabled and `return true` consumes the event. When subPage is
+  // null the hook is disabled and Back falls through to close the dialog
+  // as before.
+  useKeyDownActions({
+    enabled: subPage !== null,
+    onCancel: () => setSubPage(null),
+  });
+
+  const toggleDiscordPresence = () => {
+    const discordRichPresenceEnabled = !settings.discordRichPresenceEnabled;
+    saveSysSettings(envConfig, 'discordRichPresenceEnabled', discordRichPresenceEnabled);
+    if (discordRichPresenceEnabled && !user) {
+      navigateToLogin(router);
+    }
+  };
+
+  // Deep-link consumption: when a caller (e.g. OPDS browser close handler)
+  // sets `requestedSubPage` in the store before opening the dialog, drill
+  // straight into that sub-page on mount and clear the request so it doesn't
+  // stick to the next open. Recognised values match the SubPage union.
+  useEffect(() => {
+    if (!requestedSubPage) return;
+    const isCloudRequest =
+      requestedSubPage === 'webdav' ||
+      requestedSubPage === 'gdrive' ||
+      requestedSubPage === 's3' ||
+      requestedSubPage === 'onedrive' ||
+      requestedSubPage === 'icloud' ||
+      requestedSubPage === 'openlist' ||
+      requestedSubPage === 'cloudsync';
+    // Cloud-sync sub-pages are premium-gated. If the plan is still loading, wait
+    // (don't consume the request); once known, only honor it for paid plans.
+    if (isCloudRequest && !isCloudSyncPremium) {
+      if (userProfilePlan === undefined) return;
+      setRequestedSubPage(null);
+      return;
+    }
+    if (
+      requestedSubPage === 'kosync' ||
+      requestedSubPage === 'bookorbit' ||
+      requestedSubPage === 'grimmory' ||
+      requestedSubPage === 'webdav' ||
+      requestedSubPage === 'gdrive' ||
+      requestedSubPage === 's3' ||
+      requestedSubPage === 'onedrive' ||
+      requestedSubPage === 'icloud' ||
+      requestedSubPage === 'openlist' ||
+      requestedSubPage === 'readwise' ||
+      requestedSubPage === 'hardcover' ||
+      requestedSubPage === 'pagebound' ||
+      requestedSubPage === 'notion' ||
+      requestedSubPage === 'opds' ||
+      requestedSubPage === 'audiobookshelf' ||
+      requestedSubPage === 'send' ||
+      requestedSubPage === 'localsend'
+    ) {
+      setSubPage(requestedSubPage);
+    } else if (requestedSubPage === 'cloudsync') {
+      // Back-compat with the brief unified "Cloud Sync" page.
+      setSubPage('gdrive');
+    }
+    setRequestedSubPage(null);
+  }, [requestedSubPage, setRequestedSubPage, isCloudSyncPremium, userProfilePlan]);
+
+  // Sub-page wrapper matches the list-view's `my-4 w-full` so the
+  // SubPageHeader's "Integrations" label lands at the exact same Y position
+  // as the list-view's h2 — clicking a row reads as a navigation morph
+  // rather than a layout shift.
+  if (subPage === 'kosync')
+    return (
+      <div className='my-4 w-full'>
+        <KOSyncForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'localsend')
+    return (
+      <div className='my-4 w-full'>
+        <LocalSendForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'bookorbit')
+    return (
+      <div className='my-4 w-full'>
+        <BookOrbitForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'grimmory')
+    return (
+      <div className='my-4 w-full'>
+        <GrimmoryForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'webdav')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('WebDAV')}
+          description={_(
+            'Sync your library, reading progress, and highlights with a WebDAV server.',
+          )}
+          onBack={() => setSubPage(null)}
+        />
+        <WebDAVForm />
+        {settings.webdav?.enabled && (
+          <div className='mt-5'>
+            <Tips>
+              <li>
+                {_('{{provider}} keeps a full copy of your books, progress, and annotations.', {
+                  provider: _('WebDAV'),
+                })}
+              </li>
+              <li>
+                {_(
+                  'App settings, reading statistics, and dictionaries still sync through your Readest account while signed in.',
+                )}
+              </li>
+            </Tips>
+          </div>
+        )}
+      </div>
+    );
+  if (subPage === 'gdrive')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('Google Drive')}
+          description={_(
+            'Sync your library, reading progress, and highlights with your Google Drive.',
+          )}
+          onBack={() => setSubPage(null)}
+        />
+        <GoogleDriveForm />
+        {settings.googleDrive?.enabled && (
+          <div className='mt-5'>
+            <Tips>
+              <li>
+                {_('{{provider}} keeps a full copy of your books, progress, and annotations.', {
+                  provider: _('Google Drive'),
+                })}
+              </li>
+              <li>
+                {_(
+                  'App settings, reading statistics, and dictionaries still sync through your Readest account while signed in.',
+                )}
+              </li>
+            </Tips>
+          </div>
+        )}
+      </div>
+    );
+  if (subPage === 's3')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('S3-Compatible Storage')}
+          description={_(
+            'Sync your library, reading progress, and highlights with an S3-compatible bucket such as Cloudflare R2, AWS S3, or MinIO.',
+          )}
+          onBack={() => setSubPage(null)}
+        />
+        <S3Form />
+        <div className='mt-5'>
+          <Tips>
+            {
+              <li>
+                {_('{{provider}} keeps a full copy of your books, progress, and annotations.', {
+                  provider: _('S3-Compatible Storage'),
+                })}
+              </li>
+            }
+            {
+              <li>
+                {_(
+                  'App settings, reading statistics, and dictionaries still sync through your Readest account while signed in.',
+                )}
+              </li>
+            }
+            {
+              <li>
+                {_(
+                  'Make sure the bucket exists and the credentials have read/write access before connecting.',
+                )}
+              </li>
+            }
+            {isWebAppPlatform() && (
+              <li>
+                {_("In the browser, the bucket must allow this site's origin in its CORS policy.")}
+              </li>
+            )}
+          </Tips>
+        </div>
+      </div>
+    );
+  if (subPage === 'onedrive')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('OneDrive')}
+          description={_(
+            'Sync your library, reading progress, and highlights with your Microsoft OneDrive.',
+          )}
+          onBack={() => setSubPage(null)}
+        />
+        <OneDriveForm />
+        {settings.onedrive?.enabled && (
+          <div className='mt-5'>
+            <Tips>
+              <li>
+                {_('{{provider}} keeps a full copy of your books, progress, and annotations.', {
+                  provider: _('OneDrive'),
+                })}
+              </li>
+              <li>
+                {_(
+                  'App settings, reading statistics, and dictionaries still sync through your Readest account while signed in.',
+                )}
+              </li>
+            </Tips>
+          </div>
+        )}
+      </div>
+    );
+  if (subPage === 'icloud')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('iCloud')}
+          description={_(
+            'Sync your library, reading progress, and highlights with your iCloud Drive.',
+          )}
+          onBack={() => setSubPage(null)}
+        />
+        <ICloudForm />
+        {settings.icloud?.enabled && (
+          <div className='mt-5'>
+            <Tips>
+              <li>
+                {_('{{provider}} keeps a full copy of your books, progress, and annotations.', {
+                  provider: _('iCloud'),
+                })}
+              </li>
+              <li>
+                {_(
+                  'App settings, reading statistics, and dictionaries still sync through your Readest account while signed in.',
+                )}
+              </li>
+            </Tips>
+          </div>
+        )}
+      </div>
+    );
+  if (subPage === 'openlist')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('OpenList')}
+          description={_(
+            'Sync your library, reading progress, and highlights with your self-hosted OpenList server.',
+          )}
+          onBack={() => setSubPage(null)}
+        />
+        <OpenListForm />
+        {settings.openlist?.enabled && (
+          <div className='mt-5'>
+            <Tips>
+              <li>
+                {_('{{provider}} keeps a full copy of your books, progress, and annotations.', {
+                  provider: _('OpenList'),
+                })}
+              </li>
+              <li>
+                {_(
+                  'Downloads are proxied through your OpenList server, so its bandwidth is used for every book transfer.',
+                )}
+              </li>
+            </Tips>
+          </div>
+        )}
+      </div>
+    );
+  if (subPage === 'readest-cloud')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('Readest Cloud')}
+          description={_('Sync your library, reading progress, and highlights with Readest Cloud.')}
+          onBack={() => setSubPage(null)}
+        />
+        <BoxedList>
+          <NavigationRow
+            title={_('Account and Storage')}
+            status={_('Manage your plan and stored files')}
+            onClick={() => navigateToProfile(router)}
+          />
+        </BoxedList>
+      </div>
+    );
+  if (subPage === 'readwise')
+    return (
+      <div className='my-4 w-full'>
+        <ReadwiseForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'hardcover')
+    return (
+      <div className='my-4 w-full'>
+        <HardcoverForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'pagebound')
+    return (
+      <div className='my-4 w-full'>
+        <PageboundForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'notion')
+    return (
+      <div className='my-4 w-full'>
+        <NotionForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'obsidian')
+    return (
+      <div className='my-4 w-full'>
+        <ObsidianForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'opds')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel={_('OPDS Catalogs')}
+          description={_('Browse and download books from online catalogs.')}
+          onBack={() => setSubPage(null)}
+        />
+        <CatalogManager inSubPage />
+      </div>
+    );
+  if (subPage === 'audiobookshelf')
+    return (
+      <div className='my-4 w-full'>
+        <ABSForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+  if (subPage === 'data-flow')
+    return <DataFlowPage onBack={() => setSubPage(null)} onOpenSettings={setSubPage} />;
+
+  if (subPage === 'send')
+    return (
+      <div className='my-4 w-full'>
+        <SendToReadestForm onBack={() => setSubPage(null)} />
+      </div>
+    );
+
+  const flowProblems = flowConnectors.filter(
+    ({ id }) => getConnectorHealth(flowState, id) === 'failed',
+  ).length;
+  const flowLabel =
+    flowProblems > 0
+      ? `${_('Data Flow')}: ${_('Needs attention')}: ${flowProblems}`
+      : _('Data Flow');
+
+  const koSyncStatus = settings.kosync?.enabled
+    ? settings.kosync.username
+      ? _('Connected as {{user}}', { user: settings.kosync.username })
+      : _('Connected')
+    : _('Not connected');
+
+  const bookOrbitStatus = settings.bookorbit?.enabled
+    ? settings.bookorbit.username
+      ? _('Connected as {{user}}', { user: settings.bookorbit.username })
+      : _('Connected')
+    : _('Not connected');
+
+  const grimmoryStatus = settings.grimmory?.enabled
+    ? _('Connected as {{user}}', { user: settings.grimmory.username })
+    : _('Not connected');
+
+  const readwiseStatus = settings.readwise?.enabled ? _('Connected') : _('Not connected');
+  const hardcoverStatus = settings.hardcover?.enabled ? _('Connected') : _('Not connected');
+  const pageboundStatus =
+    settings.pagebound?.enabled && settings.pagebound.refreshToken
+      ? _('Connected')
+      : _('Not connected');
+  const notionStatus =
+    settings.notion?.enabled && settings.notion.accessToken && settings.notion.databaseId
+      ? _('Connected')
+      : _('Not connected');
+  const obsidianStatus =
+    settings.obsidian?.enabled && settings.obsidian.folder ? _('On') : _('Off');
+
+  // Cloud sync providers are independently selectable (#5062): any subset of
+  // {Readest Cloud, WebDAV, Google Drive, S3, OneDrive, iCloud} can sync the
+  // library at once. A "configured" third-party provider (WebDAV creds / a Drive
+  // token) can be switched on inline; an unconfigured one must be opened to
+  // connect.
+  const providers = getCloudSyncProviders(settings);
+  const readestEnabled = isReadestCloudEnabled(settings);
+  const cloudGate = resolveCloudSyncGate(settings, userProfilePlan ?? 'free');
+  const enabledBackends = cloudGate.backends;
+
+  /** Book files have a home when Readest Cloud is on or some backend uploads them. */
+  const booksBackedUpBy = (kind: FileSyncBackendKind): boolean =>
+    readestEnabled ||
+    enabledBackends.some(
+      (k) => k !== kind && (settings[settingsKeyForBackend(k)]?.syncBooks ?? false),
+    );
+
+  const webdavConfigured = !!(settings.webdav?.serverUrl && settings.webdav?.username);
+  const gdriveConfigured = !!settings.googleDrive?.accountLabel;
+  const webdavStatus = getThirdPartyRowStatus(_, {
+    enabled: !!settings.webdav?.enabled,
+    configured: webdavConfigured,
+    syncing: isWebDAVSyncing,
+    paused: cloudGate.paused,
+    lastError: webdavLastError,
+    syncBooks: settings.webdav?.syncBooks ?? false,
+    booksBackedUpElsewhere: booksBackedUpBy('webdav'),
+  });
+  const gdriveStatus = getThirdPartyRowStatus(_, {
+    enabled: !!settings.googleDrive?.enabled,
+    configured: gdriveConfigured,
+    syncing: isGDriveSyncing,
+    paused: cloudGate.paused,
+    lastError: gdriveLastError,
+    syncBooks: settings.googleDrive?.syncBooks ?? false,
+    booksBackedUpElsewhere: booksBackedUpBy('gdrive'),
+    // Web Google Drive with a gone/expired token can't sync until reconnected.
+    needsReauth: !canBackendRun('gdrive'),
+  });
+  const s3Configured = !!(
+    settings.s3?.endpoint &&
+    settings.s3?.bucket &&
+    settings.s3?.accessKeyId &&
+    settings.s3?.secretAccessKey
+  );
+  const s3Status = getThirdPartyRowStatus(_, {
+    enabled: !!settings.s3?.enabled,
+    configured: s3Configured,
+    syncing: isS3Syncing,
+    paused: cloudGate.paused,
+    lastError: s3LastError,
+    syncBooks: settings.s3?.syncBooks ?? false,
+    booksBackedUpElsewhere: booksBackedUpBy('s3'),
+  });
+  const onedriveConfigured = !!settings.onedrive?.accountLabel;
+  const onedriveStatus = getThirdPartyRowStatus(_, {
+    enabled: !!settings.onedrive?.enabled,
+    configured: onedriveConfigured,
+    syncing: isOneDriveSyncing,
+    paused: cloudGate.paused,
+    lastError: onedriveLastError,
+    syncBooks: settings.onedrive?.syncBooks ?? false,
+    booksBackedUpElsewhere: booksBackedUpBy('onedrive'),
+  });
+  const icloudStatus = getThirdPartyRowStatus(_, {
+    enabled: !!settings.icloud?.enabled,
+    configured: icloudAvailable,
+    syncing: isICloudSyncing,
+    paused: cloudGate.paused,
+    lastError: icloudLastError,
+    syncBooks: settings.icloud?.syncBooks ?? false,
+    booksBackedUpElsewhere: booksBackedUpBy('icloud'),
+  });
+  const openlistConfigured = !!(
+    settings.openlist?.serverUrl &&
+    settings.openlist?.username &&
+    settings.openlist?.rootPath
+  );
+  const openlistStatus = getThirdPartyRowStatus(_, {
+    enabled: !!settings.openlist?.enabled,
+    configured: openlistConfigured,
+    syncing: isOpenListSyncing,
+    paused: cloudGate.paused,
+    lastError: openlistLastError,
+    syncBooks: settings.openlist?.syncBooks ?? false,
+    booksBackedUpElsewhere: booksBackedUpBy('openlist'),
+  });
+  const readestStatus = getReadestCloudRowStatus(_, {
+    signedIn: !!user,
+    planLoading: userProfilePlan === undefined,
+    enabled: readestEnabled,
+  });
+
+  const toggleCloudProvider = async (kind: CloudSyncProviderKind, next: boolean) => {
+    await persistCloudProviderEnabled(envConfig, kind, next);
+  };
+
+  const opdsStatus =
+    opdsCount > 0 ? _('{{count}} catalog', { count: opdsCount }) : _('No catalogs');
+  const absStatus = absCount > 0 ? _('{{count}} server', { count: absCount }) : _('No servers');
+  // Enabled rows show the announced device name (falling back to the stored
+  // custom alias, then a bare "On" until the service reports its alias).
+  const localSendName = localSendAlias || getLocalSendAlias();
+  const localSendStatus = !localSendEnabled
+    ? _('Off')
+    : localSendName
+      ? _('Visible as {{name}}', { name: localSendName })
+      : _('On');
+
+  const toggleLocalSend = (next: boolean) => {
+    setLocalSendEnabled(next);
+    eventDispatcher.dispatch('localsend-prefs-changed', {});
+  };
+
+  return (
+    <div className='my-4 w-full space-y-6'>
+      <div className='w-full px-4'>
+        <div className='mb-1.5 flex items-center justify-between gap-2'>
+          <h2 className='text-lg font-semibold tracking-tight'>{_('Integrations')}</h2>
+          <button
+            type='button'
+            title={flowLabel}
+            aria-label={flowLabel}
+            onClick={() => setSubPage('data-flow')}
+            className='btn btn-ghost touch-target h-8 min-h-8 shrink-0 gap-1 rounded-full px-1.5 font-normal'
+          >
+            {flowProblems > 0 ? (
+              <RiAlertLine aria-hidden='true' className='h-4 w-4' />
+            ) : (
+              <RiInformationLine aria-hidden='true' className='h-4 w-4' />
+            )}
+            {flowProblems > 0 && <span className='text-sm tabular-nums'>{flowProblems}</span>}
+          </button>
+        </div>
+        <p className='text-base-content/70 text-sm leading-relaxed'>
+          {_('Connect Readest to external services for sync, highlights, and catalogs.')}
+        </p>
+      </div>
+
+      {/* Nearby BookDrop is the one integration that is on by default, and it
+          listens on the local network, so it leads the panel (#6360). */}
+      {isTauriAppPlatform() && (
+        <div className='w-full' data-setting-id='settings.integrations.localsend'>
+          <SectionTitle className='mb-2'>{_('Local Network')}</SectionTitle>
+          <div className='card eink-bordered border-base-200 bg-base-100 overflow-hidden border'>
+            <CloudProviderRow
+              icon={RiWifiLine}
+              title={_('Nearby BookDrop')}
+              status={localSendStatus}
+              checked={localSendEnabled}
+              canToggle
+              onToggle={toggleLocalSend}
+              onOpen={() => setSubPage('localsend')}
+              toggleLabel={_('Enable Nearby BookDrop')}
+            />
+          </div>
+        </div>
+      )}
+
+      <div className='w-full' data-setting-id='settings.integrations.sync'>
+        <SectionTitle className='mb-2'>{_('Reading Sync')}</SectionTitle>
+        <div className='card eink-bordered border-base-200 bg-base-100 overflow-hidden border'>
+          <div className='divide-base-200 divide-y'>
+            <IntegrationRow
+              icon={RiBookOpenLine}
+              title={_('KOReader')}
+              status={koSyncStatus}
+              onClick={() => setSubPage('kosync')}
+            />
+            <IntegrationRow
+              icon={RiPlanetLine}
+              title={_('BookOrbit')}
+              status={bookOrbitStatus}
+              onClick={() => setSubPage('bookorbit')}
+            />
+            <IntegrationRow
+              icon={RiBookShelfLine}
+              title={_('Grimmory')}
+              status={grimmoryStatus}
+              onClick={() => setSubPage('grimmory')}
+            />
+            <IntegrationRow
+              icon={RiBookReadLine}
+              title={_('Readwise')}
+              status={readwiseStatus}
+              onClick={() => setSubPage('readwise')}
+            />
+            <IntegrationRow
+              icon={RiBook3Line}
+              title={_('Hardcover')}
+              status={hardcoverStatus}
+              onClick={() => setSubPage('hardcover')}
+            />
+            {/* Pagebound's API sends no CORS headers, so only native HTTP reaches it. */}
+            {isTauriAppPlatform() && (
+              <IntegrationRow
+                icon={RiBookmark3Line}
+                title={_('Pagebound')}
+                status={pageboundStatus}
+                onClick={() => setSubPage('pagebound')}
+              />
+            )}
+            <IntegrationRow
+              icon={RiFileList3Line}
+              title={_('Notion')}
+              status={notionStatus}
+              onClick={() => setSubPage('notion')}
+            />
+            {/* Writes into a local vault folder: desktop and Android only for now. */}
+            {(appService?.isDesktopApp || appService?.isAndroidApp) && (
+              <IntegrationRow
+                icon={RiMarkdownLine}
+                title={_('Obsidian')}
+                status={obsidianStatus}
+                onClick={() => setSubPage('obsidian')}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className='w-full' data-setting-id='settings.integrations.cloudSync'>
+        <SectionTitle className='mb-2'>{_('Cloud Sync')}</SectionTitle>
+        <div className='card eink-bordered border-base-200 bg-base-100 overflow-hidden border'>
+          <div
+            className='divide-base-200 divide-y'
+            role='group'
+            aria-label={_('Cloud sync providers')}
+          >
+            <CloudProviderRow
+              icon={RiCloudFill}
+              title={_('Readest Cloud')}
+              status={readestStatus}
+              checked={!!user && readestEnabled}
+              canToggle={!!user}
+              onToggle={(next) => toggleCloudProvider('readest', next)}
+              onOpen={() => (user ? setSubPage('readest-cloud') : navigateToLogin(router))}
+              toggleLabel={_('Sync with Readest Cloud')}
+            />
+            {/* Third-party providers are premium: every row carries the tier
+                badge; on a free plan the checkbox is disabled and opening a
+                row routes to the upgrade page instead of the config sub-page. */}
+            {(appService?.isDesktopApp ||
+              appService?.isAndroidApp ||
+              appService?.isIOSApp ||
+              // Web: only when a Web-type GIS client id is configured for this build.
+              (isWebAppPlatform() && !!getGoogleWebClientId())) && (
+              <CloudProviderRow
+                icon={RiGoogleLine}
+                title={_('Google Drive')}
+                status={gdriveStatus}
+                badge={premiumBadge}
+                checked={!!settings.googleDrive?.enabled}
+                canToggle={canToggleCloudProvider({
+                  isPremium: isCloudSyncPremium,
+                  isConfigured: gdriveConfigured,
+                  isEnabled: !!settings.googleDrive?.enabled,
+                })}
+                onToggle={(next) => toggleCloudProvider('gdrive', next)}
+                onOpen={() =>
+                  isCloudSyncPremium ? setSubPage('gdrive') : navigateToProfile(router)
+                }
+                toggleLabel={_('Sync with Google Drive')}
+              />
+            )}
+            <CloudProviderRow
+              icon={RiCloudLine}
+              title={_('WebDAV')}
+              status={webdavStatus}
+              badge={premiumBadge}
+              checked={!!settings.webdav?.enabled}
+              canToggle={canToggleCloudProvider({
+                isPremium: isCloudSyncPremium,
+                isConfigured: webdavConfigured,
+                isEnabled: !!settings.webdav?.enabled,
+              })}
+              onToggle={(next) => toggleCloudProvider('webdav', next)}
+              onOpen={() => (isCloudSyncPremium ? setSubPage('webdav') : navigateToProfile(router))}
+              toggleLabel={_('Sync with WebDAV')}
+            />
+            <CloudProviderRow
+              icon={RiDatabase2Line}
+              title={_('S3 Storage')}
+              status={s3Status}
+              badge={premiumBadge}
+              checked={!!settings.s3?.enabled}
+              canToggle={canToggleCloudProvider({
+                isPremium: isCloudSyncPremium,
+                isConfigured: s3Configured,
+                isEnabled: !!settings.s3?.enabled,
+              })}
+              onToggle={(next) => toggleCloudProvider('s3', next)}
+              onOpen={() => (isCloudSyncPremium ? setSubPage('s3') : navigateToProfile(router))}
+              toggleLabel={_('Sync with S3')}
+            />
+            {(appService?.isDesktopApp ||
+              appService?.isAndroidApp ||
+              appService?.isIOSApp ||
+              // Web: only when a Web-type Microsoft client id is configured for this build.
+              (isWebAppPlatform() && !!getMicrosoftClientId())) && (
+              <CloudProviderRow
+                icon={RiMicrosoftLine}
+                title={_('OneDrive')}
+                status={onedriveStatus}
+                badge={premiumBadge}
+                checked={!!settings.onedrive?.enabled}
+                canToggle={canToggleCloudProvider({
+                  isPremium: isCloudSyncPremium,
+                  isConfigured: onedriveConfigured,
+                  isEnabled: !!settings.onedrive?.enabled,
+                })}
+                onToggle={(next) => toggleCloudProvider('onedrive', next)}
+                onOpen={() =>
+                  isCloudSyncPremium ? setSubPage('onedrive') : navigateToProfile(router)
+                }
+                toggleLabel={_('Sync with OneDrive')}
+              />
+            )}
+            {(appService?.isIOSApp || appService?.isMacOSApp) && (
+              <CloudProviderRow
+                icon={RiAppleLine}
+                title={_('iCloud')}
+                status={icloudStatus}
+                badge={premiumBadge}
+                checked={!!settings.icloud?.enabled}
+                canToggle={canToggleCloudProvider({
+                  isPremium: isCloudSyncPremium,
+                  isConfigured: icloudAvailable,
+                  isEnabled: !!settings.icloud?.enabled,
+                })}
+                onToggle={(next) => toggleCloudProvider('icloud', next)}
+                onOpen={() =>
+                  isCloudSyncPremium ? setSubPage('icloud') : navigateToProfile(router)
+                }
+                toggleLabel={_('Sync with iCloud')}
+              />
+            )}
+            <CloudProviderRow
+              icon={RiHardDrive2Line}
+              title={_('OpenList')}
+              status={openlistStatus}
+              badge={premiumBadge}
+              checked={!!settings.openlist?.enabled}
+              canToggle={canToggleCloudProvider({
+                isPremium: isCloudSyncPremium,
+                isConfigured: openlistConfigured,
+                isEnabled: !!settings.openlist?.enabled,
+              })}
+              onToggle={(next) => toggleCloudProvider('openlist', next)}
+              onOpen={() =>
+                isCloudSyncPremium ? setSubPage('openlist') : navigateToProfile(router)
+              }
+              toggleLabel={_('Sync with OpenList')}
+            />
+          </div>
+        </div>
+        {providers.length === 0 && (
+          <div className='mt-5'>
+            <Tips>
+              <li>
+                {_(
+                  'Library sync is off. Your books, progress, and annotations stay on this device.',
+                )}
+              </li>
+              <li>
+                {_(
+                  'App settings, reading statistics, and dictionaries still sync through your Readest account while signed in.',
+                )}
+              </li>
+            </Tips>
+          </div>
+        )}
+      </div>
+
+      <div className='w-full' data-setting-id='settings.integrations.catalogs'>
+        <SectionTitle className='mb-2'>{_('Content Sources')}</SectionTitle>
+        <div className='card eink-bordered border-base-200 bg-base-100 overflow-hidden border'>
+          <div className='divide-base-200 divide-y'>
+            <IntegrationRow
+              icon={RiRssLine}
+              title={_('OPDS Catalogs')}
+              status={opdsStatus}
+              onClick={() => setSubPage('opds')}
+            />
+            <IntegrationRow
+              icon={RiHeadphoneLine}
+              title={_('Audiobookshelf')}
+              status={absStatus}
+              onClick={() => setSubPage('audiobookshelf')}
+            />
+            <IntegrationRow
+              icon={RiSendPlaneLine}
+              title={_('Send to Readest')}
+              status={_('Email books to your library')}
+              onClick={() => setSubPage('send')}
+            />
+          </div>
+        </div>
+      </div>
+
+      {appService?.isDesktopApp && (
+        <div className='w-full' data-setting-id='settings.integrations.discord'>
+          <SectionTitle className='mb-2'>{_('Discord')}</SectionTitle>
+          <div className='card eink-bordered border-base-200 bg-base-100 overflow-hidden border'>
+            <div className='divide-base-200 divide-y'>
+              <IntegrationToggleRow
+                icon={RiDiscordLine}
+                title={_('Show on Discord')}
+                description={_("Display what I'm reading on Discord")}
+                checked={settings.discordRichPresenceEnabled}
+                onChange={toggleDiscordPresence}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+interface IntegrationRowProps {
+  icon: React.ElementType;
+  title: string;
+  status: string;
+  onClick: () => void;
+}
+
+const IntegrationRow: React.FC<IntegrationRowProps> = ({ icon: Icon, title, status, onClick }) => {
+  return (
+    <button
+      type='button'
+      onClick={onClick}
+      className={clsx(
+        'group flex w-full items-center gap-3 px-4 py-3 text-left',
+        'transition-colors duration-150',
+        'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset',
+      )}
+    >
+      <span
+        className={clsx(
+          'flex h-9 w-9 shrink-0 items-center justify-center rounded-full',
+          'bg-base-200 text-base-content/70',
+          'transition-colors duration-150',
+          'group-hover:bg-base-300/70',
+        )}
+      >
+        <Icon className='h-5 w-5' />
+      </span>
+      <div className='flex min-w-0 flex-1 flex-col gap-0.5'>
+        <SettingLabel>{title}</SettingLabel>
+        <span className='text-base-content/65 truncate text-[0.85em]'>{status}</span>
+      </div>
+      <MdChevronRight className='text-base-content/50 h-5 w-5 shrink-0' />
+    </button>
+  );
+};
+
+interface CloudProviderRowProps {
+  icon: React.ElementType;
+  title: string;
+  status: string;
+  /** This provider syncs the library. */
+  checked: boolean;
+  /** Can be toggled inline (configured, and allowed by the plan). */
+  canToggle: boolean;
+  onToggle: (next: boolean) => void;
+  onOpen: () => void;
+  /** Accessible label for the checkbox (e.g. "Sync with WebDAV"). */
+  toggleLabel: string;
+  /** End-aligned tier chip (e.g. "Premium") — uniform column before the checkbox. */
+  badge?: string;
+}
+
+/**
+ * A cloud-sync provider row (also used for Nearby BookDrop). Two controls: a
+ * trailing checkbox that turns this provider's library sync on or off
+ * (several may be on at once) — enabled only when it's already configured —
+ * and the row body / chevron that opens its config sub-page (connect, sync
+ * options, disconnect).
+ */
+const CloudProviderRow: React.FC<CloudProviderRowProps> = ({
+  icon: Icon,
+  title,
+  status,
+  checked,
+  canToggle,
+  onToggle,
+  onOpen,
+  toggleLabel,
+  badge,
+}) => {
+  return (
+    <div className='group flex w-full items-center gap-3 px-4 py-3'>
+      <button
+        type='button'
+        onClick={onOpen}
+        className={clsx(
+          'flex min-w-0 flex-1 items-center gap-3 text-left',
+          'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset',
+        )}
+      >
+        <span
+          className={clsx(
+            'flex h-9 w-9 shrink-0 items-center justify-center rounded-full',
+            'bg-base-200 text-base-content/70',
+            'transition-colors duration-150',
+            'group-hover:bg-base-300/70',
+          )}
+        >
+          <Icon className='h-5 w-5' />
+        </span>
+        <div className='flex min-w-0 flex-1 flex-col gap-0.5'>
+          <SettingLabel>{title}</SettingLabel>
+          <span className='text-base-content/65 truncate text-[0.85em]'>{status}</span>
+        </div>
+      </button>
+      {badge && <span className='badge badge-sm badge-ghost shrink-0'>{badge}</span>}
+      <input
+        type='checkbox'
+        className='checkbox checkbox-sm shrink-0'
+        checked={checked}
+        disabled={!canToggle}
+        onChange={(e) => onToggle(e.target.checked)}
+        aria-label={toggleLabel}
+        title={toggleLabel}
+      />
+      <button
+        type='button'
+        onClick={onOpen}
+        aria-label={title}
+        className={clsx(
+          'text-base-content/50 hover:text-base-content/80 shrink-0 rounded-sm',
+          'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2',
+        )}
+      >
+        <MdChevronRight className='h-5 w-5' />
+      </button>
+    </div>
+  );
+};
+
+interface IntegrationToggleRowProps {
+  icon: React.ElementType;
+  title: string;
+  description: string;
+  checked: boolean;
+  onChange: () => void;
+}
+
+/**
+ * Sibling of IntegrationRow for settings that are a simple on/off toggle
+ * (no sub-page). Keeps the same circular-badge chassis so toggle and
+ * navigation rows read as one consistent list.
+ */
+const IntegrationToggleRow: React.FC<IntegrationToggleRowProps> = ({
+  icon: Icon,
+  title,
+  description,
+  checked,
+  onChange,
+}) => {
+  return (
+    <label className='flex w-full cursor-pointer items-center gap-3 px-4 py-3 text-left'>
+      <span
+        className={clsx(
+          'flex h-9 w-9 shrink-0 items-center justify-center rounded-full',
+          'bg-base-200 text-base-content/70',
+        )}
+      >
+        <Icon className='h-5 w-5' />
+      </span>
+      <div className='flex min-w-0 flex-1 flex-col gap-0.5'>
+        <SettingLabel>{title}</SettingLabel>
+        <span className='text-base-content/65 truncate text-[0.85em]'>{description}</span>
+      </div>
+      <input type='checkbox' className='toggle shrink-0' checked={checked} onChange={onChange} />
+    </label>
+  );
+};
+
+export default IntegrationsPanel;

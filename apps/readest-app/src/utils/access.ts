@@ -1,0 +1,329 @@
+import { jwtDecode } from 'jwt-decode';
+import { supabase } from '@/utils/supabase';
+import { UserPlan } from '@/types/quota';
+import {
+  DEFAULT_DAILY_TRANSLATION_QUOTA,
+  DEFAULT_DAILY_TTS_QUOTA,
+  DEFAULT_STORAGE_QUOTA,
+} from '@/services/constants';
+import { isWebAppPlatform } from '@/services/environment';
+import { getDailyUsage } from '@/services/translators/dailyUsage';
+import { getRuntimeConfig } from '@/services/runtimeConfig';
+
+interface Token {
+  plan: UserPlan;
+  storage_usage_bytes: number;
+  storage_purchased_bytes: number;
+  customization_purchased: boolean;
+  [key: string]: string | number | boolean;
+}
+
+export const getSubscriptionPlan = (token: string): UserPlan => {
+  const data = jwtDecode<Token>(token) || {};
+  return data['plan'] || 'free';
+};
+
+export const getUserProfilePlan = (token: string): UserPlan => {
+  const data = jwtDecode<Token>(token) || {};
+  let plan = data['plan'] || 'free';
+  if (plan === 'free') {
+    const purchasedQuota = data['storage_purchased_bytes'] || 0;
+    if (purchasedQuota > 0) {
+      plan = 'purchase';
+    }
+  }
+  return plan;
+};
+
+/**
+ * Plans that include the "Send to Readest via email" feature: Plus,
+ * Pro, and Lifetime (`purchase`). Free users see an upgrade card on
+ * the client and get a 403 from the server endpoints that allocate /
+ * rotate the address, plus a bounce from the inbound email Worker.
+ *
+ * Other Send channels (in-app `/send` page, mobile share-sheet, browser
+ * extension) stay open to free users — the gate is the personal email
+ * inbox only.
+ */
+export const EMAIL_IN_PLANS: readonly UserPlan[] = ['plus', 'pro', 'purchase'];
+
+export const isEmailInPlan = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  isCustomizationAllowed(plan, customizationPurchased);
+
+/**
+ * Plans that include third-party cloud sync (WebDAV / Google Drive): any paid
+ * plan — Plus, Pro, and Lifetime (`purchase`). Free users see an upgrade prompt
+ * in Settings and the reader's auto-sync stays off, so syncing to a personal
+ * cloud is a premium feature.
+ */
+export const CLOUD_SYNC_PLANS: readonly UserPlan[] = ['plus', 'pro', 'purchase'];
+
+export const isCloudSyncInPlan = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  isCustomizationAllowed(plan, customizationPurchased);
+
+/**
+ * Master switch for the third-party cloud-sync premium paywall. OFF in Read-EX:
+ * syncing to your own storage (WebDAV / S3 / OneDrive / OpenList) is a core
+ * feature of this fork, not an upsell. Readest Cloud's own plan gating is
+ * unaffected — this flag only governs the third-party backends.
+ *
+ * ON restores upstream behaviour: cloud sync requires a {@link CLOUD_SYNC_PLANS}
+ * plan, free users see the provider rows with a Premium badge, and a downgraded
+ * account's still-selected provider is paused (never a silent fallback).
+ */
+export const CLOUD_SYNC_REQUIRES_PREMIUM = false;
+
+/**
+ * Whether third-party cloud sync is available for a plan. Falls back to the
+ * {@link isCloudSyncInPlan} paywall while {@link CLOUD_SYNC_REQUIRES_PREMIUM}
+ * is on; flipping the switch off ungates every plan.
+ */
+export const isCloudSyncAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  !CLOUD_SYNC_REQUIRES_PREMIUM || isCloudSyncInPlan(plan, customizationPurchased);
+
+/**
+ * Plans that include the offline TTS audio cache — pre-downloading a book's
+ * Read Aloud audio per chapter so it plays without a network: any paid plan
+ * (Plus, Pro, and Lifetime `purchase`). Free users see the download row with a
+ * Premium badge and an upgrade route instead of the per-chapter controls.
+ */
+export const TTS_CACHE_PLANS: readonly UserPlan[] = ['plus', 'pro', 'purchase'];
+
+export const isTTSCacheInPlan = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  isCustomizationAllowed(plan, customizationPurchased);
+
+/**
+ * Master switch for the offline-audio premium paywall, mirroring
+ * {@link CLOUD_SYNC_REQUIRES_PREMIUM}. ON: pre-downloading TTS audio requires a
+ * {@link TTS_CACHE_PLANS} plan. Flipping it off ungates every plan. The
+ * automatic playback cache (audio kept as the user listens) is unaffected —
+ * only the explicit download UI is gated.
+ */
+export const TTS_CACHE_REQUIRES_PREMIUM = true;
+
+export const isTTSCacheAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  !TTS_CACHE_REQUIRES_PREMIUM || isTTSCacheInPlan(plan, customizationPurchased);
+
+/**
+ * Offline Audiobookshelf downloads — storing an ABS audiobook's tracks or an
+ * ebook-only item's file on the device so it plays and reads without a
+ * network — are a premium feature ({@link isCustomizationAllowed}). Free users
+ * see the action with a Premium badge and an upgrade route; streaming stays
+ * free. Client-side gate, like the TTS cache.
+ */
+export const isAbsOfflineInPlan = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  isCustomizationAllowed(plan, customizationPurchased);
+
+/**
+ * Master switch for the offline-download paywall, mirroring
+ * {@link TTS_CACHE_REQUIRES_PREMIUM}. Flipping it off ungates every plan.
+ */
+export const ABS_OFFLINE_REQUIRES_PREMIUM = true;
+
+export const isAbsOfflineAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  !ABS_OFFLINE_REQUIRES_PREMIUM || isAbsOfflineInPlan(plan, customizationPurchased);
+
+/**
+ * Master switch for the Anki paywall: sending words to AnkiDroid, importing a
+ * deck back, and the Anki file export are premium ({@link isCustomizationAllowed}).
+ * CSV export stays free. Client-side gate, like the TTS cache. Flipping it off
+ * ungates every plan.
+ */
+export const ANKI_REQUIRES_PREMIUM = true;
+
+export const isAnkiAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  !ANKI_REQUIRES_PREMIUM || isCustomizationAllowed(plan, customizationPurchased);
+
+/**
+ * Plans that include Nearby BookDrop device pairing — trusted devices whose
+ * drops skip the per-transfer confirmation dialog: any paid plan (Plus, Pro,
+ * and Lifetime `purchase`). Free users see the pairing affordance with a
+ * Premium badge and an upgrade route; plain confirm-every-time transfers stay
+ * free. This gate is client-side only (LAN transfers have no server in the
+ * path), matching the TTS-cache gate's trust level.
+ */
+export const NEARBY_PAIRING_PLANS: readonly UserPlan[] = ['plus', 'pro', 'purchase'];
+
+export const isNearbyPairingInPlan = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  isCustomizationAllowed(plan, customizationPurchased);
+
+/**
+ * Master switch for the pairing paywall, mirroring
+ * {@link CLOUD_SYNC_REQUIRES_PREMIUM}. ON: pairing (and therefore
+ * confirmation-free drops) requires a {@link NEARBY_PAIRING_PLANS} plan.
+ * Flipping it off ungates every plan. Existing pairing records always
+ * persist; only the auto-accept behavior is gated.
+ */
+export const NEARBY_PAIRING_REQUIRES_PREMIUM = true;
+
+export const isNearbyPairingAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  !NEARBY_PAIRING_REQUIRES_PREMIUM || isNearbyPairingInPlan(plan, customizationPurchased);
+
+/**
+ * Whether the account has bought the Full Customization unlock, as minted into
+ * the access token by `custom_access_token_hook`. Absent on tokens issued
+ * before the claim existed, which reads as not purchased.
+ */
+export const getCustomizationPurchased = (token: string): boolean => {
+  const data = jwtDecode<Token>(token) || {};
+  return data['customization_purchased'] === true;
+};
+
+/**
+ * Plans that carry the premium feature set without a separate purchase.
+ *
+ * `purchase` is deliberately absent. {@link getUserProfilePlan} reports it for
+ * anyone holding ANY one-time purchase, which is how a storage add-on
+ * presents, so including it would hand every premium feature to a buyer who
+ * only wanted more space.
+ */
+export const PREMIUM_PLANS: readonly UserPlan[] = ['plus', 'pro'];
+
+/**
+ * Self-hosted deployments unlock every premium feature, signed in or not.
+ * There is no store to buy from, and the operator already runs the
+ * infrastructure the paywall exists to fund. Read from the runtime config in
+ * the browser, and straight from the environment on the server where the
+ * window-injected config does not exist.
+ */
+export const isSelfHosted = (): boolean =>
+  getRuntimeConfig()?.selfHosted === true ||
+  // `??` would stop at an empty string, so an explicitly blank SELF_HOSTED
+  // would mask NEXT_PUBLIC_SELF_HOSTED. `||` falls through on empty too.
+  (process.env['SELF_HOSTED'] || process.env['NEXT_PUBLIC_SELF_HOSTED']) === 'true';
+
+/**
+ * The single gate for premium features: a self-hosted deployment, a paid
+ * subscription, or the Full Customization unlock bought outright.
+ */
+export const isCustomizationAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  isSelfHosted() || customizationPurchased || PREMIUM_PLANS.includes(plan);
+
+/**
+ * Custom translators (the user's own OpenAI-compatible LLM or DeepL key) are a
+ * premium feature. Requests go straight from the device, so this is a
+ * client-side gate, like the TTS cache. It reads the session token directly so
+ * a reader window never sees a premium user as free while the plan loads.
+ */
+export const isCustomTranslatorAllowed = (token: string | null | undefined): boolean =>
+  token
+    ? isCustomizationAllowed(getUserProfilePlan(token), getCustomizationPurchased(token))
+    : isSelfHosted();
+
+/**
+ * Custom TTS services (the user's own OpenAI-compatible speech endpoint) are
+ * premium on the same terms as custom translators: requests go straight from
+ * the device, so this is a client-side gate.
+ */
+export const isCustomTTSAllowed = isCustomTranslatorAllowed;
+
+export const STORAGE_QUOTA_GRACE_BYTES = 10 * 1024 * 1024; // 10 MB grace
+
+export const getStoragePlanData = (token: string) => {
+  const data = jwtDecode<Token>(token) || {};
+  const plan = data['plan'] || 'free';
+  const usage = data['storage_usage_bytes'] || 0;
+  const purchasedQuota = data['storage_purchased_bytes'] || 0;
+  const runtimeConfig = getRuntimeConfig();
+  const fixedQuota =
+    runtimeConfig?.storageFixedQuota ?? parseInt(process.env['STORAGE_FIXED_QUOTA'] ?? '0');
+  const planQuota = fixedQuota || DEFAULT_STORAGE_QUOTA[plan] || DEFAULT_STORAGE_QUOTA['free'];
+  const quota = planQuota + purchasedQuota;
+
+  return {
+    plan,
+    usage,
+    quota,
+  };
+};
+
+export const getTranslationQuota = (plan: UserPlan): number => {
+  const runtimeConfig = getRuntimeConfig();
+  const fixedQuota =
+    runtimeConfig?.translationFixedQuota ?? parseInt(process.env['TRANSLATION_FIXED_QUOTA'] ?? '0');
+  return (
+    fixedQuota || DEFAULT_DAILY_TRANSLATION_QUOTA[plan] || DEFAULT_DAILY_TRANSLATION_QUOTA['free']
+  );
+};
+
+/**
+ * Plans that include the self-hosted premium TTS engine ("Readest Voice"):
+ * Plus and Pro subscriptions only. Unlike EMAIL_IN_PLANS / CLOUD_SYNC_PLANS
+ * this deliberately excludes `purchase` (lifetime): synthesis has a recurring
+ * per-character GPU cost that a one-time purchase does not fund.
+ */
+export const TTS_PLANS: readonly UserPlan[] = ['plus', 'pro'];
+
+export const isTTSInPlan = (plan: UserPlan): boolean => TTS_PLANS.includes(plan);
+
+/** A Readest Voice tier: Plus unlocks its voices, Pro unlocks both tiers. */
+export const isVoiceTierInPlan = (tier: 'plus' | 'pro', plan: UserPlan): boolean =>
+  tier === 'plus' ? isTTSInPlan(plan) : plan === 'pro';
+
+export const getTTSQuota = (plan: UserPlan): number => {
+  const fixedQuota = parseInt(process.env['TTS_FIXED_QUOTA'] ?? '0');
+  return fixedQuota || DEFAULT_DAILY_TTS_QUOTA[plan] || 0;
+};
+
+export const getTranslationPlanData = (token: string) => {
+  const data = jwtDecode<Token>(token) || {};
+  const plan: UserPlan = data['plan'] || 'free';
+  const usage = getDailyUsage() || 0;
+  const quota = getTranslationQuota(plan);
+
+  return {
+    plan,
+    usage,
+    quota,
+  };
+};
+
+export const getDailyTranslationPlanData = (token: string) => {
+  const data = jwtDecode<Token>(token) || {};
+  const plan = data['plan'] || 'free';
+  const quota = getTranslationQuota(plan);
+
+  return {
+    plan,
+    quota,
+  };
+};
+
+export const getAccessToken = async (): Promise<string | null> => {
+  // In browser context there might be two instances of supabase one in the app route
+  // and the other in the pages route, and they might have different sessions
+  // making the access token invalid for API calls. In that case we should use localStorage.
+  if (isWebAppPlatform()) {
+    return localStorage.getItem('token') ?? null;
+  }
+  const { data } = await supabase.auth.getSession();
+  return data?.session?.access_token ?? null;
+};
+
+export const getUserID = async (): Promise<string | null> => {
+  if (isWebAppPlatform()) {
+    const user = localStorage.getItem('user') ?? '{}';
+    return JSON.parse(user).id ?? null;
+  }
+  const { data } = await supabase.auth.getSession();
+  return data?.session?.user?.id ?? null;
+};
+
+export const validateUserAndToken = async (authHeader: string | null | undefined) => {
+  if (!authHeader) return {};
+
+  const token = authHeader.replace('Bearer ', '');
+  // getClaims verifies asymmetric (ES256) tokens locally against the cached JWKS, so API
+  // routes skip a GET /auth/v1/user round trip per request. HS256 tokens (legacy secret,
+  // self-hosted) still fall back to getUser inside getClaims.
+  try {
+    const { data, error } = await supabase.auth.getClaims(token);
+    const claims = data?.claims;
+    // The anon and service-role keys are JWTs too.
+    if (error || claims?.role !== 'authenticated' || !claims.sub) return {};
+    return { user: { id: claims.sub, email: claims.email }, token };
+  } catch {
+    // getClaims throws, rather than returns, an error for expired tokens.
+    return {};
+  }
+};

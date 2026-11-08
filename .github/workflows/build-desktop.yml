@@ -1,0 +1,108 @@
+name: Build Desktop
+
+# Read-EX desktop packaging: Windows (NSIS), macOS (universal dmg), Linux
+# (AppImage + deb). Deliberately independent of upstream's release.yml, which
+# depends on Readest's own Sentry / PostHog / Supabase / Apple / Discord
+# secrets and would fail on a fork.
+#
+# Trigger: push a tag, or run manually from the Actions tab. Artifacts are
+# attached to a DRAFT release so nothing ships by accident.
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: 'Create the release as a draft'
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: read-ex-windows-x64
+            args: '--target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.updater.conf.json'
+          - os: macos-latest
+            artifact: read-ex-macos-universal
+            args: '--target universal-apple-darwin --config src-tauri/tauri.macos-nonestore.conf.json --config src-tauri/tauri.updater.conf.json'
+          - os: ubuntu-22.04
+            artifact: read-ex-linux-x64
+            args: '--bundles appimage,deb --config src-tauri/tauri.updater.conf.json'
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev libxdo-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/readest-app/src-tauri -> target'
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      # PDF.js worker / wasm / fonts are copied out of node_modules into
+      # public/vendor — the build fails without them.
+      - name: Stage vendored assets
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Write build-time config
+        shell: bash
+        working-directory: apps/readest-app
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" > .env.local
+          echo "NEXT_PUBLIC_MICROSOFT_CLIENT_ID=${{ vars.MICROSOFT_CLIENT_ID }}" >> .env.local
+
+      - name: Build and attach to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS signing + notarization. Omit these secrets and the job still
+          # produces an unsigned dmg — see README for the Gatekeeper workaround.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/readest-app
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Read-EX ${{ github.ref_name }}'
+          releaseBody: 'See the assets below to download and install Read-EX for your platform.'
+          releaseDraft: ${{ github.event.inputs.draft == 'false' && false || true }}
+          prerelease: false
+          args: ${{ matrix.args }}

@@ -1,0 +1,255 @@
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
+import { DocumentLoader, getDirection } from '@/libs/document';
+import { getImportErrorMessage } from '@/services/errors';
+import { BlobWriter, TextReader, ZipWriter } from '@zip.js/zip.js';
+
+if (typeof globalThis['CSS'] === 'undefined') {
+  (globalThis as Record<string, unknown>)['CSS'] = {
+    escape: (s: string) => s.replace(/([^\w-])/g, '\\$1'),
+  };
+}
+
+if (!customElements.get('foliate-paginator')) {
+  customElements.define(
+    'foliate-paginator',
+    class extends HTMLElement {
+      override setAttribute() {}
+      override addEventListener() {}
+      open() {}
+    },
+  );
+}
+
+vi.mock('foliate-js/paginator.js', () => ({}));
+
+const loadFixtureBytes = (name: string): Uint8Array => {
+  const epubPath = resolve(__dirname, `../fixtures/data/${name}`);
+  return new Uint8Array(readFileSync(epubPath));
+};
+
+describe('DocumentLoader.open', () => {
+  it('reports a ZIP with no book inside as an unsupported format, not a raw parser error', async () => {
+    const writer = new ZipWriter(new BlobWriter('application/zip'));
+    await writer.add('readme.txt', new TextReader('This archive is not a book.'));
+    const file = new File([await writer.close()], 'notes.zip');
+
+    const error = await new DocumentLoader(file).open().then(
+      () => null,
+      (e: Error) => e,
+    );
+    // bookService wraps loader errors before the import toast maps them.
+    expect(getImportErrorMessage(`Failed to open the book file: ${error?.message}`)).toBe(
+      'This book format is not supported',
+    );
+  });
+
+  it('opens an EPUB whose first local file header has a non-standard signature byte', async () => {
+    // Some EPUB writers in the wild produce a malformed first local file header
+    // signature - PK\x03\x02 instead of the spec-mandated PK\x03\x04.
+    // The archive is otherwise valid: zip.js reads every entry via the central
+    // directory at the end of the file. We must not reject it at the magic-bytes gate.
+    const bytes = loadFixtureBytes('repro-3688.epub');
+    expect([bytes[0], bytes[1], bytes[2], bytes[3]]).toEqual([0x50, 0x4b, 0x03, 0x04]);
+
+    const malformed = bytes.slice();
+    malformed[3] = 0x02;
+
+    const file = new File([malformed], 'malformed-header.epub', {
+      type: 'application/epub+zip',
+    });
+    const result = await new DocumentLoader(file).open();
+
+    expect(result.book).toBeTruthy();
+    expect(result.format).toBe('EPUB');
+  }, 15000);
+
+  it('opens a raw .txt by converting it to EPUB in-memory', async () => {
+    // The Android "Open with Readest" (VIEW intent) transient path hands the
+    // reader the original .txt file (its filePath points at the content:// URI),
+    // unlike the managed library which stores the already-converted EPUB. The
+    // loader must therefore be able to open a raw .txt directly; otherwise it
+    // returns { book: null } and initViewState crashes on `bookDoc.metadata`.
+    const txt = [
+      'Chapter 1',
+      '',
+      'It was a bright cold day in April, and the clocks were striking thirteen.',
+      '',
+      'Chapter 2',
+      '',
+      'Winston Smith slipped quickly through the glass doors of Victory Mansions.',
+    ].join('\n');
+    const file = new File([txt], 'my-book.txt', { type: 'text/plain' });
+
+    const result = await new DocumentLoader(file).open();
+
+    expect(result.book).toBeTruthy();
+    expect(result.format).toBe('EPUB');
+  }, 15000);
+
+  const txtBody = ['Chapter 1', '', 'Hello world.'].join('\n');
+
+  it('opens a .txt whose MIME carries a charset param and whose name lacks the ext', async () => {
+    // Android can hand over a content:// URI with no .txt extension and a
+    // parameterised MIME (text/plain;charset=utf-8). Strict `=== 'text/plain'`
+    // plus a name-only ext check would both miss and yield a null book.
+    const file = new File([txtBody], 'content-12345', { type: 'text/plain;charset=utf-8' });
+
+    const result = await new DocumentLoader(file).open();
+
+    expect(result.book).toBeTruthy();
+    expect(result.format).toBe('EPUB');
+  }, 15000);
+
+  it('opens a .txt with an uppercase extension and a generic MIME', async () => {
+    const file = new File([txtBody], 'MY-BOOK.TXT', { type: 'application/octet-stream' });
+
+    const result = await new DocumentLoader(file).open();
+
+    expect(result.book).toBeTruthy();
+    expect(result.format).toBe('EPUB');
+  }, 15000);
+});
+
+// Issue #5959: some download managers append the duplicate marker after the
+// extension ("notes.md (1)"), and the loader classifies by name. Without
+// tolerating it a Markdown or comic file reaches the zip probe as an unknown
+// binary and fails with "Unsupported or corrupted book file".
+describe('DocumentLoader format probes with a duplicate-download marker', () => {
+  it('still recognizes Markdown', async () => {
+    const file = new File(['# Chapter One\n\nhello'], 'notes.md (1)');
+
+    const { format } = await new DocumentLoader(file).open();
+
+    expect(format).toBe('MD');
+  });
+});
+
+// Issue #7038: the folder import offers "CBZ/ZIP", but a plain .zip of images
+// went down the EPUB path and failed with "Failed to load container file".
+describe('DocumentLoader format probes for a .zip of images', () => {
+  const makeZip = async (names: string[], filename: string): Promise<File> => {
+    const { BlobWriter, TextReader, ZipWriter } = await import('@zip.js/zip.js');
+    const writer = new ZipWriter(new BlobWriter('application/zip'));
+    for (const name of names) {
+      await writer.add(name, new TextReader(name), { directory: name.endsWith('/') });
+    }
+    return new File([await writer.close()], filename, { type: 'application/zip' });
+  };
+
+  it('opens a .zip holding only images as a comic', async () => {
+    const file = await makeZip(
+      ['Vol 1/', 'Vol 1/001.jpg', 'Vol 1/002.png', 'ComicInfo.xml', '.DS_Store'],
+      'manga.zip',
+    );
+
+    const result = await new DocumentLoader(file).open().catch((e: Error) => e);
+
+    expect(result instanceof Error ? result.message : result.format).toBe('CBZ');
+    expect(result instanceof Error ? 0 : result.book.sections.length).toBe(2);
+  });
+
+  it('ignores the __MACOSX folder a Finder-made zip carries', async () => {
+    const file = await makeZip(['001.jpg', '__MACOSX/._001.jpg'], 'manga.zip');
+
+    const { format, book } = await new DocumentLoader(file).open();
+
+    expect(format).toBe('CBZ');
+    expect(book.sections.map((s: { id: string }) => s.id)).toEqual(['001.jpg']);
+  });
+
+  it('keeps uppercase .JPG pages when it opens a .zip as a comic', async () => {
+    const file = await makeZip(['001.JPG', '002.Jpg'], 'manga.zip');
+
+    const result = await new DocumentLoader(file).open().catch((e: Error) => e);
+
+    expect(result instanceof Error ? result.message : result.format).toBe('CBZ');
+    expect(
+      result instanceof Error ? [] : result.book.sections.map((s: { id: string }) => s.id),
+    ).toEqual(['001.JPG', '002.Jpg']);
+  });
+
+  it('still opens an EPUB renamed to .zip as an EPUB', async () => {
+    const file = new File(
+      [readFileSync(resolve(__dirname, '../fixtures/data/sample-alice.epub'))],
+      'alice.zip',
+    );
+
+    const { format } = await new DocumentLoader(file).open();
+
+    expect(format).toBe('EPUB');
+  }, 15000);
+
+  it('does not treat a .zip with non-image files as a comic', async () => {
+    const file = await makeZip(['cover.jpg', 'word/document.xml'], 'report.zip');
+
+    await expect(new DocumentLoader(file).open()).rejects.toThrow();
+  });
+});
+
+describe('DocumentLoader format probes for HTML', () => {
+  const html = '<!DOCTYPE html><html><head><title>T</title></head><body><p>hi</p></body></html>';
+
+  it('routes .html, .htm and a nameless text/html blob to HTML format', async () => {
+    for (const file of [
+      new File([html], 'page.html'),
+      new File([html], 'PAGE.HTM'),
+      new File([html], '', { type: 'text/html' }),
+      new File([html], 'page.html (1)'),
+    ]) {
+      const { book, format } = await new DocumentLoader(file).open();
+      expect(format).toBe('HTML');
+      expect(book.sections.length).toBe(1);
+    }
+  });
+
+  it('routes .mhtml and .mht web archives to HTML format', async () => {
+    const mhtml = [
+      'MIME-Version: 1.0',
+      'Content-Type: multipart/related; boundary="b"',
+      '',
+      '--b',
+      'Content-Type: text/html',
+      '',
+      html,
+      '--b--',
+    ].join('\r\n');
+    for (const file of [new File([mhtml], 'page.mhtml'), new File([mhtml], 'PAGE.MHT')]) {
+      const { book, format } = await new DocumentLoader(file).open();
+      expect(format).toBe('HTML');
+      expect(book.metadata.title).toBe('T');
+    }
+  });
+});
+
+describe('getDirection', () => {
+  afterEach(() => {
+    document.body.removeAttribute('style');
+    document.body.removeAttribute('dir');
+    document.documentElement.removeAttribute('dir');
+    document.body.innerHTML = '';
+  });
+
+  it('treats vertical-rl (Japanese vertical) as RTL so columns advance right-to-left', () => {
+    // vertical-rl reads top-to-bottom with columns progressing right-to-left, but
+    // its computed CSS `direction` stays `ltr`; the writing mode alone marks it RTL.
+    document.body.style.writingMode = 'vertical-rl';
+    expect(getDirection(document)).toEqual({ vertical: true, rtl: true });
+  });
+
+  it('treats vertical-lr (Mongolian) as vertical but left-to-right', () => {
+    document.body.style.writingMode = 'vertical-lr';
+    expect(getDirection(document)).toEqual({ vertical: true, rtl: false });
+  });
+
+  it('leaves horizontal-tb as neither vertical nor RTL', () => {
+    document.body.style.writingMode = 'horizontal-tb';
+    expect(getDirection(document)).toEqual({ vertical: false, rtl: false });
+  });
+
+  it('still honors an explicit rtl dir for horizontal text', () => {
+    document.body.setAttribute('dir', 'rtl');
+    expect(getDirection(document)).toEqual({ vertical: false, rtl: true });
+  });
+});

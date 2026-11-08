@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.bilingify.readest</id>
+
+  <name>Readest</name>
+  <summary>Modern, feature-rich ebook reader</summary>
+
+  <description>
+    <p>Readest is a modern, feature-rich ebook reader designed for avid readers offering seamless cross-platform access, powerful tools, and an intuitive interface to elevate your reading experience.</p>
+    <p>Built as a modern rewrite of Foliate, Readest leverages Next.js 15 and Tauri v2 to deliver a smooth, cross-platform experience across macOS, Windows, Linux, Android, iOS, and the Web.</p>
+    <p>Whether you're analyzing complex texts, immersing yourself in stories, or exploring new ideas, Readest adapts to your needs with powerful features for deep, thoughtful reading.</p>
+    <p>Key features include:</p>
+    <ul>
+      <li>Multi-format support for EPUB, MOBI, KF8 (AZW3), FB2, CBZ, TXT, and PDF (experimental).</li>
+      <li>Switch between scrolling or paginated reading modes for your preferred reading style.</li>
+      <li>Full-text search across the entire book to find relevant sections quickly.</li>
+      <li>Add highlights, bookmarks, and notes to enhance your reading experience and learning.</li>
+      <li>Easily excerpt text from books for detailed notes and analysis.</li>
+      <li>Instantly look up words and terms with built-in dictionary and Wikipedia integration.</li>
+      <li>Translate selected text instantly using DeepL for accurate translations.</li>
+      <li>Parallel Reading: Read two books or documents simultaneously in a split-screen view, perfect for researchers, language learners, and multitaskers.</li>
+      <li>Customize fonts, layout, theme mode, and theme colors for a personalized reading experience.</li>
+      <li>Cross-platform synchronization of book files, reading progress, notes, and bookmarks across all supported platforms.</li>
+      <li>Text-to-Speech functionality for a more accessible reading experience.</li>
+      <li>Organize, sort, and manage your entire ebook library with advanced library management tools.</li>
+      <li>One-click file association to quickly open files in Readest from your file browser.</li>
+    </ul>
+    <p>Readest also includes custom CSS support for personalized styling, and code syntax highlighting for technical books. The application is designed to honor the legacy of deep reading while embracing modern technology for an enhanced experience.</p>
+  </description>
+
+  <categories>
+    <category>Office</category>
+    <category>Education</category>
+    <category>Literature</category>
+  </categories>
+
+  <keywords>
+    <keyword translate="no">readest</keyword>
+    <keyword>ebook</keyword>
+    <keyword>reader</keyword>
+    <keyword>epub</keyword>
+    <keyword>mobi</keyword>
+    <keyword>pdf</keyword>
+    <keyword>reading</keyword>
+    <keyword>books</keyword>
+    <keyword>annotation</keyword>
+    <keyword>highlight</keyword>
+    <keyword>notes</keyword>
+    <keyword>translation</keyword>
+    <keyword>tts</keyword>
+    <keyword>sync</keyword>
+  </keywords>
+
+  <url type="homepage">https://github.com/readest/readest</url>
+  <url type="bugtracker">https://github.com/readest/readest/issues</url>
+  <url type="help">https://github.com/readest/readest/wiki</url>
+  <url type="donation">https://github.com/sponsors/readest</url>
+  <url type="vcs-browser">https://github.com/readest/readest</url>
+
+  <launchable type="desktop-id">com.bilingify.readest.desktop</launchable>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+
+  <releases>
+    <release version="0.12.20" date="2026-11-06">
+      <description>
+        <ul>
+          <li>Vocabulary: You can now build a vocabulary list, mark words as Learning or Mastered for Word Lens hints, and sync with Anki</li>
+          <li>Statistics: Added a reading statistics dashboard so you can see your reading habits at a glance</li>
+          <li>Reading: Added Page Flip and paper curl page turns, a page preview while dragging the progress slider, a straight-line reading ruler, and keyboard-only text selection</li>
+          <li>Styling: You can now ignore publisher fonts, make white image backgrounds transparent, and adjust dialogue highlighting</li>
+          <li>Text-to-Speech: You can now preview voices, pick a default voice per language, and sync downloaded read-aloud audio across devices</li>
+          <li>Library: You can now import pasted text and Word or RTF files, share collections as bundles, search for covers in the app</li>
+          <li>Sync: Added Grimmory, Obsidian, and CrossPoint 2.0 highlight sync, a new view of where your reading data goes, and a switch for servers with self-signed certificates</li>
+          <li>Dictionary: You can now resize the dictionary popup, customize AI context lookups, edit word hints, and choose your lookup app on Android</li>
+          <li>PDF: Text is now sharper, especially on iOS and Android, with smoother pinch zoom, panning, and gapless horizontal scrolling</li>
+          <li>More: The KOReader plugin can sign in with a QR code, iPhone Duo gets book mode on its inner display, and stylus annotation and sync are more reliable</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.12.16" date="2026-10-14">
+      <description>
+        <ul>
+          <li>Text-to-Speech: Added Readest Voice premium read-aloud voices for Plus and Pro, you can now connect your own OpenAI-compatible voice service, and Edge voices work again</li>
+          <li>Annotations: You can now handwrite and draw on your pages, and share passages as quote card images</li>
+          <li>Library: Books now show their page count with a new Pages sort and filter that syncs across devices, and numbered titles sort in natural order</li>
+          <li>Sync: Custom fonts download when you need them and can be removed from the cloud, custom theme edits now sync, and deleted books no longer come back</li>
+          <li>Sync: KOReader progress sync and WebDAV sync are more reliable, and signing out only logs out the current device</li>
+          <li>Reading: Very large or link-heavy chapters no longer freeze the reader, and fixed layout issues with headings, blockquotes, footnotes, and background textures</li>
+          <li>Audiobooks: Audiobookshelf playback now works in the web app, chapters are detected more reliably, and you can pair audiobooks with books streamed from Audiobookshelf</li>
+          <li>Linux: Fixed a freeze with two open windows, the main window reopens maximized, and Reveal in Folder works again</li>
+          <li>PDF: You can hide page thumbnails in the PDF table of contents</li>
+          <li>More: The share sheet opens again on iOS 16, with polish for the drawing tools, bottom sheets, and bookshelf header</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.12.12" date="2026-10-05">
+      <description>
+        <ul>
+          <li>Text-to-Speech: You can now listen sentence by sentence and loop a passage with A-B repeat, control playback from your desktop's Now Playing controls</li>
+          <li>Reading: Added dialogue highlighting for quoted speech, a Column Gap setting for two-page spreads</li>
+          <li>Sync: Added a Readest plugin for CrossPoint e-readers for reading progress sync</li>
+          <li>Sync: You can now sync reading progress to Pagebound, sign in to Hardcover more easily, and note edits are no longer overwritten by older synced copies</li>
+          <li>PDF: PDFs now blend smoothly with your reading theme with smart image inversion, show page thumbnails in the table of contents</li>
+          <li>PDF: Highlighting and text selection on scanned PDFs is smoother and more accurate, and very large scanned pages no longer crash the reader on iOS</li>
+          <li>Translation: You can now add your own translation providers with a reusable prompt library, look up words with an AI context dictionary</li>
+          <li>Annotations: A global note now appears on every occurrence of its text, exports can include the sentence around each highlight</li>
+          <li>Android: Added home screen widgets for your current book and bookshelf, automatic e-ink full refresh every few page turns</li>
+          <li>More: Images now have a long-press and right-click menu to copy or save them, Windows shows PDF thumbnails in Explorer</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.12.10" date="2026-09-22">
+      <description>
+        <ul>
+          <li>Library: You can now organize books into configurable bookshelves, tag books in bulk</li>
+          <li>Audiobooks: You can download Audiobookshelf books for offline listening, stream audiobooks from OPDS catalogs and BookOrbit</li>
+          <li>Reading: You can now open HTML files as books, and select, highlight, and look up text in Paragraph Mode</li>
+          <li>Sync: Reading progress refreshes when you return to the app, WebDAV sync is more reliable, and Readwise exports now include bookmarks</li>
+          <li>TTS: You can now browse and resume your books from Android Auto and pick up recent books from CarPlay</li>
+          <li>PDF: Page-turn animations now work on PDFs, comics, and fixed-layout books, and wide comic pages get a spread of their own</li>
+          <li>KOReader: Added background sync, group downloads, and more library controls, and highlights you delete stay deleted</li>
+          <li>Dictionary: Pronunciations can play automatically on lookup, accented words are easier to find</li>
+          <li>More: Backups are much faster and keep the screen awake, and fixed freezes on App launch and in image-heavy chapters</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.12.8" date="2026-09-08">
+      <description>
+        <ul>
+          <li>Reading: Customize the information shown in headers and footers, resize text with zoom shortcuts</li>
+          <li>Sync: You can choose whether to use Readest Cloud before signing in, and recover missing covers during sync</li>
+          <li>Annotations: You can now import highlights, bookmarks, and reading progress from ReadEra, and sync your notes and highlights to Notion</li>
+          <li>Audiobooks: You can now stream ebook-only titles from Audiobookshelf</li>
+          <li>Text-to-Speech: use Apple Enhanced and Premium voices on the web, and optionally skip parenthetical readings in Japanese books</li>
+          <li>Web Imports: You can now clip signed-in pages and import web novels that require an account, with more reliable text decoding</li>
+          <li>Styling: Your library and reader can now use separate theme modes and colors, and e-ink mode is available on every platform</li>
+          <li>PDF: You can lock horizontal panning while zoomed, highlights stay visible in dark mode, and PDFs work on older devices</li>
+          <li>Dictionary: Dictionary entries can now play embedded audio, jump to parts of speech, and enlarge images</li>
+          <li>Sharing: Nearby BookDrop now offers easier pairing, transfer sounds, and more reliable device discovery and reconnection</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.12.6" date="2026-08-29">
+      <description>
+        <ul>
+          <li>Audiobooks: Added Audiobookshelf support for streaming audiobooks and podcasts, and you can now pair an audiobook with its ebook to read along as it plays</li>
+          <li>Text-to-Speech: Added a lyric-style view that shows the sentences around the one being read, plus per-book offline voice downloads and steadier pauses between sentences</li>
+          <li>Library: You can now browse the web inside Readest to add books, choose which chapters to import from a web novel, hide covers for privacy, and watch download progress right on the shelf</li>
+          <li>Sharing: Added Nearby BookDrop to send and receive books between nearby devices over your local network, including KOReader devices</li>
+          <li>Reading: Added customizable keyboard and mouse shortcuts, Yomitan dictionary support, a full-screen book cover view, and right-to-left page order for comics and fixed-layout books</li>
+          <li>Reading: The Notebook is now a full writing workspace, where your notes save as you type, sync across devices, and link back to the passage they came from</li>
+          <li>Footnotes: Footnote popups no longer get cut off, let you select and look up text, and can jump straight to the note's place in the book</li>
+          <li>PDF: You can now select text across page boundaries, copy paragraphs without broken line breaks, and see the printed page numbers as reference pages</li>
+          <li>Sync: Your book groups and shelves now sync, file sync between devices settles reliably, highlights you delete in KOReader come across, and your progress survives an OPDS re-download</li>
+          <li>More: Fixed crashes on launch, garbled AZW3 books, the reading position drifting after rotating the screen, and unreadable highlights on e-ink screens</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.12.1" date="2026-08-08">
+      <description>
+        <ul>
+          <li>Text-to-Speech: Books that come with recorded narration now play their own audio in step with the text, and you can set the sleep timer to stop at the end of a chapter</li>
+          <li>Library: Added full text search across your books with fuzzy and nearby-word matching, importing web novels from a link, bulk downloading from the shelf, and page counts in book details</li>
+          <li>Annotations: Your notes and highlights now live in one hub, where you can export and import them as a file, copy a link back to any highlight, and write math formulas in your notes</li>
+          <li>Reading: You can now pull down to add a bookmark, tap the page label to jump to any page, tap the footer to bring up the progress bar, and turn pages with an Apple Pencil double tap or squeeze</li>
+          <li>Reading: Fixed layout books can now scroll horizontally, image descriptions show in the image viewer, search results group by chapter, and the mouse cursor gets out of the way while you read</li>
+          <li>Sync: Added iCloud sync on iPhone, iPad and Mac, plus a BookOrbit integration that keeps your annotations, bookmarks, stats and reading status in step</li>
+          <li>Translation: Translated text now keeps its bold, italic and other inline formatting, and the Azure and Yandex translators work again</li>
+          <li>Styling: Added Ambient Mode on Android, a refreshed theme and background picker with separate looks for your library and reader, and cleaner popups throughout</li>
+          <li>PDF: Sharper text on desktop and a readable footer in scrolled mode</li>
+          <li>More: Markdown books now pick up their title and author automatically and show every heading in the contents, plus fixes for some crashes</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.11.20" date="2026-07-20">
+      <description>
+        <ul>
+          <li>Text-to-Speech: Read-aloud voices can now be downloaded per book for offline listening, and adjustable pauses between sentences and paragraphs</li>
+          <li>Text-to-Speech: Added CarPlay support on iOS and more reliable Android Auto controls so you can listen while driving</li>
+          <li>Sync: Added OneDrive as a cloud provider, you can now sync to several providers at once</li>
+          <li>Reading: Added a right-edge swipe to change Auto Scroll speed, footnotes in Markdown books, and copying text now keeps its paragraph breaks</li>
+          <li>Reading: Smoother page-turn animations, steadier text selection on iOS, and a redesigned custom theme editor that stays readable on mobile</li>
+          <li>Annotations: You can now copy a highlight or note together with a deep link that jumps straight back to its spot in the book</li>
+          <li>Library: You can now sort and filter your shelf by time remaining, and the Recently Read shelf and widget show only books you're currently reading</li>
+          <li>PDF: Fixed a crash that could happen when turning pages or zooming large PDFs on iOS</li>
+          <li>More: Fixed OPDS catalogs disappearing after a restart, and improved 32-bit Android stability</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.11.18" date="2026-07-08">
+      <description>
+        <ul>
+          <li>Reading: Added Auto Scroll, a hands-free mode that scrolls the page for you at an adjustable pace, plus middle-click autoscroll on the desktop</li>
+          <li>Reading: Added slide and page-curl animations when turning pages for a more natural feel</li>
+          <li>Reading: Fixed page turning and the reading ruler for vertical right-to-left books, PDF text selection when system font scaling is on, and header/footer readability over light PDFs in dark mode</li>
+          <li>Text-to-Speech: Redesigned read-aloud as a mini player with an expandable full player, and playback now keeps going even after you close the book</li>
+          <li>Text-to-Speech: Online voices now play gap-free with chapter seeking and lock-screen controls, plus Android Auto support so you can listen in the car</li>
+          <li>Sync: Added S3-compatible cloud storage and a new Cloud Sync screen to choose and switch between your sync providers</li>
+          <li>Integrations: Added a Calibre plugin to push books and custom columns into Readest, and improved OPDS sign-in and auto-download for self-hosted catalogs</li>
+          <li>Library: New books dropped into watched folders now import automatically, and you can sort your shelf by reading progress</li>
+          <li>More: Added a speak button in the dictionary popup, a cleaner theme switcher, and per-rule toggles for proofreading</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.11.17" date="2026-06-29">
+      <description>
+        <ul>
+          <li>Sync: Added WebDAV and Google Drive sync for your books and reading data</li>
+          <li>Widgets: Added home-screen reading widgets on mobile so you can jump straight back into your book</li>
+          <li>Reading: You can now open and read Markdown(.md) files</li>
+          <li>Reading: You can select a word by double-clicking it, and search gained regex and nearby-words modes</li>
+          <li>Reading: Added a sticky progress bar with chapter markers, and keyboard shortcuts to fine-tune text selection</li>
+          <li>Library: Added a Recently Read shelf to quickly pick up where you left off, plus a separate background texture for your library</li>
+          <li>Text-to-Speech: Added offline voices on iOS, a setting to highlight by word or by sentence</li>
+          <li>PDF: Smoother pinch-zoom and panning, faster scrolling on mobile, and a new contrast option in the view menu</li>
+          <li>More: Customize the highlight toolbar across all books, filter exported annotations by color and style</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+
+  <developer id="com.readest">
+    <name>Readest Team</name>
+  </developer>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Readest main interface with annotation</caption>
+      <image type="source">https://raw.githubusercontent.com/readest/readest/refs/heads/main/data/screenshots/annotations.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Reading interface with dark mode</caption>
+      <image type="source">https://raw.githubusercontent.com/readest/readest/refs/heads/main/data/screenshots/dark_mode.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Reading with TTS speak out</caption>
+      <image type="source">https://raw.githubusercontent.com/readest/readest/refs/heads/main/data/screenshots/tts_speak_aloud.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Reading tools with Wikipedia integration</caption>
+      <image type="source">https://raw.githubusercontent.com/readest/readest/refs/heads/main/data/screenshots/wikipedia_vertical.png</image>
+    </screenshot>
+  </screenshots>
+
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-info">moderate</content_attribute>
+  </content_rating>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#d97706</color>
+    <color type="primary" scheme_preference="dark">#b45309</color>
+  </branding>
+</component>

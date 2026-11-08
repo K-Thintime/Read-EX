@@ -1,0 +1,524 @@
+// @vitest-environment node
+import { describe, test, expect, vi, beforeEach } from 'vitest';
+import type { FoliateView } from '@/types/view';
+import type { Insets } from '@/types/misc';
+import type { ViewSettings } from '@/types/book';
+
+vi.mock('@/store/bookDataStore', async () => {
+  const { create } = await import('zustand');
+  return {
+    useBookDataStore: create<{
+      booksData: Record<string, unknown>;
+      clearBookData: (keyOrId: string) => void;
+    }>((set) => ({
+      booksData: {},
+      clearBookData: (keyOrId: string) =>
+        set((state) => {
+          const booksData = { ...state.booksData };
+          delete booksData[keyOrId.split('-')[0]!];
+          return { booksData };
+        }),
+    })),
+  };
+});
+
+vi.mock('@/store/settingsStore', () => {
+  const { create } = require('zustand');
+  return {
+    useSettingsStore: create(() => ({
+      settings: {},
+    })),
+  };
+});
+
+vi.mock('@/store/libraryStore', () => {
+  const { create } = require('zustand');
+  return {
+    useLibraryStore: create(() => ({
+      library: [],
+      hashIndex: new Map(),
+      setLibrary: vi.fn(),
+      getBookByHash: vi.fn(),
+      updateBookProgress: vi.fn(),
+      rebuildHashIndex: vi.fn(),
+    })),
+  };
+});
+
+vi.mock('@/utils/misc', () => ({
+  uniqueId: vi.fn(() => 'mock-uid-123'),
+}));
+
+// These are transitive imports needed by readerStore
+vi.mock('@/services/nav', () => ({ updateToc: vi.fn() }));
+vi.mock('@/utils/book', () => ({
+  formatTitle: vi.fn((t: string) => t),
+  getMetadataHash: vi.fn(() => 'hash'),
+  getPrimaryLanguage: vi.fn(() => 'en'),
+}));
+vi.mock('@/utils/path', () => ({
+  getBaseFilename: vi.fn((n: string) => n),
+}));
+vi.mock('@/services/constants', () => ({
+  SUPPORTED_LANGNAMES: {},
+}));
+vi.mock('@/libs/document', () => ({
+  DocumentLoader: vi.fn(),
+}));
+vi.mock('@/services/opds/pseStream', () => ({
+  isPseStreamFileName: () => false,
+  openPseStreamBook: vi.fn(),
+  parsePseStreamFileName: vi.fn(),
+}));
+vi.mock('@/services/rss/feedBookUrl', () => ({
+  isFeedBookUrl: () => false,
+  parseFeedBookUrl: vi.fn(),
+}));
+vi.mock('@/services/rss/feedReader', () => ({
+  openFeedBookDoc: vi.fn(),
+}));
+
+import { useReaderStore } from '@/store/readerStore';
+import { useBookDataStore, type BookData } from '@/store/bookDataStore';
+import { useLibraryStore } from '@/store/libraryStore';
+import { uniqueId } from '@/utils/misc';
+
+/**
+ * Helper to seed a minimal ViewState in the store for a given key.
+ */
+function seedViewState(key: string, overrides: Record<string, unknown> = {}) {
+  useReaderStore.setState((state) => ({
+    viewStates: {
+      ...state.viewStates,
+      [key]: {
+        key,
+        view: null,
+        viewerKey: `${key}-viewer`,
+        isPrimary: true,
+        loading: false,
+        inited: false,
+        error: null,
+        ribbonVisible: false,
+        ttsEnabled: false,
+        autoScrollEnabled: false,
+        drawingEnabled: false,
+        syncing: false,
+        gridInsets: null,
+        previewMode: false,
+        viewSettings: null,
+        ...overrides,
+      },
+    },
+  }));
+}
+
+describe('readerStore', () => {
+  beforeEach(() => {
+    useReaderStore.setState({
+      viewStates: {},
+      bookKeys: [],
+      hoveredBookKey: null,
+    });
+    useBookDataStore.setState({ booksData: {} });
+  });
+
+  describe('initial state', () => {
+    test('has empty viewStates and bookKeys', () => {
+      const state = useReaderStore.getState();
+      expect(state.viewStates).toEqual({});
+      expect(state.bookKeys).toEqual([]);
+      expect(state.hoveredBookKey).toBeNull();
+    });
+  });
+
+  describe('setBookKeys', () => {
+    test('sets bookKeys array', () => {
+      useReaderStore.getState().setBookKeys(['book-1', 'book-2']);
+      expect(useReaderStore.getState().bookKeys).toEqual(['book-1', 'book-2']);
+    });
+
+    test('replaces existing bookKeys', () => {
+      useReaderStore.getState().setBookKeys(['a']);
+      useReaderStore.getState().setBookKeys(['b', 'c']);
+      expect(useReaderStore.getState().bookKeys).toEqual(['b', 'c']);
+    });
+  });
+
+  describe('setHoveredBookKey', () => {
+    test('sets hovered book key', () => {
+      useReaderStore.getState().setHoveredBookKey('book-1');
+      expect(useReaderStore.getState().hoveredBookKey).toBe('book-1');
+    });
+
+    test('can be set to null', () => {
+      useReaderStore.getState().setHoveredBookKey('book-1');
+      useReaderStore.getState().setHoveredBookKey(null);
+      expect(useReaderStore.getState().hoveredBookKey).toBeNull();
+    });
+  });
+
+  describe('getView / setView', () => {
+    test('getView returns null for missing key', () => {
+      expect(useReaderStore.getState().getView('nonexistent')).toBeNull();
+    });
+
+    test('getView returns null for null key', () => {
+      expect(useReaderStore.getState().getView(null)).toBeNull();
+    });
+
+    test('setView stores a view and getView retrieves it', () => {
+      const key = 'abc-0';
+      seedViewState(key);
+
+      const mockView = { tagName: 'FOLIATE-VIEW' } as unknown as FoliateView;
+      useReaderStore.getState().setView(key, mockView);
+
+      const retrieved = useReaderStore.getState().getView(key);
+      expect(retrieved).toBe(mockView);
+    });
+  });
+
+  describe('getViews', () => {
+    test('returns all views from viewStates', () => {
+      const view1 = { id: 'v1' } as unknown as FoliateView;
+      const view2 = { id: 'v2' } as unknown as FoliateView;
+      seedViewState('key1', { view: view1 });
+      seedViewState('key2', { view: view2 });
+
+      const views = useReaderStore.getState().getViews();
+      expect(views).toHaveLength(2);
+      expect(views).toContain(view1);
+      expect(views).toContain(view2);
+    });
+  });
+
+  describe('clearViewState', () => {
+    test('removes a view state by key', () => {
+      seedViewState('key-to-remove');
+      seedViewState('key-to-keep');
+
+      useReaderStore.getState().clearViewState('key-to-remove');
+      const state = useReaderStore.getState();
+      expect(state.viewStates['key-to-remove']).toBeUndefined();
+      expect(state.viewStates['key-to-keep']).toBeDefined();
+    });
+
+    test('does nothing when key does not exist', () => {
+      seedViewState('existing');
+      useReaderStore.getState().clearViewState('nonexistent');
+      expect(useReaderStore.getState().viewStates['existing']).toBeDefined();
+    });
+  });
+
+  describe('getViewState', () => {
+    test('returns null for missing key', () => {
+      expect(useReaderStore.getState().getViewState('missing')).toBeNull();
+    });
+
+    test('returns the view state for existing key', () => {
+      seedViewState('my-key');
+      const vs = useReaderStore.getState().getViewState('my-key');
+      expect(vs).not.toBeNull();
+      expect(vs!.key).toBe('my-key');
+    });
+  });
+
+  describe('setViewSettings / getViewSettings', () => {
+    test('getViewSettings returns null for missing key', () => {
+      expect(useReaderStore.getState().getViewSettings('missing')).toBeNull();
+    });
+
+    test('setViewSettings stores and getViewSettings retrieves settings', () => {
+      const key = 'bookid-0';
+      seedViewState(key, { isPrimary: false });
+
+      // setViewSettings requires bookData to exist for the book id
+      useBookDataStore.setState({
+        booksData: {
+          bookid: {
+            id: 'bookid',
+            book: null,
+            file: null,
+            config: { updatedAt: Date.now() },
+            bookDoc: null,
+            isFixedLayout: false,
+          },
+        },
+      });
+
+      const settings = { fontSize: 16 } as unknown as ViewSettings;
+      useReaderStore.getState().setViewSettings(key, settings);
+
+      const retrieved = useReaderStore.getState().getViewSettings(key);
+      expect(retrieved).toEqual(settings);
+    });
+
+    test('keeps the sidebar tab chosen in the book config when a primary view saves settings', () => {
+      const key = 'bookid-0';
+      const live = { sideBarTab: 'toc', ttsLocation: 'cfi-1' } as unknown as ViewSettings;
+      seedViewState(key, { viewSettings: live });
+      const bookData = (sideBarTab: string) => ({
+        bookid: {
+          id: 'bookid',
+          book: null,
+          file: null,
+          config: { updatedAt: Date.now(), viewSettings: { ...live, sideBarTab } },
+          bookDoc: null,
+          isFixedLayout: false,
+        } as BookData,
+      });
+      useBookDataStore.setState({ booksData: bookData('toc') });
+
+      // The sidebar writes its tab to the book config only (#6836)...
+      useBookDataStore.setState({ booksData: bookData('annotations') });
+      // ...then Read Aloud saves the next sentence through the live settings.
+      useReaderStore.getState().setViewSettings(key, { ...live, ttsLocation: 'cfi-2' });
+
+      const saved = useBookDataStore.getState().booksData['bookid']!.config!.viewSettings!;
+      expect(saved.sideBarTab).toBe('annotations');
+      expect(saved.ttsLocation).toBe('cfi-2');
+    });
+
+    test('setViewSettings does nothing for empty key', () => {
+      useReaderStore.getState().setViewSettings('', { fontSize: 16 } as unknown as ViewSettings);
+      // Should not throw or create new state
+      expect(Object.keys(useReaderStore.getState().viewStates)).toHaveLength(0);
+    });
+  });
+
+  describe('setBookmarkRibbonVisibility', () => {
+    test('sets ribbonVisible on view state', () => {
+      seedViewState('book-1');
+      useReaderStore.getState().setBookmarkRibbonVisibility('book-1', true);
+      expect(useReaderStore.getState().viewStates['book-1']!.ribbonVisible).toBe(true);
+
+      useReaderStore.getState().setBookmarkRibbonVisibility('book-1', false);
+      expect(useReaderStore.getState().viewStates['book-1']!.ribbonVisible).toBe(false);
+    });
+  });
+
+  describe('setTTSEnabled', () => {
+    test('sets ttsEnabled on view state', () => {
+      seedViewState('book-1');
+      useReaderStore.getState().setTTSEnabled('book-1', true);
+      expect(useReaderStore.getState().viewStates['book-1']!.ttsEnabled).toBe(true);
+
+      useReaderStore.getState().setTTSEnabled('book-1', false);
+      expect(useReaderStore.getState().viewStates['book-1']!.ttsEnabled).toBe(false);
+    });
+  });
+
+  describe('setIsLoading', () => {
+    test('sets loading on view state', () => {
+      seedViewState('book-1');
+      useReaderStore.getState().setIsLoading('book-1', true);
+      expect(useReaderStore.getState().viewStates['book-1']!.loading).toBe(true);
+
+      useReaderStore.getState().setIsLoading('book-1', false);
+      expect(useReaderStore.getState().viewStates['book-1']!.loading).toBe(false);
+    });
+  });
+
+  describe('setIsSyncing', () => {
+    test('sets syncing on view state', () => {
+      seedViewState('book-1');
+      useReaderStore.getState().setIsSyncing('book-1', true);
+      expect(useReaderStore.getState().viewStates['book-1']!.syncing).toBe(true);
+
+      useReaderStore.getState().setIsSyncing('book-1', false);
+      expect(useReaderStore.getState().viewStates['book-1']!.syncing).toBe(false);
+    });
+  });
+
+  describe('getGridInsets / setGridInsets', () => {
+    test('getGridInsets returns default insets for missing key', () => {
+      const insets = useReaderStore.getState().getGridInsets('missing');
+      expect(insets).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+    });
+
+    test('setGridInsets stores and getGridInsets retrieves insets', () => {
+      seedViewState('book-1');
+      const insets: Insets = { top: 10, right: 5, bottom: 20, left: 5 };
+      useReaderStore.getState().setGridInsets('book-1', insets);
+      expect(useReaderStore.getState().getGridInsets('book-1')).toEqual(insets);
+    });
+
+    test('setGridInsets can set null', () => {
+      seedViewState('book-1');
+      useReaderStore.getState().setGridInsets('book-1', { top: 1, right: 2, bottom: 3, left: 4 });
+      useReaderStore.getState().setGridInsets('book-1', null);
+      // getGridInsets falls back to default when gridInsets is null
+      expect(useReaderStore.getState().getGridInsets('book-1')).toEqual({
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+      });
+    });
+  });
+
+  describe('setViewInited', () => {
+    test('sets inited on view state', () => {
+      seedViewState('book-1');
+      useReaderStore.getState().setViewInited('book-1', true);
+      expect(useReaderStore.getState().viewStates['book-1']!.inited).toBe(true);
+
+      useReaderStore.getState().setViewInited('book-1', false);
+      expect(useReaderStore.getState().viewStates['book-1']!.inited).toBe(false);
+    });
+  });
+
+  describe('recreateViewer', () => {
+    test.each(['', 'closed-book'])('does not reload a missing viewer (%s)', (key) => {
+      const initViewState = vi.fn().mockResolvedValue(undefined);
+      const original = useReaderStore.getState().initViewState;
+      useReaderStore.setState({ initViewState });
+      try {
+        useReaderStore.getState().recreateViewer({} as never, key);
+        expect(initViewState).not.toHaveBeenCalled();
+      } finally {
+        useReaderStore.setState({ initViewState: original });
+      }
+    });
+
+    test.each([
+      { key: '', loading: true, error: null },
+      { key: '', loading: false, error: 'Failed to load book.' },
+      { key: 'another-book', loading: false, error: null },
+    ])('does not reload an invalid stored view: %j', (viewState) => {
+      seedViewState('book-1', viewState);
+      const initViewState = vi.fn().mockResolvedValue(undefined);
+      const original = useReaderStore.getState().initViewState;
+      useReaderStore.setState({ initViewState });
+      try {
+        useReaderStore.getState().recreateViewer({} as never, 'book-1');
+        expect(initViewState).not.toHaveBeenCalled();
+      } finally {
+        useReaderStore.setState({ initViewState: original });
+      }
+    });
+
+    // Regression test for #5277: `initViewState` already mints a fresh
+    // viewerKey, so minting a second one here remounted <FoliateViewer> twice.
+    // The abandoned first mount kept opening the same bookDoc and left an extra
+    // `data` transform listener on its shared loader, so every stylesheet was
+    // transformed twice and the book's fonts were replaced by the app's.
+    test('mints a single viewerKey so the viewer mounts only once', async () => {
+      seedViewState('book-1', { viewerKey: 'book-1-uid-0' });
+
+      let counter = 0;
+      const uniqueIdMock = vi.mocked(uniqueId);
+      uniqueIdMock.mockImplementation(() => `uid-${++counter}`);
+
+      // Stand in for the real initViewState, which reloads the book and ends by
+      // assigning a fresh viewerKey of its own.
+      const initViewState = vi.fn(async (_envConfig: unknown, _id: string, key: string) => {
+        useReaderStore.setState((state) => ({
+          viewStates: {
+            ...state.viewStates,
+            [key]: { ...state.viewStates[key]!, viewerKey: `${key}-${uniqueId()}` },
+          },
+        }));
+      });
+      useReaderStore.setState({
+        initViewState: initViewState as unknown as ReturnType<
+          typeof useReaderStore.getState
+        >['initViewState'],
+      });
+
+      const mountedKeys: string[] = [];
+      const unsubscribe = useReaderStore.subscribe((state) => {
+        const viewerKey = state.viewStates['book-1']?.viewerKey;
+        if (viewerKey && mountedKeys.at(-1) !== viewerKey) mountedKeys.push(viewerKey);
+      });
+
+      useReaderStore.getState().recreateViewer({} as never, 'book-1');
+      await vi.waitFor(() => expect(initViewState).toHaveBeenCalled());
+      await Promise.resolve();
+      await Promise.resolve();
+      unsubscribe();
+
+      expect(mountedKeys).toEqual(['book-1-uid-1']);
+      uniqueIdMock.mockImplementation(() => 'mock-uid-123');
+    });
+  });
+});
+
+describe('clearViewState and the streamed ABS ebook cache', () => {
+  const absEbook = { format: 'ABS', metadata: { absMediaType: 'ebook' } };
+  const epub = { format: 'EPUB' };
+
+  beforeEach(() => {
+    useReaderStore.setState({ viewStates: {}, bookKeys: [], hoveredBookKey: null });
+    const cached = { bookDoc: {} } as unknown as BookData;
+    useBookDataStore.setState({ booksData: { abc: cached, def: cached } });
+  });
+
+  test('drops the cached book data of an ABS ebook when its last view closes', () => {
+    vi.mocked(useLibraryStore.getState().getBookByHash).mockReturnValue(absEbook as never);
+    seedViewState('abc-view1');
+
+    useReaderStore.getState().clearViewState('abc-view1');
+
+    expect(useBookDataStore.getState().booksData['abc']).toBeUndefined();
+    expect(useBookDataStore.getState().booksData['def']).toBeDefined();
+  });
+
+  test('keeps the cache while another view of the same ABS ebook is still open', () => {
+    vi.mocked(useLibraryStore.getState().getBookByHash).mockReturnValue(absEbook as never);
+    seedViewState('abc-view1');
+    seedViewState('abc-view2');
+
+    useReaderStore.getState().clearViewState('abc-view1');
+
+    expect(useBookDataStore.getState().booksData['abc']).toBeDefined();
+  });
+
+  test('keeps the cache of a local book so a reopen stays instant', () => {
+    vi.mocked(useLibraryStore.getState().getBookByHash).mockReturnValue(epub as never);
+    seedViewState('abc-view1');
+
+    useReaderStore.getState().clearViewState('abc-view1');
+
+    expect(useBookDataStore.getState().booksData['abc']).toBeDefined();
+  });
+});
+
+describe('areBooksOpen', () => {
+  beforeEach(() => {
+    useReaderStore.setState({ viewStates: {}, bookKeys: [], hoveredBookKey: null });
+  });
+
+  test('is true when the requested books are still open (back from the account page)', () => {
+    seedViewState('abc-view1');
+    seedViewState('def-view2');
+    useReaderStore.setState({ bookKeys: ['abc-view1', 'def-view2'] });
+
+    expect(useReaderStore.getState().areBooksOpen(['abc', 'def'])).toBe(true);
+  });
+
+  test('is false for other books', () => {
+    seedViewState('abc-view1');
+    useReaderStore.setState({ bookKeys: ['abc-view1'] });
+
+    expect(useReaderStore.getState().areBooksOpen(['def'])).toBe(false);
+    expect(useReaderStore.getState().areBooksOpen(['abc', 'def'])).toBe(false);
+  });
+
+  test('is false once the books were closed, though their keys remain', () => {
+    useReaderStore.setState({ bookKeys: ['abc-view1'] });
+
+    expect(useReaderStore.getState().areBooksOpen(['abc'])).toBe(false);
+  });
+
+  test('is false for a book that failed to load, so it is retried', () => {
+    seedViewState('abc-view1', { error: 'Failed to load book.' });
+    useReaderStore.setState({ bookKeys: ['abc-view1'] });
+
+    expect(useReaderStore.getState().areBooksOpen(['abc'])).toBe(false);
+  });
+
+  test('is false with nothing open', () => {
+    expect(useReaderStore.getState().areBooksOpen([])).toBe(false);
+  });
+});
