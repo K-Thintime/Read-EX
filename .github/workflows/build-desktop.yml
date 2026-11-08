@@ -29,6 +29,10 @@ on:
         description: 'Publish the release as a draft'
         type: boolean
         default: true
+      targets:
+        description: 'Which platforms to build (comma separated: desktop,android)'
+        type: string
+        default: 'desktop,android'
   push:
     tags:
       - 'v*'
@@ -43,6 +47,10 @@ concurrency:
 jobs:
   desktop:
     name: ${{ matrix.artifact }}
+    # A tag always builds everything; a manual run can be narrowed with the
+    # `targets` input so a change that only touches Android does not drag the
+    # 45-minute desktop matrix along with it.
+    if: github.event_name == 'push' || contains(inputs.targets, 'desktop')
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +232,7 @@ jobs:
     name: read-ex-android
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    if: github.event_name == 'push' || contains(inputs.targets, 'android')
 
     steps:
       - uses: actions/checkout@v4
@@ -306,21 +315,40 @@ jobs:
         working-directory: apps/readest-app
         run: pnpm tauri android init --ci
 
-      # Two fixes to the generated tree, both idempotent - see the script header
+      # The release APK has to be signed, and Android refuses to install an
+      # update signed by a different key, so the keystore is minted once and
+      # kept in a repository secret from then on.
+      - name: Decode release keystore
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is unset - the release APK will be unsigned and cannot be installed."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d \
+            > apps/readest-app/src-tauri/gen/android/app/readex.p12
+          ls -l apps/readest-app/src-tauri/gen/android/app/readex.p12
+
+      # Three fixes to the generated tree, all idempotent - see the script header
       # for why each is needed:
       #   - Gradle distribution -> Tencent mirror (services.gradle.org times out)
       #   - missingDimensionStrategy for the plugin's store/pen flavour dimensions
+      #   - a signingConfigs block, without which assembleRelease is unsigned
       - name: Patch generated Android project
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: node scripts/patch-android-project.mjs
 
-      # --debug: the release variant demands a signing config that only exists
-      # once real distribution keys do. A debug-signed APK installs and runs the
-      # production frontend bundle, which is what matters for a first release.
+      # --release, not --debug. Rust's debug profile leaves libreadestlib.so
+      # unstripped and the resulting APK was 659 MB; Gradle strips native
+      # libraries for the release variant, which brings it back to a sane size.
       # No --apk flag in tauri 2: APK output is the default. aarch64 covers
       # every phone shipped in the last decade; armv7 can be added later.
       - name: Build APK
         working-directory: apps/readest-app
-        run: pnpm tauri android build --debug --target aarch64
+        run: pnpm tauri android build --release --target aarch64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
