@@ -18,6 +18,13 @@
 
     <uses-permission android:name="com.ichi2.anki.permission.READ_WRITE_DATABASE" />
 
+    <!-- Required for install_package: without this declaration Android 8+
+         refuses every APK install intent and never shows the "install unknown
+         apps" grant dialog, so the in-app updater fails with a bare
+         SecurityException / ActivityNotFound. Library manifests are merged
+         into the app manifest by Gradle, so declaring it here is enough. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application>
         <!-- Receives the EXTRA_CHOSEN_COMPONENT callback from the
              browser-excluding dictionary chooser so the user's pick is
