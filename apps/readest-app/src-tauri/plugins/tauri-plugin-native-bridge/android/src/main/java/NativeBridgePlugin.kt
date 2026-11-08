@@ -833,18 +833,46 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
                 try {
                     val file = File(args.path ?: "")
                     if (file.exists()) {
-                        val intent = Intent(Intent.ACTION_VIEW)
-                        val apkUri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
-                        intent.setDataAndType(apkUri, "application/vnd.android.package-archive")
-                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                        val packageManager = activity.packageManager
-                        val resolveInfos = packageManager.queryIntentActivities(intent, 0)
-                        for (resolveInfo in resolveInfos) {
-                            val packageName = resolveInfo.activityInfo.packageName
-                            activity.grantUriPermission(packageName, apkUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        // Android 8+ gates sideloading behind the per-app
+                        // "Install unknown apps" grant, which only exists when
+                        // REQUEST_INSTALL_PACKAGES is declared AND the user
+                        // flipped the switch. Without the grant startActivity
+                        // is refused silently on most ROMs, so detect it here:
+                        // send the user to the grant page once and report a
+                        // clear failure to retry after granting.
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                            !activity.packageManager.canRequestPackageInstalls()
+                        ) {
+                            try {
+                                val settingsIntent = Intent(
+                                    android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                    android.net.Uri.parse("package:${activity.packageName}"),
+                                )
+                                settingsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                withContext(Dispatchers.Main) { activity.startActivity(settingsIntent) }
+                            } catch (_: Exception) {
+                                // Some ROMs lack the exact settings action; the
+                                // failure below still tells the user what to do.
+                            }
+                            r.put("success", false)
+                            r.put(
+                                "error",
+                                "Install permission not granted. Allow 'Install unknown apps' for this app in system settings, then retry the update.",
+                            )
+                        } else {
+                            val intent = Intent(Intent.ACTION_VIEW)
+                            val apkUri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
+                            intent.setDataAndType(apkUri, "application/vnd.android.package-archive")
+                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                            val packageManager = activity.packageManager
+                            val resolveInfos = packageManager.queryIntentActivities(intent, 0)
+                            for (resolveInfo in resolveInfos) {
+                                val packageName = resolveInfo.activityInfo.packageName
+                                activity.grantUriPermission(packageName, apkUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            withContext(Dispatchers.Main) { activity.startActivity(intent) }
+                            r.put("success", true)
                         }
-                        withContext(Dispatchers.Main) { activity.startActivity(intent) }
-                        r.put("success", true)
                     } else {
                         r.put("success", false)
                         r.put("error", "File does not exist")
