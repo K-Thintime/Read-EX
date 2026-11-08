@@ -270,6 +270,48 @@ fn get_executable_dir() -> String {
         .unwrap_or_default()
 }
 
+/// Windows portable self-update handover.
+///
+/// The naive "spawn the downloaded exe, then exit" swap kills BOTH processes on
+/// this fork: `tauri_plugin_single_instance` is active on Windows, so the child
+/// detects the still-running parent, forwards argv to it and exits before the
+/// parent's exit(0) lands. The user is left with a downloaded exe and a dead
+/// app — no replacement, no restart.
+///
+/// This command hands the swap to a detached `cmd` relay instead. The relay
+/// waits long enough for the parent to die, renames the running exe out of the
+/// way (renaming a running image is legal on Windows, deleting is not), renames
+/// the downloaded build INTO the old exe's path — so shortcuts and pinned
+/// taskbar entries keep pointing at a stable name — launches it and deletes the
+/// backup. The parent process exits right after invoking this.
+#[cfg(windows)]
+#[tauri::command]
+fn windows_self_update(new_exe_path: String) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let old = std::env::current_exe().map_err(|e| e.to_string())?;
+    let old_str = old.to_string_lossy().to_string();
+    let bak_str = format!("{}.bak", old_str);
+    // `ping -n 3` is the classic headless delay (~2s): `timeout` wants a
+    // console and fails under DETACHED_PROCESS. The parent calls exit(0)
+    // immediately after this command returns, so the old image is gone long
+    // before the moves run.
+    let cmdline = format!(
+        "ping -n 3 127.0.0.1 >nul & move /y \"{old}\" \"{bak}\" & move /y \"{new}\" \"{old}\" & start \"\" \"{old}\" & del /f /q \"{bak}\"",
+        old = old_str,
+        bak = bak_str,
+        new = new_exe_path,
+    );
+    std::process::Command::new("cmd")
+        .args(["/C", &cmdline])
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Logical size of the main window the first time the app runs. Later launches
 /// restore whatever the user left behind (`tauri_plugin_window_state`), so this
 /// is a starting point, not a preference. macOS has always opened at this size;
@@ -664,6 +706,8 @@ pub fn run() {
             upload_file,
             get_environment_variable,
             get_executable_dir,
+            #[cfg(windows)]
+            windows_self_update,
             #[cfg(desktop)]
             file_reveal::reveal_item_in_dir,
             set_webview_info,
