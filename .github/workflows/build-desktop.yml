@@ -44,7 +44,7 @@ jobs:
             base-args: '--target x86_64-pc-windows-msvc --bundles nsis'
           - os: macos-latest
             artifact: read-ex-macos-universal
-            base-args: '--target universal-apple-darwin --config src-tauri/tauri.macos-nonestore.conf.json'
+            base-args: '--target universal-apple-darwin'
           - os: ubuntu-22.04
             artifact: read-ex-linux-x64
             base-args: '--bundles appimage,deb'
@@ -124,20 +124,29 @@ jobs:
             echo "::warning::vars.MICROSOFT_CLIENT_ID is unset - the OneDrive row will be disabled in this build. See FORK.md."
           fi
 
-      # Updater artifacts are only produced when a signing key exists: with
-      # createUpdaterArtifacts on and no key, tauri build hard-fails.
-      - name: Resolve tauri arguments
-        id: tauri-args
+      # createUpdaterArtifacts is on in tauri.conf.json (the updater chain needs
+      # it), but `tauri build` hard-fails when it cannot find a signing key. Flip
+      # it off in-tree for keyless builds instead of passing --config: tauri-action
+      # resolves --config against the repo root while tauri resolves it against
+      # projectPath, so any relative path fails one of the two.
+      - name: Guard updater artifacts
         shell: bash
+        working-directory: apps/readest-app
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          args="${{ matrix.base-args }}"
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
-            args="$args --config src-tauri/tauri.updater.conf.json"
-            echo "Updater artifacts: enabled (signing key present)."
-          else
-            echo "Updater artifacts: skipped (no signing key) - installers still build."
+          if [ -n "$SIGNING_KEY" ]; then
+            echo "Signing key present - updater artifacts (.sig) will be produced."
+            exit 0
           fi
-          echo "args=$args" >> "$GITHUB_OUTPUT"
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            j.bundle.createUpdaterArtifacts = false;
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+          "
+          echo "::warning::TAURI_SIGNING_PRIVATE_KEY is unset - building installers without updater artifacts."
 
       - name: Build and publish draft release
         if: startsWith(github.ref, 'refs/tags/')
@@ -169,7 +178,7 @@ jobs:
             Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
           releaseDraft: ${{ github.event_name == 'push' && true || inputs.draft }}
           prerelease: false
-          args: ${{ steps.tauri-args.outputs.args }}
+          args: ${{ matrix.base-args }}
 
       - name: Build only
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -186,7 +195,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: apps/readest-app
-          args: ${{ steps.tauri-args.outputs.args }}
+          args: ${{ matrix.base-args }}
 
       - name: Upload installers
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
