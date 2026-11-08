@@ -53,13 +53,21 @@ interface FileSyncFormProps {
  */
 const formatSyncError = (_: TranslationFunc, e: unknown): string => {
   if (e instanceof FileSyncError) {
+    // The underlying message carries the server's own reason (`OpenList login
+    // failed: ...`, an HTTP status, ...). Keeping it turns "authentication
+    // failed" into something a user - or a bug report - can act on.
+    const detail = e.message.trim();
     switch (e.code) {
       case 'AUTH_FAILED':
-        return _('Authentication failed. Reconnect in Settings.');
+        return detail
+          ? `${_('Authentication failed. Reconnect in Settings.')} (${detail})`
+          : _('Authentication failed. Reconnect in Settings.');
       case 'NOT_FOUND':
-        return _('Remote resource not found');
+        return detail
+          ? `${_('Remote resource not found')} (${detail})`
+          : _('Remote resource not found');
       case 'NETWORK':
-        return _('Network error');
+        return detail ? `${_('Network error')} (${detail})` : _('Network error');
     }
     if (typeof e.status === 'number') {
       return _('Sync failed (status {{status}})', { status: e.status });
