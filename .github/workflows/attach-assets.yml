@@ -29,6 +29,11 @@ on:
         required: false
         default: false
         type: boolean
+      min_installers:
+        description: 'Abort unless at least this many installers were collected (a single-platform run passes 1)'
+        required: false
+        default: '3'
+        type: string
 
 permissions:
   contents: write
@@ -55,6 +60,7 @@ jobs:
         env:
           TAG: ${{ inputs.tag }}
           INCLUDE_MACOS: ${{ inputs.include_macos }}
+          MIN_INSTALLERS: ${{ inputs.min_installers }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -78,7 +84,10 @@ jobs:
           ls -lh artifacts
           n=$(find artifacts -type f ! -name '*.sig' | wc -l)
           echo "installers: $n"
-          [ "$n" -ge 3 ] || { echo "::error::expected at least 3 installers, got $n"; exit 1; }
+          [ "$n" -ge "${MIN_INSTALLERS}" ] || {
+            echo "::error::expected at least ${MIN_INSTALLERS} installers, got $n"
+            exit 1
+          }
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
