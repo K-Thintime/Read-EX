@@ -95,25 +95,37 @@ if (gradle.includes(strategies[0])) {
 // itself carries no secret.
 const SIGNING_BLOCK = `
 // --- Read-EX release signing (added by scripts/patch-android-project.mjs) ---
-val readexKeystoreProps = rootProject.file("keystore.properties")
-val readexSigning = java.util.Properties()
-if (readexKeystoreProps.exists()) {
-    readexKeystoreProps.inputStream().use { readexSigning.load(it) }
+// No java.util.Properties here: inside a Gradle .kts script the implicit
+// receiver is Project, so the leading `java` in \`java.util.Properties\`
+// resolves to the java extension and the script fails to compile with
+// "Unresolved reference: util". Parsing two keys by hand is the cheap way out.
+val readexPropsFile = rootProject.file("keystore.properties")
+val readexSigning = mutableMapOf<String, String>()
+if (readexPropsFile.exists()) {
+    readexPropsFile.readLines().forEach { line ->
+        val sep = line.indexOf('=')
+        if (sep > 0) {
+            readexSigning[line.substring(0, sep).trim()] = line.substring(sep + 1).trim()
+        }
+    }
 }
+val readexKeystoreFile = rootProject.file(
+    "app/" + (readexSigning["storeFile"] ?: "readex.p12")
+)
 android {
     signingConfigs {
-        if (readexKeystoreProps.exists()) {
+        if (readexSigning.isNotEmpty()) {
             create("readex") {
-                storeFile = file(readexSigning.getProperty("storeFile"))
-                storePassword = readexSigning.getProperty("password")
-                keyAlias = readexSigning.getProperty("keyAlias")
-                keyPassword = readexSigning.getProperty("password")
+                storeFile = readexKeystoreFile
+                storePassword = readexSigning["password"]
+                keyAlias = readexSigning["keyAlias"]
+                keyPassword = readexSigning["password"]
             }
         }
     }
     buildTypes {
         getByName("release") {
-            if (readexKeystoreProps.exists()) {
+            if (readexSigning.isNotEmpty()) {
                 signingConfig = signingConfigs.getByName("readex")
             }
         }
