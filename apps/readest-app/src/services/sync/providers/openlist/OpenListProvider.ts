@@ -105,7 +105,13 @@ class OpenListProviderImpl {
   }
 
   async list(path: string): Promise<FileEntry[]> {
-    const content = await this.client.call<OpenListEntry[] | null>('fs/list', {
+    // Real servers wrap the array: `data: { content: [...], total, write, ... }`.
+    // Older code paths (and some AList forks) have been seen returning the bare
+    // array, so both shapes are accepted — assuming either one alone turns an
+    // ordinary listing into "e.map is not a function".
+    const data = await this.client.call<
+      { content?: OpenListEntry[] | null } | OpenListEntry[] | null
+    >('fs/list', {
       path,
       password: '',
       page: 1,
@@ -113,8 +119,9 @@ class OpenListProviderImpl {
       per_page: 0,
       refresh: false,
     });
+    const content = Array.isArray(data) ? data : data?.content;
     // An empty directory comes back as `content: null`, not `[]`.
-    if (!content) return [];
+    if (!Array.isArray(content)) return [];
     return content.map((entry) => ({
       name: entry.name,
       path: joinPath(path, entry.name),

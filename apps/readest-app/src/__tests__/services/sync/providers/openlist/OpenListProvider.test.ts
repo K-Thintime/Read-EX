@@ -76,7 +76,12 @@ const makeWire = () => {
 
     if (url.includes('/api/fs/list')) {
       if (mode === 'absent') return json({ code: 500, message: 'object not found' });
-      return json({ code: 200, message: 'success', data: listing.length ? listing : null });
+      // Real servers wrap the array in `{ content, total, ... }`.
+      return json({
+        code: 200,
+        message: 'success',
+        data: { content: listing.length ? listing : null },
+      });
     }
 
     if (url.includes('/api/fs/mkdir') || url.includes('/api/fs/remove')) {
@@ -194,6 +199,38 @@ describe('OpenListProvider — read/head mapping', () => {
     const { provider } = build();
     expect(await provider.list('/onedrive/Readest/Readest/books')).toEqual([]);
   });
+
+  test('list reads the real { content } envelope shape', async () => {
+    // Regression: the wire used to mock `data` as a bare array, which passed
+    // every test while the real server answered `data: { content: [...] }` -
+    // the provider then called .map on an object ("e.map is not a function").
+    const { wire, provider } = build();
+    wire.setListing([{ name: 'books', size: 0, is_dir: true, modified: '2026-01-01T00:00:00Z' }]);
+    const entries = await provider.list('/onedrive/Readest/Readest');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.name).toBe('books');
+  });
+
+  test('list tolerates a bare-array data shape (older forks)', async () => {
+    const wire = makeWire();
+    const fetchBareArray = async (input: string, init?: RequestInit) => {
+      if (String(input).endsWith('/api/fs/list')) {
+        return new Response(
+          JSON.stringify({
+            code: 200,
+            message: 'success',
+            data: [{ name: 'books', size: 0, is_dir: true }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return wire.fetchFn(input, init);
+    };
+    const p = createOpenListProvider(config, fetchBareArray);
+    const entries = await p.list('/onedrive/Readest/Readest');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.isDirectory).toBe(true);
+  });
 });
 
 describe('OpenListProvider — auth handling', () => {
@@ -273,7 +310,7 @@ describe('OpenListProvider — writes and directories', () => {
           JSON.stringify({
             code: 200,
             message: 'success',
-            data: children.length ? children : null,
+            data: { content: children.length ? children : null },
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         );
