@@ -59,6 +59,8 @@ vi.mock('@/services/constants', () => ({
   READEST_UPDATER_FILE: 'https://example.com/latest.json',
   READEST_CHANGELOG_FILE: 'https://example.com/release-notes.json',
   READEST_NIGHTLY_UPDATER_FILE: 'https://example.com/nightly/latest.json',
+  READEST_LATEST_RELEASE_API: 'https://api.example.com/latest-release',
+  READEST_RELEASE_PAGE: 'https://example.com/releases',
 }));
 
 import {
@@ -68,6 +70,11 @@ import {
   getLastShownReleaseNotesVersion,
   resolveNightlyUpdate,
   getNightlyPlatformKey,
+  getIgnoredUpdateVersion,
+  setIgnoredUpdateVersion,
+  clearIgnoredUpdateVersion,
+  isUpdateIgnored,
+  __resetUpdateCheckForTests,
 } from '@/helpers/updater';
 import {
   buildNightlyManifest,
@@ -78,6 +85,7 @@ import {
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
+  __resetUpdateCheckForTests();
   mockIsTauriAppPlatform = false;
   mockAppVersion = '1.0.0';
   MockWebviewWindowLastArgs.length = 0;
@@ -112,22 +120,47 @@ describe('updater', () => {
     });
   });
 
+  // ── ignored versions ───────────────────────────────────────────
+  describe('ignored update versions', () => {
+    test('nothing is ignored by default', () => {
+      expect(getIgnoredUpdateVersion()).toBe('');
+      expect(isUpdateIgnored('2.0.0')).toBe(false);
+    });
+
+    test('skipping 2.0.0 suppresses 2.0.0 only', () => {
+      setIgnoredUpdateVersion('2.0.0');
+      expect(isUpdateIgnored('2.0.0')).toBe(true);
+      // A newer release has to prompt again - skipping once must not mute the
+      // channel forever.
+      expect(isUpdateIgnored('2.0.1')).toBe(false);
+      expect(isUpdateIgnored('1.9.0')).toBe(false);
+    });
+
+    test('clearing brings the prompt back', () => {
+      setIgnoredUpdateVersion('2.0.0');
+      clearIgnoredUpdateVersion();
+      expect(getIgnoredUpdateVersion()).toBe('');
+      expect(isUpdateIgnored('2.0.0')).toBe(false);
+    });
+
+    test('an ignored version is not offered by the launch check', async () => {
+      setIgnoredUpdateVersion('2.0.0');
+      mockOsType.mockReturnValue('macos');
+      mockCheck.mockResolvedValue({ version: '2.0.0' });
+
+      const result = await checkForAppUpdates(dummyTranslate, true);
+
+      expect(result).toBe(false);
+      expect(MockWebviewWindowLastArgs).toHaveLength(0);
+    });
+  });
+
   // ── checkForAppUpdates ─────────────────────────────────────────
   describe('checkForAppUpdates', () => {
-    test('skips check when auto-check and interval has not elapsed', async () => {
-      const now = Date.now();
-      localStorage.setItem('lastAppUpdateCheck', now.toString());
-
-      const result = await checkForAppUpdates(dummyTranslate, true);
-
-      expect(result).toBe(false);
-      expect(mockCheck).not.toHaveBeenCalled();
-    });
-
-    test('proceeds with check when interval has elapsed', async () => {
-      const pastTime = Date.now() - 86400 * 1000 - 1000;
-      localStorage.setItem('lastAppUpdateCheck', pastTime.toString());
-
+    test('auto check runs on every launch, whatever the stored timestamp says', async () => {
+      // The old throttle keyed off this timestamp, so relaunching on the same
+      // day was a no-op even when a release had just gone out.
+      localStorage.setItem('lastAppUpdateCheck', Date.now().toString());
       mockOsType.mockReturnValue('macos');
       mockCheck.mockResolvedValue(null);
 
@@ -137,14 +170,14 @@ describe('updater', () => {
       expect(mockCheck).toHaveBeenCalled();
     });
 
-    test('proceeds when no previous check timestamp', async () => {
+    test('checks once per launch even when two pages mount', async () => {
       mockOsType.mockReturnValue('macos');
       mockCheck.mockResolvedValue(null);
 
-      const result = await checkForAppUpdates(dummyTranslate, true);
+      await checkForAppUpdates(dummyTranslate, true);
+      await checkForAppUpdates(dummyTranslate, true);
 
-      expect(result).toBe(false);
-      expect(mockCheck).toHaveBeenCalled();
+      expect(mockCheck).toHaveBeenCalledTimes(1);
     });
 
     test('always checks when isAutoCheck is false', async () => {

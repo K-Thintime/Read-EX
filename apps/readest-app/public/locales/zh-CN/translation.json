@@ -2769,5 +2769,10 @@
   "Could not download {{count}} books:": "有 {{count}} 本下载失败：",
   "Turn on a cloud storage backend first": "请先启用一个网盘后端",
   "The library is still loading, try again in a moment": "书库还在加载，请稍后再试",
-  "Directory not found": "目录不存在"
+  "Directory not found": "目录不存在",
+  "Skip This Version": "跳过此版本",
+  "OPEN DOWNLOAD PAGE": "打开下载页",
+  "Skipped Version": "已跳过的版本",
+  "Version {{version}} will not be offered again": "不再提示 {{version}} 这个版本",
+  "Notify Me Again": "恢复提示"
 }

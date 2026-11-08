@@ -9,13 +9,68 @@ import { setUpdaterWindowVisible } from '@/components/UpdaterWindow';
 import { isTauriAppPlatform } from '@/services/environment';
 import { getAppVersion, isUpdateNewer } from '@/utils/version';
 import {
-  CHECK_UPDATE_INTERVAL_SEC,
   READEST_CHANGELOG_FILE,
-  READEST_UPDATER_FILE,
+  READEST_LATEST_RELEASE_API,
   READEST_NIGHTLY_UPDATER_FILE,
+  READEST_RELEASE_PAGE,
+  READEST_UPDATER_FILE,
 } from '@/services/constants';
 
 const LAST_CHECK_KEY = 'lastAppUpdateCheck';
+const IGNORED_VERSION_KEY = 'ignoredAppUpdateVersion';
+
+// Auto-checks used to be throttled to one per 24 h, which meant a relaunch on
+// the same day showed nothing even when a release had just gone out. The
+// library and reader pages both call this on mount, so the guard is
+// per-process: one check per app launch, however many pages mount.
+let autoCheckedThisLaunch = false;
+
+export const getIgnoredUpdateVersion = (): string => {
+  try {
+    return localStorage.getItem(IGNORED_VERSION_KEY) || '';
+  } catch {
+    return '';
+  }
+};
+
+export const setIgnoredUpdateVersion = (version: string) => {
+  try {
+    localStorage.setItem(IGNORED_VERSION_KEY, version);
+  } catch {
+    // Private mode / storage disabled - ignoring a version is a convenience,
+    // never a correctness requirement.
+  }
+};
+
+export const clearIgnoredUpdateVersion = () => {
+  try {
+    localStorage.removeItem(IGNORED_VERSION_KEY);
+  } catch {
+    // see above
+  }
+};
+
+/**
+ * A version is ignored only when it is exactly the one the user skipped.
+ *
+ * The obvious "not newer than the ignored version" test would also swallow a
+ * backported hotfix (skip 2.0.0 while on 1.9.0, then 1.9.1 ships and stays
+ * silent). Equality on the parsed version - same core, same nightly stamp -
+ * keeps the skip scoped to the release the user actually declined.
+ */
+export const isUpdateIgnored = (version: string): boolean => {
+  const ignored = getIgnoredUpdateVersion();
+  if (!ignored) return false;
+  return !isUpdateNewer(version, ignored) && !isUpdateNewer(ignored, version);
+};
+
+/**
+ * Test seam. The "one auto-check per launch" guard is module state and nothing
+ * in production ever resets it - a new process is the reset.
+ */
+export const __resetUpdateCheckForTests = () => {
+  autoCheckedThisLaunch = false;
+};
 
 const showUpdateWindow = (latestVersion: string, scrollBarStyle: ScrollBarStyle) => {
   const win = new WebviewWindow('updater', {
@@ -56,6 +111,122 @@ export interface ResolvedNightlyUpdate {
   url: string; // artifact URL (for the custom install flows)
   signature: string; // artifact signature
 }
+
+export type ReleaseAssetKind = 'windows-exe' | 'android-apk' | 'linux-deb' | 'download-page';
+
+/**
+ * A newer release that tauri's own updater cannot install: Windows ships a bare
+ * exe, Android a sideloaded apk. The window still offers a one-click install,
+ * but the mechanics live in the app rather than in the plugin.
+ */
+export interface ResolvedReleaseAsset {
+  version: string;
+  notes?: string;
+  pubDate?: string;
+  pageUrl: string;
+  assetUrl?: string;
+  assetName?: string;
+  kind: ReleaseAssetKind;
+}
+
+interface GithubAsset {
+  name: string;
+  browser_download_url: string;
+}
+
+interface GithubRelease {
+  tag_name?: string;
+  body?: string;
+  published_at?: string;
+  html_url?: string;
+  draft?: boolean;
+  prerelease?: boolean;
+  assets?: GithubAsset[];
+}
+
+const pickAsset = (assets: GithubAsset[], patterns: RegExp[]): GithubAsset | undefined => {
+  for (const re of patterns) {
+    const hit = assets.find((a) => re.test(a.name));
+    if (hit) return hit;
+  }
+  return undefined;
+};
+
+const releaseAssetMatchers: Record<Exclude<ReleaseAssetKind, 'download-page'>, RegExp[]> = {
+  // The single-file build is what the updater can launch in place; the zip is
+  // only a fallback for a release that predates it.
+  'windows-exe': [/_windows-x64\.exe$/i, /\.exe$/i],
+  'android-apk': [/\.apk$/i],
+  'linux-deb': [/\.deb$/i],
+};
+
+export type ReleaseAssetTarget = 'windows' | 'android' | 'linux' | 'any';
+
+/**
+ * Ask the GitHub releases API for the newest published release.
+ *
+ * This is the source of truth for "is there a new version" on platforms whose
+ * installers tauri cannot self-update. Drafts and prereleases are skipped so a
+ * half-finished release never prompts anyone; any failure reads as "no update"
+ * because an update check has to stay best-effort.
+ */
+export const resolveReleaseUpdate = async (
+  currentVersion: string,
+  fetchFn: FetchFn,
+  target: ReleaseAssetTarget = 'any',
+): Promise<ResolvedReleaseAsset | null> => {
+  let release: GithubRelease;
+  try {
+    const res = await fetchFn(READEST_LATEST_RELEASE_API, {
+      headers: { Accept: 'application/vnd.github+json' },
+      connectTimeout: 8000,
+    } as RequestInit);
+    if (!res.ok) return null;
+    release = (await res.json()) as GithubRelease;
+  } catch (err) {
+    console.warn('Failed to fetch the latest GitHub release', err);
+    return null;
+  }
+  const version = (release.tag_name || '').replace(/^v/, '');
+  if (!version || release.draft || release.prerelease) return null;
+  if (!isUpdateNewer(version, currentVersion)) return null;
+
+  const assets = release.assets ?? [];
+  const pageUrl = release.html_url || `${READEST_RELEASE_PAGE}/latest`;
+  const candidateKinds: Array<Exclude<ReleaseAssetKind, 'download-page'>> =
+    target === 'windows'
+      ? ['windows-exe']
+      : target === 'android'
+        ? ['android-apk']
+        : target === 'linux'
+          ? ['linux-deb']
+          : ['windows-exe', 'android-apk', 'linux-deb'];
+
+  for (const kind of candidateKinds) {
+    const asset = pickAsset(assets, releaseAssetMatchers[kind]);
+    if (asset) {
+      return {
+        version,
+        notes: release.body,
+        pubDate: release.published_at,
+        pageUrl,
+        assetUrl: asset.browser_download_url,
+        assetName: asset.name,
+        kind,
+      };
+    }
+  }
+
+  // Nothing this device can install by itself - still worth saying a release
+  // exists, with a link to the page.
+  return {
+    version,
+    notes: release.body,
+    pubDate: release.published_at,
+    pageUrl,
+    kind: 'download-page',
+  };
+};
 
 // Android ships one APK per ABI group. osArch() reports the ABI of the loaded
 // native library, so it picks the APK this install can actually run.
@@ -147,14 +318,20 @@ export const checkForAppUpdates = async (
   isAutoCheck = true,
   updateChannel: 'stable' | 'nightly' = 'stable',
 ): Promise<boolean> => {
-  const lastCheck = localStorage.getItem(LAST_CHECK_KEY);
-  const now = Date.now();
-  if (isAutoCheck && lastCheck && now - parseInt(lastCheck, 10) < CHECK_UPDATE_INTERVAL_SEC * 1000)
-    return false;
-  localStorage.setItem(LAST_CHECK_KEY, now.toString());
+  // One automatic check per launch. A manual check (About window) always runs.
+  if (isAutoCheck) {
+    if (autoCheckedThisLaunch) return false;
+    autoCheckedThisLaunch = true;
+  }
+  try {
+    localStorage.setItem(LAST_CHECK_KEY, Date.now().toString());
+  } catch {
+    // storage disabled - the timestamp is only informational
+  }
 
   console.log('Checking for updates', { updateChannel });
   const OS_TYPE = osType();
+  const currentVersion = getAppVersion();
 
   try {
     if (updateChannel === 'nightly') {
@@ -165,33 +342,57 @@ export const checkForAppUpdates = async (
         Boolean((window as { __READEST_IS_APPIMAGE?: boolean }).__READEST_IS_APPIMAGE),
       );
       if (!platformKey) return false;
-      const resolved = await resolveNightlyUpdate(getAppVersion(), platformKey, fetch);
-      if (resolved) {
-        setUpdaterWindowVisible(true, resolved.version, getAppVersion(), true, resolved);
+      const resolved = await resolveNightlyUpdate(currentVersion, platformKey, fetch);
+      if (resolved && !isUpdateIgnored(resolved.version)) {
+        setUpdaterWindowVisible(true, resolved.version, currentVersion, true, resolved);
         return true;
       }
       return false;
     }
 
     if (['macos', 'windows', 'linux'].includes(OS_TYPE)) {
+      // 1. The tauri updater: only knows about platforms whose bundle produced
+      //    a signed updater artifact (macOS dmg on this fork).
       const update = await check();
       if (update) {
+        if (isUpdateIgnored(update.version)) return false;
         // Enum ScrollBarStyle is exported as type by tauri, so it cannot be used directly.
         const scrollBarStyle = (OS_TYPE === 'windows'
           ? 'fluentOverlay'
           : 'default') as unknown as ScrollBarStyle;
         showUpdateWindow(update.version, scrollBarStyle);
+        return true;
       }
-      return !!update;
+      // 2. Everything else: ask GitHub directly. This is what makes the Windows
+      //    portable build notice a new release at all.
+      const release = await resolveReleaseUpdate(
+        currentVersion,
+        fetch,
+        OS_TYPE === 'windows' ? 'windows' : 'linux',
+      );
+      if (release && !isUpdateIgnored(release.version)) {
+        setUpdaterWindowVisible(true, release.version, currentVersion, true, undefined, release);
+        return true;
+      }
+      return false;
     } else if (OS_TYPE === 'android') {
       try {
+        const platformKey = getAndroidPlatformKey(osArch());
         const response = await fetch(READEST_UPDATER_FILE, { connectTimeout: 5000 });
-        const data = await response.json();
-        const isNewer = semver.gt(data.version, getAppVersion());
-        if (isNewer && getAndroidPlatformKey(osArch()) in data.platforms) {
-          setUpdaterWindowVisible(true, data.version!, getAppVersion());
+        const data = (await response.json()) as UpdateManifest;
+        if (isUpdateNewer(data.version, currentVersion) && platformKey in (data.platforms ?? {})) {
+          if (isUpdateIgnored(data.version)) return false;
+          setUpdaterWindowVisible(true, data.version, currentVersion);
+          return true;
         }
-        return isNewer;
+        // latest.json only lists what tauri can install; the apk is not in it,
+        // so fall through to the release API before concluding "up to date".
+        const release = await resolveReleaseUpdate(currentVersion, fetch, 'android');
+        if (release && !isUpdateIgnored(release.version)) {
+          setUpdaterWindowVisible(true, release.version, currentVersion, true, undefined, release);
+          return true;
+        }
+        return false;
       } catch (err) {
         console.warn('Failed to fetch Android update info', err);
         throw new Error('Failed to fetch Android update info');

@@ -31,6 +31,7 @@ import { DEFAULT_ANNOTATION_TOOLBAR_ITEMS } from '@/utils/annotationToolbar';
 import { canShareText } from '@/utils/share';
 import { useEinkRefreshSupported } from '@/hooks/useEinkRefreshSupported';
 import { optInTelemetry, optOutTelemetry } from '@/utils/telemetry';
+import { clearIgnoredUpdateVersion, getIgnoredUpdateVersion } from '@/helpers/updater';
 import KeyboardShortcutsSettings from './KeyboardShortcutsSettings';
 
 const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }) => {
@@ -139,6 +140,7 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
   const [allowScript, setAllowScript] = useState(viewSettings.allowScript);
   const [isAutoCheckUpdates, setIsAutoCheckUpdates] = useState(settings.autoCheckUpdates);
   const [isNightlyChannel, setIsNightlyChannel] = useState(settings.updateChannel === 'nightly');
+  const [ignoredUpdateVersion, setIgnoredUpdateVersion] = useState(getIgnoredUpdateVersion());
   const [isTelemetryEnabled, setIsTelemetryEnabled] = useState(settings.telemetryEnabled);
 
   const resetToDefaults = useResetViewSettings();
@@ -482,6 +484,11 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
     const newValue = !isAutoCheckUpdates;
     saveSysSettings(envConfig, 'autoCheckUpdates', newValue);
     setIsAutoCheckUpdates(newValue);
+  };
+
+  const resumeUpdatePrompts = () => {
+    clearIgnoredUpdateVersion();
+    setIgnoredUpdateVersion('');
   };
 
   const toggleNightlyChannel = () => {
@@ -852,6 +859,19 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
             onChange={toggleNightlyChannel}
             data-setting-id='settings.control.nightlyChannel'
           />
+          {ignoredUpdateVersion && (
+            <SettingsRow
+              label={_('Skipped Version')}
+              description={_('Version {{version}} will not be offered again', {
+                version: ignoredUpdateVersion,
+              })}
+              data-setting-id='settings.control.skippedUpdateVersion'
+            >
+              <button className='btn btn-ghost btn-sm font-normal' onClick={resumeUpdatePrompts}>
+                {_('Notify Me Again')}
+              </button>
+            </SettingsRow>
+          )}
         </BoxedList>
       )}
 

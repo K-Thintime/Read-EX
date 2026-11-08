@@ -19,8 +19,13 @@ import { tauriDownload } from '@/utils/transfer';
 import { installPackage, verifyUpdateSignature, installNightlyUpdate } from '@/utils/bridge';
 import { join } from '@tauri-apps/api/path';
 import { getLocale } from '@/utils/misc';
-import { getAndroidPlatformKey, setLastShownReleaseNotesVersion } from '@/helpers/updater';
-import type { ResolvedNightlyUpdate } from '@/helpers/updater';
+import {
+  getAndroidPlatformKey,
+  setIgnoredUpdateVersion,
+  setLastShownReleaseNotesVersion,
+} from '@/helpers/updater';
+import type { ResolvedNightlyUpdate, ResolvedReleaseAsset } from '@/helpers/updater';
+import { openExternalUrl } from '@/utils/open';
 import {
   READEST_UPDATER_FILE,
   READEST_CHANGELOG_FILE,
@@ -85,11 +90,15 @@ export const UpdaterContent = ({
   lastVersion,
   checkUpdate = true,
   nightlyUpdate,
+  releaseUpdate,
+  onDismiss,
 }: {
   latestVersion?: string;
   lastVersion?: string;
   checkUpdate?: boolean;
   nightlyUpdate?: ResolvedNightlyUpdate;
+  releaseUpdate?: ResolvedReleaseAsset;
+  onDismiss?: () => void;
 }) => {
   const _ = useTranslation();
   const [targetLang, setTargetLang] = useState('EN');
@@ -364,7 +373,54 @@ export const UpdaterContent = ({
         }
       },
     });
+    // Releases on platforms whose installer tauri cannot replace in place.
+    // Everything here keeps the existing profile directory (%APPDATA%\com.readex.app
+    // on Windows, the app container on Android), so an update never resets
+    // settings, library, credentials or sync configuration.
+    const buildReleaseUpdate = (r: ResolvedReleaseAsset): GenericUpdate => ({
+      currentVersion,
+      version: r.version,
+      date: r.pubDate,
+      body: r.notes,
+      downloadAndInstall: async (onEvent) => {
+        if (!r.assetUrl || r.kind === 'download-page') {
+          openExternalUrl(r.pageUrl);
+          return;
+        }
+        const fileName = r.assetName || `Read-EX_${r.version}`;
+        if (r.kind === 'windows-exe') {
+          const execDir = await invoke<string>('get_executable_dir');
+          const filePath = await join(execDir, fileName);
+          await downloadWithProgress(r.assetUrl, filePath, onEvent);
+          // Same pattern as the upstream portable updater: stage the new build
+          // beside the old one and hand over. Overwriting the running exe is
+          // not possible on Windows anyway.
+          const command = Command.create('start-readest', ['/C', 'start', '', filePath]);
+          await command.spawn();
+          setTimeout(async () => {
+            await exit(0);
+          }, 800);
+          return;
+        }
+        if (r.kind === 'android-apk') {
+          if (!appService) throw new Error('App service unavailable');
+          const filePath = await appService.resolveFilePath(fileName, 'Cache');
+          await downloadWithProgress(r.assetUrl, filePath, onEvent);
+          const res = await installPackage({ path: filePath });
+          if (!res.success) {
+            console.error('Failed to install APK:', res.error);
+            throw new Error(res.error || 'Install failed');
+          }
+          return;
+        }
+        openExternalUrl(r.pageUrl);
+      },
+    });
     const checkForUpdates = async () => {
+      if (releaseUpdate) {
+        setUpdate(buildReleaseUpdate(releaseUpdate));
+        return;
+      }
       if (nightlyUpdate) {
         setUpdate(buildNightlyUpdate(nightlyUpdate));
         return;
@@ -389,7 +445,7 @@ export const UpdaterContent = ({
       checkForUpdates();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appService?.hasUpdater, nightlyUpdate]);
+  }, [appService?.hasUpdater, nightlyUpdate, releaseUpdate]);
 
   useEffect(() => {
     if (latestVersion) {
@@ -520,6 +576,17 @@ export const UpdaterContent = ({
     }
   };
 
+  // Remember this version so the launch check stops offering it. Only the exact
+  // version is suppressed: the next release prompts again.
+  const handleSkipVersion = () => {
+    if (newVersion) setIgnoredUpdateVersion(newVersion);
+    if (onDismiss) {
+      onDismiss();
+    } else {
+      window.close();
+    }
+  };
+
   if (!isMounted) {
     return null;
   }
@@ -582,13 +649,22 @@ export const UpdaterContent = ({
 
                 <div className={clsx('card-actions', isDownloading && 'hidden sm:flex')}>
                   <button
+                    className='btn btn-ghost btn-sm font-normal'
+                    disabled={isDownloading}
+                    onClick={handleSkipVersion}
+                  >
+                    {_('Skip This Version')}
+                  </button>
+                  <button
                     className={clsx(
                       'btn btn-warning text-base-100 px-6 font-bold',
                       (!update || isDownloading) && 'btn-disabled',
                     )}
                     onClick={handleDownloadInstall}
                   >
-                    {_('DOWNLOAD & INSTALL')}
+                    {releaseUpdate && releaseUpdate.kind === 'download-page'
+                      ? _('OPEN DOWNLOAD PAGE')
+                      : _('DOWNLOAD & INSTALL')}
                   </button>
                 </div>
               </div>
@@ -681,11 +757,12 @@ export const setUpdaterWindowVisible = (
   lastVersion?: string,
   checkUpdate = true,
   nightlyUpdate?: ResolvedNightlyUpdate,
+  releaseUpdate?: ResolvedReleaseAsset,
 ) => {
   const dialog = document.getElementById('updater_window');
   if (dialog) {
     const event = new CustomEvent('setDialogVisibility', {
-      detail: { visible, latestVersion, lastVersion, checkUpdate, nightlyUpdate },
+      detail: { visible, latestVersion, lastVersion, checkUpdate, nightlyUpdate, releaseUpdate },
     });
     dialog.dispatchEvent(event);
   }
@@ -697,14 +774,17 @@ export const UpdaterWindow = () => {
   const [lastVersion, setLastVersion] = useState('');
   const [checkUpdate, setCheckUpdate] = useState(true);
   const [nightlyUpdate, setNightlyUpdate] = useState<ResolvedNightlyUpdate | undefined>(undefined);
+  const [releaseUpdate, setReleaseUpdate] = useState<ResolvedReleaseAsset | undefined>(undefined);
   const [isOpen, setIsOpen] = useState(false);
 
   useEffect(() => {
     const handleCustomEvent = (event: CustomEvent) => {
-      const { visible, latestVersion, lastVersion, checkUpdate, nightlyUpdate } = event.detail;
+      const { visible, latestVersion, lastVersion, checkUpdate, nightlyUpdate, releaseUpdate } =
+        event.detail;
       setIsOpen(visible);
       setCheckUpdate(checkUpdate);
       setNightlyUpdate(nightlyUpdate);
+      setReleaseUpdate(releaseUpdate);
       if (latestVersion) {
         setLatestVersion(latestVersion);
       }
@@ -739,6 +819,8 @@ export const UpdaterWindow = () => {
           lastVersion={lastVersion ?? undefined}
           checkUpdate={checkUpdate}
           nightlyUpdate={nightlyUpdate}
+          releaseUpdate={releaseUpdate}
+          onDismiss={() => setIsOpen(false)}
         />
       )}
     </Dialog>

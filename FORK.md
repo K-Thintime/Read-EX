@@ -71,9 +71,11 @@ echo "NEXT_PUBLIC_MICROSOFT_CLIENT_ID=<你的 Azure Application (client) ID>" \
   >> apps/readest-app/.env.tauri
 
 cd apps/readest-app
-pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
-# 产物：../../target/x86_64-pc-windows-msvc/release/bundle/nsis/
+pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
+# 产物：../../target/x86_64-pc-windows-msvc/release/readest.exe
 ```
+
+Windows 用 `--no-bundle` 而不是 `--bundles nsis`：NSIS bundler 会在打包阶段从 `tauri-apps/binary-releases` 下载工具链，这一步在 CI 上稳定 504，本机实测同样 000，cargo 编译完再挂在这里很浪费。可执行文件本身是完整的，zip 一下就能用。
 
 `createUpdaterArtifacts` 是在 `tauri.conf.json` 里开启的，所以**本地构建也需要签名私钥**（仓库用的那把在 `~/.tauri/readex.key`）：
 
@@ -103,8 +105,26 @@ git push origin v0.1.0
 | 类型 | 名称 | 状态 | 说明 |
 |---|---|---|---|
 | Secret | `TAURI_SIGNING_PRIVATE_KEY` | **已配置** | 本仓库已生成专属密钥对并写入 Secret；公钥已写进 `tauri.conf.json` 与 `constants.ts` |
+| Secret | `ANDROID_KEYSTORE_BASE64` | **已配置** | Android 发布签名的 PKCS12 keystore（base64）。Android 不允许用不同签名覆盖安装，所以这把key必须固定复用，换掉会导致老用户必须先卸载 |
+| Secret | `ANDROID_KEYSTORE_PASSWORD` | **已配置** | 上面 keystore 的 store/key 密码 |
 | Variable | `MICROSOFT_CLIENT_ID` | **待填** | Azure 应用的 client id；未填时 OneDrive 那一行在设置页里是灰的，其余功能不受影响 |
 | Secret | `APPLE_CERTIFICATE` / `_PASSWORD` / `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 可选 | 默认**不**注入（空值会让 tauri 对着空证书跑 `security import`，整包失败）。要签名时先按 `tauri.macos-nonestore.conf.json` 加上 entitlements，再把这些变量加回 workflow 的 `env` |
+
+### Android 签名
+
+`tauri android init` 生成的工程没有 `signingConfigs`，直接 `assembleRelease` 出来的是 `-unsigned.apk`，装不上；退而求其次用 `--debug` 虽然能装，但 Rust debug profile 不 strip 原生库，APK 会到 **659MB**。
+
+所以构建走 release 变体，由 `scripts/patch-android-project.mjs` 往 `app/build.gradle.kts` 追加一段 `signingConfigs`，从 `gen/android/keystore.properties` 读别名和密码；keystore 本身由 workflow 从 `ANDROID_KEYSTORE_BASE64` 解码到 `gen/android/app/readex.p12`。Gradle 会顺带 strip 掉 `.so` 的符号，体积回到几十 MB。
+
+重新生成 keystore（**只在首次搭建或确定要放弃老用户升级路径时做**）：
+
+```bash
+keytool -genkeypair -keystore readex.p12 -storetype PKCS12 \
+  -alias readex -keyalg RSA -keysize 2048 -validity 10950 \
+  -storepass "$PASS" -keypass "$PASS" \
+  -dname "CN=Read-EX, OU=Read-EX, O=Read-EX, C=CN"
+base64 -w0 readex.p12    # 整段写进 ANDROID_KEYSTORE_BASE64
+```
 
 密钥已就位，除非要**换掉**它，否则不用再动：
 
@@ -131,6 +151,40 @@ pnpm tauri signer generate -w ~/.tauri/readex.key   # 生成新的一对
 
 ---
 
+## 自动更新
+
+三件事必须同时成立，少一件更新就是死的：
+
+1. **release 必须是公开的，不能是 draft**。`https://github.com/K-Thintime/read-ex/releases/latest/download/latest.json`
+   对 draft 返回 404，装了旧版的客户端只会一直显示"已是最新"。tag 推送触发的构建现在直接发布。
+2. **macOS 必须构建 `app` target**（workflow 里是 `--bundles app,dmg`）。只构建 `dmg` 时
+   tauri 会警告 `no updater-enabled targets were built`，不产出 `.app.tar.gz`，`latest.json` 也就无从生成。
+3. **Windows / Android 没有 tauri 可自更新的产物**，所以 `helpers/updater.ts` 会退一步查
+   GitHub Releases API，拿最新的 tag 和对应资产，由应用自己下载安装。
+
+各平台的更新方式：
+
+| 平台 | 检测 | 安装 |
+|---|---|---|
+| macOS | tauri updater 读 `latest.json` | 签名校验后原地替换 `.app` |
+| Windows | tauri updater 拿不到就查 Releases API | 下载 `Read-EX_<ver>_windows-x64.exe` 到同目录，启动新进程后退出 |
+| Android | `latest.json` → Releases API | 下载 apk 交给系统安装器（同签名覆盖安装） |
+| Linux deb | 不提供（deb 安装的 `is_updater_disabled` 为 true） | 用 `dpkg -i` 升级 |
+
+交互约束：
+
+- **启动即检查**：每次启动查一次（同一进程内多个页面只查一次），不再有 24 小时节流。
+- **可关闭**：设置 → 控制 → 更新 → `启动时检查更新`。
+- **可忽略单个版本**：更新窗口里的「跳过此版本」只压制这一个版本号，出下一个版本会重新提示；
+  在设置页同一分组里能看到已跳过的版本并「恢复提示」。
+- 忽略状态存在 `localStorage`，每台设备独立。
+
+> **配置为什么不会丢**：更新只替换可执行文件，配置目录由 `identifier`（`com.readex.app`）决定，
+> 位于 `%APPDATA%\com.readex.app`（Windows）或 `~/Library/Application Support/com.readex.app`（macOS）。
+> 因此**不要改 `tauri.conf.json` 的 identifier**，一改就等于换了个应用，旧配置全部读不到。
+
+---
+
 ## 已知限制
 
 - **深链 scheme 沿用 `readest`**：与官方版同时安装会竞争该 scheme。改它需要动 `tauri.conf.json`、Android manifest、iOS plist 以及约 20 处代码里的 `readest://` 字面量，收益不大，暂不改。
@@ -147,11 +201,13 @@ pnpm tauri signer generate -w ~/.tauri/readex.key   # 生成新的一对
 出包只需推一个 tag：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
-工作流跑完会在 Releases 里留下一个 **draft**（草稿），确认安装包没问题再点 Publish。若只是想验证构建，在 Actions 页面手动运行 *Build Read-EX*，产物以 artifact 形式保留 14 天。
+工作流跑完会**直接发布**（不是 draft）——必须如此，否则 `latest.json` 匿名取不到，自动更新失效。
+release 里会带上 `latest.json`，它是更新器唯一的数据源。若只是想验证构建，在 Actions 页面手动运行
+*Build Read-EX*，产物以 artifact 形式保留 14 天，不会产生 release。
 
 ## 许可证
 

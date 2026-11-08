@@ -1029,7 +1029,17 @@ export const SHARE_TOKEN_LENGTH = 22;
 export const SHARE_PRESIGN_TTL_SECONDS = 300;
 export const SHARE_CFI_MAX_LENGTH = 512;
 
-const LATEST_DOWNLOAD_BASE_URL = 'https://github.com/K-Thintime/read-ex/releases/latest/download';
+export const READEST_GITHUB_REPO = 'K-Thintime/read-ex';
+
+const LATEST_DOWNLOAD_BASE_URL = `https://github.com/${READEST_GITHUB_REPO}/releases/latest/download`;
+
+// `latest.json` is produced by the release workflow from the signed tarball, so
+// it only ever lists platforms tauri can install by itself. Windows (portable
+// exe) and Android (sideloaded apk) have no such artifact, which is why the
+// release API is consulted as a second source: it always knows the newest tag.
+export const READEST_RELEASE_PAGE = `https://github.com/${READEST_GITHUB_REPO}/releases`;
+
+export const READEST_LATEST_RELEASE_API = `https://api.github.com/repos/${READEST_GITHUB_REPO}/releases/latest`;
 
 export const READEST_UPDATER_FILE = `${LATEST_DOWNLOAD_BASE_URL}/latest.json`;
 
@@ -1053,6 +1063,8 @@ export const READEST_OPDS_USER_AGENT = 'Readest/1.0 (OPDS Browser)';
 export const SYNC_PROGRESS_INTERVAL_SEC = 3;
 export const SYNC_NOTES_INTERVAL_SEC = 5;
 export const SYNC_BOOKS_INTERVAL_SEC = 5;
+// No longer gates the launch check (that runs once per process now); kept as a
+// named interval for anything that wants a coarser cadence.
 export const CHECK_UPDATE_INTERVAL_SEC = 24 * 60 * 60;
 
 export const MAX_ZOOM_LEVEL = 500;

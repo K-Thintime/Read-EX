@@ -61,7 +61,12 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-latest
             artifact: read-ex-macos-universal
-            bundles: dmg
+            # `app` is not redundant with `dmg`: only the `app` target emits the
+            # signed .app.tar.gz the updater installs from. With `dmg` alone
+            # tauri warns "configured to create updater artifacts but no
+            # updater-enabled targets were built" and latest.json is never
+            # produced, which silently kills auto-update.
+            bundles: app,dmg
             target: universal-apple-darwin
           - os: ubuntu-22.04
             artifact: read-ex-linux-x64
@@ -220,8 +225,13 @@ jobs:
           # One glob set for all three: `**` covers the <triple>/ level that
           # appears whenever --target is passed, and empty patterns are simply
           # not matched.
+          #
+          # dist/*.exe matters: Windows has no NSIS/MSI here, so the bare exe is
+          # the only thing the in-app updater can download and launch. The zip
+          # stays as the friendly fresh-install package.
           path: |
             dist/*.zip
+            dist/*.exe
             target/**/bundle/dmg/*.dmg
             target/**/bundle/deb/*.deb
             target/**/bundle/deb/*.sig
@@ -384,26 +394,38 @@ jobs:
           mkdir -p artifacts
           V="${GITHUB_REF_NAME#v}"
           find staging -type f \
-            \( -name '*.zip' -o -name '*.dmg' -o -name '*.deb' \
-               -o -name '*.apk' -o -name '*.tar.gz' -o -name '*.sig' \) |
+            \( -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.apk' \
+               -o -name '*.tar.gz' -o -name '*.sig' -o -name '*.exe' \) |
           while read -r f; do
             base="$(basename "$f")"
             case "$base" in
               *windows*.zip) cp "$f" "artifacts/Read-EX_${V}_windows-x64.zip" ;;
+              *.exe)         cp "$f" "artifacts/Read-EX_${V}_windows-x64.exe" ;;
               *.apk)         cp "$f" "artifacts/Read-EX_${V}_android-arm64.apk" ;;
               *)             cp "$f" "artifacts/$base" ;;
             esac
           done
           ls -lh artifacts
-          n=$(find artifacts -type f ! -name '*.sig' | wc -l)
-          echo "installers: $n"
-          # Four platforms must all be present; a silently empty release is
-          # worse than a red build.
-          [ "$n" -ge 4 ] || { echo "::error::expected at least 4 installers, got $n"; exit 1; }
+
+          # A count check let a release through with four installers and no
+          # updater artifact, i.e. everything looked green and auto-update was
+          # dead on arrival. Name what has to be there instead.
+          missing=0
+          require() { [ -f "$1" ] || { echo "::error::missing $1"; missing=1; }; }
+          require "artifacts/Read-EX_${V}_windows-x64.zip"
+          require "artifacts/Read-EX_${V}_windows-x64.exe"
+          require "artifacts/Read-EX_${V}_android-arm64.apk"
+          ls artifacts/*.deb >/dev/null 2>&1 || { echo "::error::no .deb"; missing=1; }
+          ls artifacts/*.dmg >/dev/null 2>&1 || { echo "::error::no .dmg"; missing=1; }
+          # Without the signed tarball the tauri updater has nothing to install
+          # on macOS and latest.json cannot be written at all.
+          ls artifacts/*.app.tar.gz >/dev/null 2>&1 ||
+            { echo "::error::no .app.tar.gz - macOS updater artifact missing"; missing=1; }
+          [ "$missing" -eq 0 ] || exit 1
 
       # The updater manifest used to come from tauri-action, which this workflow
-      # no longer uses. Rebuild it from the signed tarball so
-      # /releases/latest/download/latest.json always matches what is attached.
+      # no longer uses. Rebuild it from what is actually attached so
+      # /releases/latest/download/latest.json always matches the release.
       - name: Write updater manifest
         shell: bash
         run: |
@@ -411,28 +433,51 @@ jobs:
             const fs = require("fs"), path = require("path");
             const dir = "artifacts";
             const v = process.env.GITHUB_REF_NAME.replace(/^v/, "");
-            const sig = fs.readdirSync(dir).find((f) => f.endsWith(".app.tar.gz.sig"));
-            if (!sig) { console.log("no updater signature - skipping latest.json"); process.exit(0); }
-            const signature = fs.readFileSync(path.join(dir, sig), "utf8").trim();
-            const asset = sig.replace(/\.sig$/, "");
-            const url = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${process.env.GITHUB_REF_NAME}/${asset}`;
+            const base = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${process.env.GITHUB_REF_NAME}`;
+            const files = fs.readdirSync(dir);
+            const platforms = {};
+
+            // macOS: the only platform tauri can replace in place here, so the
+            // signature is real and both arches share the universal tarball.
+            const sig = files.find((f) => f.endsWith(".app.tar.gz.sig"));
+            if (sig) {
+              const signature = fs.readFileSync(path.join(dir, sig), "utf8").trim();
+              const asset = sig.replace(/\.sig$/, "");
+              for (const key of ["darwin-x86_64", "darwin-aarch64"]) {
+                platforms[key] = { signature, url: `${base}/${asset}` };
+              }
+            }
+
+            // Windows ships a bare exe with no tauri signature (no NSIS/MSI
+            // artifact exists on this fork). The app downloads and launches it
+            // itself, which only needs the URL - hence the empty signature.
+            const exe = files.find((f) => f.endsWith("_windows-x64.exe"));
+            if (exe) platforms["windows-x86_64-portable"] = { signature: "", url: `${base}/${exe}` };
+
+            const apk = files.find((f) => f.endsWith(".apk"));
+            if (apk) platforms["android-arm64"] = { signature: "", url: `${base}/${apk}` };
+
+            if (Object.keys(platforms).length === 0) {
+              console.log("no updater artifacts - skipping latest.json");
+              process.exit(0);
+            }
             const manifest = {
               version: v,
               notes: `Read-EX ${v}`,
               pub_date: new Date().toISOString(),
-              platforms: {
-                "darwin-x86_64": { signature, url },
-                "darwin-aarch64": { signature, url },
-              },
+              platforms,
             };
             fs.writeFileSync(path.join(dir, "latest.json"), JSON.stringify(manifest, null, 2));
-            console.log("latest.json ->", url);
+            console.log("latest.json platforms:", Object.keys(platforms).join(", "));
           '
 
-      - name: Create draft release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          draft: ${{ github.event_name == 'push' && true || inputs.draft }}
+          # Published by default. This is not cosmetic: drafts are invisible to
+          # /releases/latest/download/latest.json, so a draft release makes every
+          # installed app report "up to date" forever.
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
           name: Read-EX ${{ github.ref_name }}
           body: |
             Read-EX ${{ github.ref_name }} — Windows, macOS, Linux and Android.
@@ -443,7 +488,10 @@ jobs:
             - **Windows** — unzip and run `Read-EX.exe`. No installer, no admin rights. Needs the Edge WebView2 runtime (preinstalled on Win10 1803+ / Win11).
             - **macOS** — open the `.dmg`, drag to Applications. Unsigned: run `xattr -dr com.apple.quarantine /Applications/Read-EX.app` or right-click → Open.
             - **Linux** — `sudo dpkg -i Read-EX_*_amd64.deb` (needs `libwebkit2gtk-4.1-0`). Debian/Ubuntu only for now: the AppImage bundler depends on a download that fails on GitHub runners.
-            - **Android** — sideload the `.apk`. It is debug-signed, so enable "install unknown apps" for your file manager.
+            - **Android** — sideload the `.apk`. It is signed with a stable key, so later versions install over it; enable "install unknown apps" for your file manager.
+
+            ### Updating
+            Installed copies check this repository on every launch. Windows and Android download and hand over to the new build; macOS updates in place. Settings, library and sync configuration live outside the app bundle and survive the update. Auto-check can be turned off in Settings → Control → Update, and any single release can be skipped from the update dialog.
 
             Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
           files: artifacts/*

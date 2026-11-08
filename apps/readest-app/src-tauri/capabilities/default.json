@@ -173,7 +173,7 @@
             "start",
             "",
             {
-              "validator": "^.*Readest(.*)\\.exe$"
+              "validator": "^.*(Readest|Read-EX)(.*)\\.exe$"
             }
           ]
         },
