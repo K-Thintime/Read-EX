@@ -565,7 +565,12 @@ export const UpdaterContent = ({
         }
       });
       console.log('package installed');
-      if (!appService?.isAndroidApp && process.env.NODE_ENV === 'production') {
+      // The release-asset flows hand over to a new process themselves (spawn the
+      // downloaded exe + exit, or the Android installer). Relaunching here would
+      // start the *old* binary again, because the running image is still the old
+      // file - the user would end up with the update plus a stale window.
+      const handsOverItself = !!releaseUpdate;
+      if (!handsOverItself && !appService?.isAndroidApp && process.env.NODE_ENV === 'production') {
         await relaunch();
       }
     } catch (error) {
