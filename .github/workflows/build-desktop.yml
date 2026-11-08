@@ -11,7 +11,10 @@ name: Build Read-EX
 #
 # Everything works with zero secrets. Optional secrets only upgrade the output:
 #   TAURI_SIGNING_PRIVATE_KEY(+ _PASSWORD) -> signed updater artifacts (.sig)
-#   APPLE_*                                -> signed + notarised dmg
+#   APPLE_CERTIFICATE & co.                -> signed + notarised dmg. These are
+#     deliberately NOT passed as env by default: an empty APPLE_CERTIFICATE still
+#     makes tauri run `security import` against nothing, which fails the whole
+#     macOS bundle. Add them to the env blocks only once the secrets exist.
 #   vars.MICROSOFT_CLIENT_ID               -> enables the OneDrive backend
 
 on:
@@ -96,6 +99,10 @@ jobs:
           # Root Cargo.toml owns the workspace, so the target dir is repo-root/target.
           workspaces: '. -> target'
           key: ${{ matrix.artifact }}
+          # Save even when the job fails: a failed *bundle* still leaves a
+          # complete cargo target dir, and reusing it is the difference between
+          # an 11-minute retry and a 30-second one.
+          save-if: always
 
       # --frozen-lockfile is the fast path; the fallback exists because the
       # submodule clones above are branch tips and can drift from the lockfile
@@ -149,18 +156,44 @@ jobs:
           echo "::warning::TAURI_SIGNING_PRIVATE_KEY is unset - building installers without updater artifacts."
 
       - name: Build and publish draft release
+        id: bundle
         if: startsWith(github.ref, 'refs/tags/')
+        continue-on-error: true
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/readest-app
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Read-EX ${{ github.ref_name }}'
+          releaseBody: |
+            Read-EX ${{ github.ref_name }} — desktop builds for Windows, macOS and Linux.
+
+            **Sync backends:** Readest Cloud (optional), WebDAV, S3, Google Drive, OneDrive, iCloud (Apple platforms) and **OpenList**.
+
+            ### Install notes
+            - **Windows**: run the `.exe` installer. SmartScreen will warn about an unknown publisher — the build is unsigned.
+            - **macOS**: open the `.dmg`, drag to Applications. Unsigned builds need `xattr -dr com.apple.quarantine /Applications/Read-EX.app`, or right-click → Open.
+            - **Linux**: the `.AppImage` is portable (`chmod +x` then run); the `.deb` needs `libwebkit2gtk-4.1-0`.
+
+            Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
+          releaseDraft: ${{ github.event_name == 'push' && true || inputs.draft }}
+          prerelease: false
+          args: ${{ matrix.base-args }}
+
+      # Bundlers fetch their own helpers at package time — NSIS plugins on
+      # Windows, quick-sharun on Linux — and those downloads intermittently
+      # answer 504 from the runner. Cargo has already finished by then, so one
+      # retry only redoes the cheap bundling step, not the 11-minute build.
+      - name: Retry bundling once
+        if: startsWith(github.ref, 'refs/tags/') && steps.bundle.outcome == 'failure'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/readest-app
           tagName: ${{ github.ref_name }}
@@ -187,12 +220,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: apps/readest-app
           args: ${{ matrix.base-args }}
