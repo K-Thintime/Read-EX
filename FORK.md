@@ -42,10 +42,28 @@ OpenList（AList 的社区 fork）的 API 有三个和常规 REST 不同的地�
 
 ## 构建
 
+### 0. 先补子模块（必须）
+
+本仓库的历史是一次性导入的，**子模块指针没有记录**。开始构建前先注册：
+
+```bash
+git submodule add https://github.com/readest/foliate-js packages/foliate-js
+git submodule add https://github.com/readest/tauri packages/tauri
+git submodule add https://github.com/readest/simplecc-wasm packages/simplecc-wasm
+git submodule add https://github.com/readest/js-mdict packages/js-mdict
+git submodule add https://github.com/mozilla/pdf.js.qcms packages/qcms
+git submodule add https://github.com/readest/tauri-plugin-turso \
+  apps/readest-app/src-tauri/plugins/tauri-plugin-turso
+git submodule add https://github.com/readest/tauri-plugin-webview-upgrade \
+  apps/readest-app/src-tauri/plugins/tauri-plugin-webview-upgrade
+```
+
+> 缺任何一个都会在 `pnpm install`（js-mdict / simplecc-wasm）或 `cargo build`（turso / qcms / tauri）阶段报错。
+> 想保留上游提交历史的话，更省事的做法是 `git clone --recurse-submodules` 官方仓库，再把上面「相对上游的改动」表里的文件覆盖过去。
+
 ### 前置
 
 - Node 22+、pnpm 11、Rust stable、VS Build Tools（Windows）/ Xcode CLT（macOS）/ `libwebkit2gtk-4.1-dev`（Linux）
-- **子模块必须初始化**：`git clone --recurse-submodules`，或事后 `git submodule update --init --recursive`
 
 ### 本地（验证用，Windows）
 
@@ -110,6 +128,19 @@ git push origin v0.1.0
 - **未签名安装包**：Windows 触发 SmartScreen（更多信息 → 仍要运行）；macOS 需 `xattr -dr com.apple.quarantine /Applications/Read-EX.app`。
 - **OpenList 代理下载吃服务器带宽**：大库同步建议把 OpenList 挂在带宽充裕的机器上，或直接用 S3 后端。
 - **AGPL-3.0**：分发二进制时必须公开源码并附获取方式；因条款冲突，不适合上架 App Store。
+
+---
+
+## 发布到自己的 GitHub
+
+```bash
+cd readest-main
+git remote add origin https://github.com/<你的账号>/read-ex.git
+git branch -M main
+git push -u origin main
+```
+
+之后推 tag 即可让 Actions 出包（见下）。
 
 ---
 
