@@ -217,6 +217,8 @@ jobs:
             target/**/bundle/dmg/*.dmg
             target/**/bundle/deb/*.deb
             target/**/bundle/deb/*.sig
+            target/**/bundle/macos/*.app.tar.gz
+            target/**/bundle/macos/*.sig
 
   android:
     name: read-ex-android
@@ -338,11 +340,65 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: staging
           merge-multiple: true
 
-      - name: List collected files
-        run: ls -lh dist
+      # download-artifact keeps the path each file had inside its artifact, so
+      # staging/ ends up as staging/{apps,dist,target}/... and a plain
+      # `files: staging/*` glob matches nothing at all. Collect the installers
+      # into one flat directory first, renaming them to something a human can
+      # recognise on the release page.
+      - name: Flatten installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          V="${GITHUB_REF_NAME#v}"
+          find staging -type f \
+            \( -name '*.zip' -o -name '*.dmg' -o -name '*.deb' \
+               -o -name '*.apk' -o -name '*.tar.gz' -o -name '*.sig' \) |
+          while read -r f; do
+            base="$(basename "$f")"
+            case "$base" in
+              *windows*.zip) cp "$f" "artifacts/Read-EX_${V}_windows-x64.zip" ;;
+              *.apk)         cp "$f" "artifacts/Read-EX_${V}_android-arm64.apk" ;;
+              *)             cp "$f" "artifacts/$base" ;;
+            esac
+          done
+          ls -lh artifacts
+          n=$(find artifacts -type f ! -name '*.sig' | wc -l)
+          echo "installers: $n"
+          # Four platforms must all be present; a silently empty release is
+          # worse than a red build.
+          [ "$n" -ge 4 ] || { echo "::error::expected at least 4 installers, got $n"; exit 1; }
+
+      # The updater manifest used to come from tauri-action, which this workflow
+      # no longer uses. Rebuild it from the signed tarball so
+      # /releases/latest/download/latest.json always matches what is attached.
+      - name: Write updater manifest
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs"), path = require("path");
+            const dir = "artifacts";
+            const v = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            const sig = fs.readdirSync(dir).find((f) => f.endsWith(".app.tar.gz.sig"));
+            if (!sig) { console.log("no updater signature - skipping latest.json"); process.exit(0); }
+            const signature = fs.readFileSync(path.join(dir, sig), "utf8").trim();
+            const asset = sig.replace(/\.sig$/, "");
+            const url = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${process.env.GITHUB_REF_NAME}/${asset}`;
+            const manifest = {
+              version: v,
+              notes: `Read-EX ${v}`,
+              pub_date: new Date().toISOString(),
+              platforms: {
+                "darwin-x86_64": { signature, url },
+                "darwin-aarch64": { signature, url },
+              },
+            };
+            fs.writeFileSync(path.join(dir, "latest.json"), JSON.stringify(manifest, null, 2));
+            console.log("latest.json ->", url);
+          '
 
       - name: Create draft release
         uses: softprops/action-gh-release@v2
@@ -357,9 +413,9 @@ jobs:
             ### Install notes
             - **Windows** — unzip and run `Read-EX.exe`. No installer, no admin rights. Needs the Edge WebView2 runtime (preinstalled on Win10 1803+ / Win11).
             - **macOS** — open the `.dmg`, drag to Applications. Unsigned: run `xattr -dr com.apple.quarantine /Applications/Read-EX.app` or right-click → Open.
-            - **Linux** — `sudo dpkg -i read-ex_*.deb` (needs `libwebkit2gtk-4.1-0`). Debian/Ubuntu only for now: the AppImage bundler depends on a download that fails on GitHub runners.
+            - **Linux** — `sudo dpkg -i Read-EX_*_amd64.deb` (needs `libwebkit2gtk-4.1-0`). Debian/Ubuntu only for now: the AppImage bundler depends on a download that fails on GitHub runners.
             - **Android** — sideload the `.apk`. It is debug-signed, so enable "install unknown apps" for your file manager.
 
             Based on [readest](https://github.com/readest/readest), licensed **AGPL-3.0**. Source for this build: this repository.
-          files: dist/*
-          fail_on_unmatched_files: false
+          files: artifacts/*
+          fail_on_unmatched_files: true

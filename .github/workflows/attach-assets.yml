@@ -1,0 +1,89 @@
+name: Attach artifacts to release
+
+# Repair tool: moves the installers of an *already finished* build run onto an
+# existing release, without recompiling anything.
+#
+# Why this exists: the `release` job in build-desktop.yml first shipped with
+# `files: dist/*`, which matches nothing because download-artifact preserves the
+# directory layout inside each artifact (staging/apps/..., staging/target/...).
+# `fail_on_unmatched_files: false` then turned that into a green build with an
+# empty release. The glob is fixed there now, but the run that produced the
+# v0.1.0 binaries had already uploaded its artifacts, and re-running the whole
+# four-platform matrix just to attach files is wasteful - GitHub moves the blobs
+# between its own storage in seconds.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run id whose artifacts should be attached (Actions -> a run -> URL)'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag to attach to'
+        required: true
+        default: 'v0.1.0'
+        type: string
+      include_macos:
+        description: 'Also replace the macOS dmg / updater tarball'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: attach-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  attach:
+    name: Attach to ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          merge-multiple: true
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Flatten installers
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          INCLUDE_MACOS: ${{ inputs.include_macos }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          V="${TAG#v}"
+          find staging -type f \
+            \( -name '*.zip' -o -name '*.dmg' -o -name '*.deb' \
+               -o -name '*.apk' -o -name '*.tar.gz' -o -name '*.sig' \) |
+          while read -r f; do
+            base="$(basename "$f")"
+            case "$base" in
+              *windows*.zip) cp "$f" "artifacts/Read-EX_${V}_windows-x64.zip" ;;
+              *.apk)         cp "$f" "artifacts/Read-EX_${V}_android-arm64.apk" ;;
+              *.dmg|*.tar.gz|*.tar.gz.sig)
+                # The macOS job of the run being repaired already published these
+                # itself; only overwrite them when explicitly asked, because the
+                # release may hold a dmg from a different commit.
+                [ "$INCLUDE_MACOS" = "true" ] && cp "$f" "artifacts/$base" || true ;;
+              *)             cp "$f" "artifacts/$base" ;;
+            esac
+          done
+          ls -lh artifacts
+          n=$(find artifacts -type f ! -name '*.sig' | wc -l)
+          echo "installers: $n"
+          [ "$n" -ge 3 ] || { echo "::error::expected at least 3 installers, got $n"; exit 1; }
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          draft: true
+          files: artifacts/*
+          fail_on_unmatched_files: true
