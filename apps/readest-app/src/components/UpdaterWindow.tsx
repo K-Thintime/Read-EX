@@ -247,17 +247,12 @@ export const UpdaterContent = ({
           body: data.notes,
           downloadAndInstall: async (onEvent) => {
             await downloadWithProgress(downloadUrl, exeFilePath, onEvent);
-            try {
-              console.log('Launching new executable:', exeFilePath);
-              const command = Command.create('start-readest', ['/C', 'start', '', exeFilePath]);
-              await command.spawn();
-              console.log('New executable launched, exiting current app...');
-              setTimeout(async () => {
-                await exit(0);
-              }, 500);
-            } catch (error) {
-              console.error('Failed to launch new executable:', error);
-            }
+          try {
+            console.log('Handing over to new executable:', exeFilePath);
+            await handOverToNewWindowsExe(exeFilePath);
+          } catch (error) {
+            console.error('Failed to hand over to new executable:', error);
+          }
           },
         } as GenericUpdate);
       }
@@ -303,7 +298,17 @@ export const UpdaterContent = ({
         } as GenericUpdate);
       }
     };
-    const buildNightlyUpdate = (n: ResolvedNightlyUpdate): GenericUpdate => ({
+    const handOverToNewWindowsExe = async (exeFilePath: string): Promise<void> => {
+    // Detached cmd relay: wait for THIS process to exit, swap the downloaded
+    // exe into the running exe's path, launch it. Spawning the new exe
+    // directly cannot work — tauri_plugin_single_instance makes the child
+    // exit while the old process is still alive (see windows_self_update).
+    await invoke('windows_self_update', { newExePath: exeFilePath });
+    setTimeout(async () => {
+      await exit(0);
+    }, 500);
+  };
+  const buildNightlyUpdate = (n: ResolvedNightlyUpdate): GenericUpdate => ({
       currentVersion,
       version: n.version,
       date: n.pubDate,
@@ -365,11 +370,7 @@ export const UpdaterContent = ({
           }, 500);
         } else {
           // windows portable
-          const command = Command.create('start-readest', ['/C', 'start', '', filePath]);
-          await command.spawn();
-          setTimeout(async () => {
-            await exit(0);
-          }, 500);
+          await handOverToNewWindowsExe(filePath);
         }
       },
     });
@@ -392,14 +393,10 @@ export const UpdaterContent = ({
           const execDir = await invoke<string>('get_executable_dir');
           const filePath = await join(execDir, fileName);
           await downloadWithProgress(r.assetUrl, filePath, onEvent);
-          // Same pattern as the upstream portable updater: stage the new build
-          // beside the old one and hand over. Overwriting the running exe is
-          // not possible on Windows anyway.
-          const command = Command.create('start-readest', ['/C', 'start', '', filePath]);
-          await command.spawn();
-          setTimeout(async () => {
-            await exit(0);
-          }, 800);
+          // Hand over to a detached relay that swaps the new exe into the old
+          // exe's path and launches it after this process exits (see
+          // windows_self_update). Throwing surfaces failures in the dialog.
+          await handOverToNewWindowsExe(filePath);
           return;
         }
         if (r.kind === 'android-apk') {
