@@ -341,14 +341,15 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: node scripts/patch-android-project.mjs
 
-      # --release, not --debug. Rust's debug profile leaves libreadestlib.so
-      # unstripped and the resulting APK was 659 MB; Gradle strips native
-      # libraries for the release variant, which brings it back to a sane size.
-      # No --apk flag in tauri 2: APK output is the default. aarch64 covers
-      # every phone shipped in the last decade; armv7 can be added later.
+      # Release is the default variant: tauri only exposes `--debug` to opt the
+      # other way, and passing `--release` is rejected as an unknown argument.
+      # Rust's debug profile leaves libreadestlib.so unstripped and the resulting
+      # APK was 659 MB; the release variant lets Gradle strip native libraries.
+      # No --apk flag in tauri 2 either: APK output is the default. aarch64
+      # covers every phone shipped in the last decade; armv7 can be added later.
       - name: Build APK
         working-directory: apps/readest-app
-        run: pnpm tauri android build --release --target aarch64
+        run: pnpm tauri android build --target aarch64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
