@@ -68,7 +68,22 @@ const TOKEN_TTL_MS = 47 * 60 * 60 * 1000;
  */
 const NOT_FOUND_RE = /not\s*found|object not found|does not exist|no such file|不存在/i;
 
-const trimTrailingSlash = (url: string): string => url.trim().replace(/\/+$/, '');
+/**
+ * Turn whatever the user typed into an origin we can concatenate paths onto.
+ *
+ * `192.168.1.9:5244` is the shape people actually type, and it is not a valid
+ * URL: `fetch` rejects it outright, the rejection reaches the form as a bare
+ * "network error", and the user goes looking for a firewall problem. Assume
+ * plain http for anything without a scheme — self-hosted OpenList instances are
+ * overwhelmingly http on a LAN, and anything behind TLS will already say so.
+ */
+export const normalizeServerUrl = (raw: string | undefined): string => {
+  const url = (raw ?? '').trim();
+  if (!url) return '';
+  const withScheme = /^https?:\/\//i.test(url) ? url : `http://${url.replace(/^\/+/, '')}`;
+  return withScheme.replace(/\/+$/, '');
+};
+
 
 /** Percent-encode one path segment, keeping `/` separators literal. */
 const encodeSegment = (segment: string): string => encodeURIComponent(segment);
@@ -137,7 +152,7 @@ export class OpenListClient {
     private readonly config: OpenListClientConfig,
     fetchFn?: OpenListFetchFn,
   ) {
-    this.baseUrl = trimTrailingSlash(config.serverUrl);
+    this.baseUrl = normalizeServerUrl(config.serverUrl);
     this.fetchFn =
       fetchFn ??
       ((isTauriAppPlatform() ? tauriFetch : globalThis.fetch.bind(globalThis)) as OpenListFetchFn);

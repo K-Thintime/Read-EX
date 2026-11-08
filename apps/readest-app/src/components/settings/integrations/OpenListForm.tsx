@@ -6,7 +6,7 @@ import { useTranslation, type TranslationFunc } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
 import { eventDispatcher } from '@/utils/event';
 import { FileSyncError } from '@/services/sync/file/provider';
-import { parentOf } from '@/services/sync/providers/openlist/openListClient';
+import { normalizeServerUrl, parentOf } from '@/services/sync/providers/openlist/openListClient';
 import { createOpenListProvider } from '@/services/sync/providers/openlist/OpenListProvider';
 import { SectionTitle } from '../primitives';
 import FileSyncForm from './FileSyncForm';
@@ -15,21 +15,30 @@ import { persistCloudProviderEnabled } from './cloudSync';
 /**
  * Translate a connection-probe failure into a user-facing string. Each branch is
  * a literal `_('...')` call so the i18next-scanner picks the keys up.
+ *
+ * The underlying `FileSyncError` message is appended on purpose: it carries what
+ * actually went wrong (`Failed to fetch`, `certificate verify failed`, an
+ * `invalid URL`, …). Collapsing everything into "Network error" makes a typo in
+ * the host look identical to a TLS problem, and there is no way for the user -
+ * or a bug report - to tell them apart.
  */
 const formatConnectError = (_: TranslationFunc, e: unknown): string => {
   if (e instanceof FileSyncError) {
+    const detail = e.message.replace(/^OpenList\s+\S+\s+failed:\s*/i, '').trim();
     switch (e.code) {
       case 'AUTH_FAILED':
-        return _('Authentication failed');
+        return detail ? `${_('Authentication failed')}: ${detail}` : _('Authentication failed');
       case 'NOT_FOUND':
         return _('Directory not found');
       case 'NETWORK':
-        return _('Network error');
+        return detail ? `${_('Network error')}: ${detail}` : _('Network error');
     }
     if (typeof e.status === 'number') {
       return _('Unexpected server response (status {{status}})', { status: e.status });
     }
+    return detail || _('Network error');
   }
+  if (e instanceof Error && e.message) return e.message;
   return _('Network error');
 };
 
@@ -81,7 +90,7 @@ const OpenListForm: React.FC = () => {
   const canSubmit = connectionReady && !!rootPath;
 
   const draft = () => ({
-    serverUrl: serverUrl.trim().replace(/\/+$/, ''),
+    serverUrl: normalizeServerUrl(serverUrl),
     username: username.trim(),
     password,
     rootPath: rootPath.trim() || '/',

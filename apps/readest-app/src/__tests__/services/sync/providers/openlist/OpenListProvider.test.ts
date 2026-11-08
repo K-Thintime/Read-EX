@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, test, expect } from 'vitest';
+import { normalizeServerUrl } from '@/services/sync/providers/openlist/openListClient';
 import { createOpenListProvider } from '@/services/sync/providers/openlist/OpenListProvider';
 import { FileSyncError } from '@/services/sync/file/provider';
 
@@ -298,5 +299,30 @@ describe('OpenListProvider — writes and directories', () => {
     const { wire, provider } = build();
     wire.setMode('absent');
     await expect(provider.deleteDir('/onedrive/Readest/Readest/books')).resolves.toBeUndefined();
+  });
+});
+
+describe('normalizeServerUrl', () => {
+  test('assumes http for a bare host:port, which is what users type', () => {
+    // `192.168.1.9:5244` is not a valid URL - fetch rejects it and the form
+    // used to report the rejection as an opaque "network error".
+    expect(normalizeServerUrl('192.168.1.9:5244')).toBe('http://192.168.1.9:5244');
+    expect(normalizeServerUrl('openlist.example.com')).toBe('http://openlist.example.com');
+  });
+
+  test('keeps an explicit scheme and case as written', () => {
+    expect(normalizeServerUrl('https://drive.example.com')).toBe('https://drive.example.com');
+    expect(normalizeServerUrl('HTTPS://Drive.Example.com')).toBe('HTTPS://Drive.Example.com');
+  });
+
+  test('strips trailing slashes so paths do not double up', () => {
+    expect(normalizeServerUrl('https://drive.example.com///')).toBe('https://drive.example.com');
+    expect(normalizeServerUrl('  http://10.0.0.2:5244/  ')).toBe('http://10.0.0.2:5244');
+  });
+
+  test('does not invent a host for empty input', () => {
+    expect(normalizeServerUrl('')).toBe('');
+    expect(normalizeServerUrl(undefined)).toBe('');
+    expect(normalizeServerUrl('   ')).toBe('');
   });
 });
