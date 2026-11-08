@@ -181,7 +181,7 @@ KOReader/BookOrbit/AudiobookShelf 的客户端标识、Discord RPC 按钮、Linu
 
 三件事必须同时成立，少一件更新就是死的：
 
-1. **release 必须是公开的，不能是 draft**。`https://github.com/K-Thintime/read-ex/releases/latest/download/latest.json`
+1. **release 必须是公开的，不能是 draft**。`https://github.com/K-Thintime/Read-EX/releases/latest/download/latest.json`
    对 draft 返回 404，装了旧版的客户端只会一直显示"已是最新"。tag 推送触发的构建现在直接发布。
 2. **macOS 必须构建 `app` target**（workflow 里是 `--bundles app,dmg`）。只构建 `dmg` 时
    tauri 会警告 `no updater-enabled targets were built`，不产出 `.app.tar.gz`，`latest.json` 也就无从生成。
@@ -222,7 +222,7 @@ KOReader/BookOrbit/AudiobookShelf 的客户端标识、Discord RPC 按钮、Linu
 
 ## 发布到自己的 GitHub
 
-仓库已推送至 **https://github.com/K-Thintime/read-ex**（`main` 分支）。
+仓库已推送至 **https://github.com/K-Thintime/Read-EX**（`main` 分支）。
 
 出包只需推一个 tag：
 

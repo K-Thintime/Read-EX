@@ -1029,7 +1029,7 @@ export const SHARE_TOKEN_LENGTH = 22;
 export const SHARE_PRESIGN_TTL_SECONDS = 300;
 export const SHARE_CFI_MAX_LENGTH = 512;
 
-export const READEST_GITHUB_REPO = 'K-Thintime/read-ex';
+export const READEST_GITHUB_REPO = 'K-Thintime/Read-EX';
 
 const LATEST_DOWNLOAD_BASE_URL = `https://github.com/${READEST_GITHUB_REPO}/releases/latest/download`;
 
