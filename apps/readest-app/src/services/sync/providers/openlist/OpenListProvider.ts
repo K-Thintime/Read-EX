@@ -250,7 +250,10 @@ class OpenListProviderImpl {
       // the entry can already be expired, so re-issue `fs/get` right before the
       // native download instead of trusting the cached value.
       const url = this.client.downloadUrl(remotePath, await this.client.freshSign(remotePath));
-      await tauriDownload(url, localPath, onProgress, await this.client.authHeaders());
+      // The /p proxy authenticates on the guest `sign`; an Authorization header
+      // alongside it 401s on several OpenList deployments, so download sign-only
+      // (the buffered fallback in `download()` applies the same rule).
+      await tauriDownload(url, localPath, onProgress);
       return true;
     } catch (e) {
       console.warn('OpenListProvider.downloadStream failed', remotePath, e);
