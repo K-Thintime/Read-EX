@@ -344,39 +344,53 @@ export class OpenListClient {
    * bandwidth, which is the right trade for reliability.
    *
    * The `/p` route authenticates on the **`sign`** (guest signature) it returns
-   * from `fs/get`, not on the Authorization header — a valid token still yields
-   * HTTP 401 here. The `sign` is also short-lived, so the one attached to a
-   * directory listing can be expired by the time we download; we therefore
-   * re-issue `fs/get` to obtain a live signature on every call and again on any
-   * 401 retry (the retry was previously only re-logging-in, which never helped
-   * a `/p` 401 because the missing piece was the sign, not the token).
+   * from `fs/get`, not on the Authorization header. A valid token still yields
+   * HTTP 401 here — and, worse, several OpenList deployments return 401 *because*
+   * an Authorization header is present: they treat the bearer token as the
+   * authoritative credential and reject it for a guest-scoped route. So the
+   * download is attempted **sign-only first** (no Authorization header); later
+   * attempts add the bearer token in case the deployment gates `/p` behind it.
+   * The `sign` is also short-lived, so a fresh one is re-issued from `fs/get` on
+   * every retry (the prior retry only re-logged-in, which never helped a `/p` 401
+   * because the missing piece was the sign, not the token).
    */
   async download(path: string, sign?: string): Promise<Response | null> {
-    for (let attempt = 0; ; attempt++) {
+    let lastFailure: FileSyncError | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // The guest signature is short-lived; re-issue `fs/get` whenever no sign
+      // was supplied or on any retry, so we never download with a stale one.
       let effectiveSign = sign;
       if (!effectiveSign || attempt > 0) {
         try {
           const entry = await this.call<OpenListEntry>('fs/get', { path, password: '' });
           effectiveSign = entry?.sign ?? effectiveSign;
-        } catch {
-          // Keep whatever we had; if still nothing, /p falls back to the token
-          // (and will surface a 401 that the retry loop handles).
+        } catch (e) {
+          if (e instanceof FileSyncError) lastFailure = e;
         }
       }
       const query = effectiveSign ? `?sign=${encodeURIComponent(effectiveSign)}` : '';
       const url = `${this.baseUrl}/p${encodePath(path)}${query}`;
+      // Attempt 0 is sign-only: the proxy authenticates on the sign, and an
+      // Authorization header present alongside it 401s on many servers. Later
+      // attempts add the bearer token (force-refreshed on the last) for
+      // token-gated deployments.
+      const headers = attempt === 0 ? undefined : await this.authHeaders(attempt > 1);
       let res: Response;
       try {
-        res = await this.fetchFn(url, { method: 'GET', headers: await this.authHeaders(attempt > 0) });
+        res = await this.fetchFn(url, { method: 'GET', ...(headers ? { headers } : {}) });
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         throw new FileSyncError(`OpenList download failed: ${message}`, 'NETWORK');
       }
       if (res.status === HTTP_NOT_FOUND) return null;
-      // Same contract as `call` / `put`: one forced re-login + fresh sign
-      // rescues an expired token/signature; a second 401 means the credentials
-      // themselves are wrong.
-      if (res.status === HTTP_UNAUTHORIZED && attempt === 0) continue;
+      if (res.status === HTTP_UNAUTHORIZED) {
+        lastFailure = new FileSyncError(
+          `OpenList download failed: HTTP 401 for ${path}`,
+          'AUTH_FAILED',
+          res.status,
+        );
+        continue;
+      }
       if (!res.ok) {
         throw new FileSyncError(
           `OpenList download failed: HTTP ${res.status} for ${path}`,
@@ -386,6 +400,10 @@ export class OpenListClient {
       }
       return res;
     }
+    throw (
+      lastFailure ??
+      new FileSyncError(`OpenList download failed: HTTP 401 for ${path}`, 'AUTH_FAILED')
+    );
   }
 
   /**
