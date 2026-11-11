@@ -246,7 +246,10 @@ class OpenListProviderImpl {
     try {
       const entry = await this.getEntry(remotePath);
       if (!entry) return false;
-      const url = this.client.downloadUrl(remotePath, entry.sign);
+      // A live signature is required by the `/p` proxy route; the one attached to
+      // the entry can already be expired, so re-issue `fs/get` right before the
+      // native download instead of trusting the cached value.
+      const url = this.client.downloadUrl(remotePath, await this.client.freshSign(remotePath));
       await tauriDownload(url, localPath, onProgress, await this.client.authHeaders());
       return true;
     } catch (e) {
