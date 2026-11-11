@@ -34,6 +34,11 @@ const makeWire = () => {
   let stat: { name: string; size: number; is_dir: boolean; sign?: string } | null = null;
   /** Body served by the `/p` proxy route. */
   let fileBody = 'hello';
+  /** When true, `/p` returns 401 unless the request carries a `?sign=` query —
+   *  mirroring OpenList, whose proxy route authenticates on the signature. */
+  let requireSign = false;
+  /** Counts fs/get hits so the second lookup can supply a sign the first lacked. */
+  let fsGetCount = 0;
 
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -71,7 +76,12 @@ const makeWire = () => {
 
     if (url.includes('/api/fs/get')) {
       if (mode === 'absent') return json({ code: 500, message: 'object not found' });
-      return json({ code: 200, message: 'success', data: stat });
+      fsGetCount += 1;
+      // The first lookup (the listing/getEntry probe) omits the sign to mimic a
+      // driver that only attaches it on a follow-up call; later lookups carry
+      // it. This lets a test prove the download re-issues fs/get for a live sign.
+      const sign = fsGetCount === 1 ? (stat?.sign ?? undefined) : 'fresh';
+      return json({ code: 200, message: 'success', data: stat ? { ...stat, sign } : null });
     }
 
     if (url.includes('/api/fs/list')) {
@@ -96,6 +106,9 @@ const makeWire = () => {
 
     // /p proxy download route (plain text, not JSON).
     if (new URL(url).pathname.startsWith('/p/') || url.includes('/p/')) {
+      if (requireSign && !new URL(url).searchParams.has('sign')) {
+        return new Response('sign required', { status: 401 });
+      }
       return new Response(fileBody, { status: 200 });
     }
 
@@ -116,6 +129,9 @@ const makeWire = () => {
     },
     setFileBody: (v: string) => {
       fileBody = v;
+    },
+    setRequireSign: (v: boolean) => {
+      requireSign = v;
     },
     tokensIssued: () => tokensIssued,
   };
@@ -167,6 +183,27 @@ describe('OpenListProvider — read/head mapping', () => {
     expect(download?.url).toBe(
       'https://openlist.test/p/onedrive/Readest/Readest/books/h/book.epub?sign=sg',
     );
+  });
+
+  test('readBinary falls back to a freshly-issued sign when the listing entry omits one', async () => {
+    // Regression for the 401-on-download bug: the `/p` proxy authenticates on a
+    // `sign` (guest signature), not the Authorization token, and the signature
+    // attached to the directory-listing entry can be missing. The download must
+    // re-issue fs/get to obtain a live sign rather than 401-ing.
+    const { wire, provider } = build();
+    wire.setRequireSign(true);
+    // No sign on the entry returned by the initial getEntry probe.
+    wire.setStat({ name: 'book.epub', size: 5, is_dir: false });
+    wire.setFileBody('hello');
+
+    const buffer = await provider.readBinary('/onedrive/Readest/Readest/books/h/book.epub');
+    expect(new TextDecoder().decode(buffer!)).toBe('hello');
+
+    const download = wire.calls.find((c) => c.url.includes('/p/'));
+    expect(download?.url).toContain('?sign=');
+
+    // The listing fs/get plus the download's own fs/get refresh.
+    expect(wire.calls.filter((c) => c.url.includes('/api/fs/get')).length).toBeGreaterThanOrEqual(2);
   });
 
   test('list maps OpenList entries onto FileEntry with absolute paths', async () => {
