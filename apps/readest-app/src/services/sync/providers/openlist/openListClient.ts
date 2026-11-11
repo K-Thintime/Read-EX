@@ -342,11 +342,29 @@ export class OpenListClient {
    * `/d/` route 302s to the underlying driver, which 403s on several providers
    * (115, Tianyi) without a Referer; the proxy cannot. Costs the server's
    * bandwidth, which is the right trade for reliability.
+   *
+   * The `/p` route authenticates on the **`sign`** (guest signature) it returns
+   * from `fs/get`, not on the Authorization header — a valid token still yields
+   * HTTP 401 here. The `sign` is also short-lived, so the one attached to a
+   * directory listing can be expired by the time we download; we therefore
+   * re-issue `fs/get` to obtain a live signature on every call and again on any
+   * 401 retry (the retry was previously only re-logging-in, which never helped
+   * a `/p` 401 because the missing piece was the sign, not the token).
    */
   async download(path: string, sign?: string): Promise<Response | null> {
-    const query = sign ? `?sign=${encodeURIComponent(sign)}` : '';
-    const url = `${this.baseUrl}/p${encodePath(path)}${query}`;
     for (let attempt = 0; ; attempt++) {
+      let effectiveSign = sign;
+      if (!effectiveSign || attempt > 0) {
+        try {
+          const entry = await this.call<OpenListEntry>('fs/get', { path, password: '' });
+          effectiveSign = entry?.sign ?? effectiveSign;
+        } catch {
+          // Keep whatever we had; if still nothing, /p falls back to the token
+          // (and will surface a 401 that the retry loop handles).
+        }
+      }
+      const query = effectiveSign ? `?sign=${encodeURIComponent(effectiveSign)}` : '';
+      const url = `${this.baseUrl}/p${encodePath(path)}${query}`;
       let res: Response;
       try {
         res = await this.fetchFn(url, { method: 'GET', headers: await this.authHeaders(attempt > 0) });
@@ -355,8 +373,9 @@ export class OpenListClient {
         throw new FileSyncError(`OpenList download failed: ${message}`, 'NETWORK');
       }
       if (res.status === HTTP_NOT_FOUND) return null;
-      // Same contract as `call` / `put`: one forced re-login rescues an expired
-      // token; a second 401 means the credentials themselves are wrong.
+      // Same contract as `call` / `put`: one forced re-login + fresh sign
+      // rescues an expired token/signature; a second 401 means the credentials
+      // themselves are wrong.
       if (res.status === HTTP_UNAUTHORIZED && attempt === 0) continue;
       if (!res.ok) {
         throw new FileSyncError(
@@ -366,6 +385,20 @@ export class OpenListClient {
         );
       }
       return res;
+    }
+  }
+
+  /**
+   * Issue a fresh `fs/get` to obtain a live download `sign`. Used by the native
+   * streaming path, which builds the `/p` URL itself and must not rely on a
+   * possibly-expired signature from an earlier listing.
+   */
+  async freshSign(path: string): Promise<string | undefined> {
+    try {
+      const entry = await this.call<OpenListEntry>('fs/get', { path, password: '' });
+      return entry?.sign;
+    } catch {
+      return undefined;
     }
   }
 
