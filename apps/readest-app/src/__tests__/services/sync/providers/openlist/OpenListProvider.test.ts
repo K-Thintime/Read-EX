@@ -206,6 +206,22 @@ describe('OpenListProvider — read/head mapping', () => {
     expect(wire.calls.filter((c) => c.url.includes('/api/fs/get')).length).toBeGreaterThanOrEqual(2);
   });
 
+  test('the /p download request is sign-only (no Authorization header) on the first attempt', async () => {
+    // Regression for the persistent HTTP 401: many OpenList deployments reject
+    // the `/p` proxy route with 401 *because* a bearer token is sent alongside
+    // the guest `sign`. The first attempt must authenticate on the sign alone.
+    const { wire, provider } = build();
+    wire.setStat({ name: 'book.epub', size: 5, is_dir: false, sign: 'sg' });
+    wire.setFileBody('hello');
+
+    const buffer = await provider.readBinary('/onedrive/Readest/Readest/books/h/book.epub');
+    expect(new TextDecoder().decode(buffer!)).toBe('hello');
+
+    const download = wire.calls.find((c) => c.url.includes('/p/'))!;
+    expect(download.url).toContain('?sign=sg');
+    expect(download.headers['Authorization']).toBeUndefined();
+  });
+
   test('list maps OpenList entries onto FileEntry with absolute paths', async () => {
     const { wire, provider } = build();
     wire.setListing([
