@@ -99,11 +99,20 @@ jobs:
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev libssl-dev libasound2-dev libsoup-3.0-dev \
-            patchelf build-essential curl wget file
+          # GitHub-hosted runners occasionally fail apt-get with
+          # "Temporary failure resolving 'azure.archive.ubuntu.com'". That is a
+          # transient mirror/DNS hiccup on the runner, not a code problem, so we
+          # retry a few times instead of letting it kill the whole build.
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends --fix-missing \
+              libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+              librsvg2-dev libxdo-dev libssl-dev libasound2-dev libsoup-3.0-dev \
+              patchelf build-essential curl wget file; then
+              break
+            fi
+            echo "apt-get attempt $attempt failed (transient mirror/DNS issue?), retrying in 10s..."
+            sleep 10
+          done
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
