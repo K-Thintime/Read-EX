@@ -42,6 +42,15 @@ export interface OpenListEntry {
   created?: string;
   /** Short-lived download signature, required by the `/p` proxy route. */
   sign?: string;
+  /**
+   * Driver direct download URL returned by some `fs/get` responses. When present
+   * it is a self-authenticating (often presigned) link and is preferred over the
+   * `/d` / `/p` routes — no bearer token is needed and none is leaked to a
+   * third-party host.
+   */
+  url?: string;
+  /** WebDAV-style direct URL, an alternative to {@link url} on some drivers. */
+  durl?: string;
 }
 
 interface OpenListEnvelope<T> {
@@ -338,67 +347,96 @@ export class OpenListClient {
   }
 
   /**
-   * `GET /p/<path>?sign=...` — OpenList's server-side proxy route. The signed
-   * `/d/` route 302s to the underlying driver, which 403s on several providers
-   * (115, Tianyi) without a Referer; the proxy cannot. Costs the server's
-   * bandwidth, which is the right trade for reliability.
+   * Resolve the candidate download URLs for a path, most-preferred first.
    *
-   * The `/p` route authenticates on the **`sign`** (guest signature) it returns
-   * from `fs/get`, not on the Authorization header. A valid token still yields
-   * HTTP 401 here — and, worse, several OpenList deployments return 401 *because*
-   * an Authorization header is present: they treat the bearer token as the
-   * authoritative credential and reject it for a guest-scoped route. So the
-   * download is attempted **sign-only first** (no Authorization header); later
-   * attempts add the bearer token in case the deployment gates `/p` behind it.
-   * The `sign` is also short-lived, so a fresh one is re-issued from `fs/get` on
-   * every retry (the prior retry only re-logged-in, which never helped a `/p` 401
-   * because the missing piece was the sign, not the token).
+   * AList/OpenList offers several ways to pull a file's bytes, and which one
+   * works depends on the server and its storage driver:
+   *
+   *   1. **Driver direct `url`** — `fs/get` returns a self-authenticating
+   *      (often presigned) link for drivers that expose one. No token is needed
+   *      and, importantly, the bearer token is never sent to a third-party host.
+   *   2. **`/d/<path>?sign=<sign>`** — the standard *logged-in* download route.
+   *      It authenticates on the **bearer token** (this is the route the AList
+   *      web UI uses for signed-in users), so it works even when the guest
+   *      `sign` would not. Some drivers 302 this to the underlying storage, which
+   *      can 403 without a Referer — that is what candidate 3 covers.
+   *   3. **`/p/<path>?sign=<sign>`** — the server-side proxy. It authenticates
+   *      on the **guest `sign`** and streams the bytes through OpenList, sidestepping
+   *      the driver 403. Many deployments, however, 401 this route *because* a
+   *      token is present, so it is attempted sign-only and only as a last resort.
+   *
+   * Relying solely on candidate 3 was the root cause of the persistent HTTP 401:
+   * servers that sign guest downloads differently (or not at all) rejected it
+   * outright. Trying the logged-in `/d` route first fixes the common case.
    */
-  async download(path: string, sign?: string): Promise<Response | null> {
-    let lastFailure: FileSyncError | null = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      // The guest signature is short-lived; re-issue `fs/get` whenever no sign
-      // was supplied or on any retry, so we never download with a stale one.
-      let effectiveSign = sign;
-      if (!effectiveSign || attempt > 0) {
-        try {
-          const entry = await this.call<OpenListEntry>('fs/get', { path, password: '' });
-          effectiveSign = entry?.sign ?? effectiveSign;
-        } catch (e) {
-          if (e instanceof FileSyncError) lastFailure = e;
-        }
+  async resolveDownloadTargets(
+    path: string,
+    suppliedSign?: string,
+    suppliedUrl?: string,
+  ): Promise<Array<{ url: string; auth: boolean }>> {
+    let sign = suppliedSign;
+    let directUrl = suppliedUrl;
+    // Only re-issue `fs/get` when we have no sign to build the `/d` and `/p`
+    // routes. The caller (getEntry) already fetched the entry and hands its sign
+    // (and any direct `url`) straight through, so we skip the extra round-trip —
+    // a per-file RPC would otherwise double on every download in a large sync.
+    if (sign === undefined) {
+      try {
+        const entry = await this.call<OpenListEntry>('fs/get', { path, password: '' });
+        sign = entry?.sign ?? sign;
+        directUrl = directUrl ?? entry?.url ?? entry?.durl;
+      } catch {
+        // fs/get failing here is not fatal: a concrete error is still surfaced by
+        // the actual download attempt below. We proceed with whatever we have.
       }
-      const query = effectiveSign ? `?sign=${encodeURIComponent(effectiveSign)}` : '';
-      const url = `${this.baseUrl}/p${encodePath(path)}${query}`;
-      // Attempt 0 is sign-only: the proxy authenticates on the sign, and an
-      // Authorization header present alongside it 401s on many servers. Later
-      // attempts add the bearer token (force-refreshed on the last) for
-      // token-gated deployments.
-      const headers = attempt === 0 ? undefined : await this.authHeaders(attempt > 1);
+    }
+
+    const encoded = encodePath(path);
+    const token = await this.ensureToken().catch(() => null);
+    const query = sign ? `?sign=${encodeURIComponent(sign)}` : '';
+
+    const targets: Array<{ url: string; auth: boolean }> = [];
+    if (directUrl) targets.push({ url: directUrl, auth: false });
+    if (token) targets.push({ url: `${this.baseUrl}/d${encoded}${query}`, auth: true });
+    targets.push({ url: `${this.baseUrl}/p${encoded}${query}`, auth: false });
+    return targets;
+  }
+
+  /**
+   * `GET` a file's bytes, trying each candidate from {@link resolveDownloadTargets}
+   * and returning on the first that succeeds. A 404 means the file is absent (per
+   * the provider contract a missing object is not an error); any other failure
+   * advances to the next candidate so one broken route does not sink the whole
+   * sync. Pass the `sign`/`url` already obtained from `getEntry` to avoid a
+   * redundant `fs/get`.
+   */
+  async download(
+    path: string,
+    sign?: string,
+    url?: string,
+  ): Promise<Response | null> {
+    const targets = await this.resolveDownloadTargets(path, sign, url);
+    let lastFailure: FileSyncError | null = null;
+    for (const target of targets) {
+      const headers = target.auth ? { Authorization: await this.ensureToken() } : undefined;
       let res: Response;
       try {
-        res = await this.fetchFn(url, { method: 'GET', ...(headers ? { headers } : {}) });
+        res = await this.fetchFn(target.url, {
+          method: 'GET',
+          ...(headers ? { headers } : {}),
+        });
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        throw new FileSyncError(`OpenList download failed: ${message}`, 'NETWORK');
-      }
-      if (res.status === HTTP_NOT_FOUND) return null;
-      if (res.status === HTTP_UNAUTHORIZED) {
-        lastFailure = new FileSyncError(
-          `OpenList download failed: HTTP 401 for ${path}`,
-          'AUTH_FAILED',
-          res.status,
-        );
+        lastFailure = new FileSyncError(`OpenList download failed: ${message}`, 'NETWORK');
         continue;
       }
-      if (!res.ok) {
-        throw new FileSyncError(
-          `OpenList download failed: HTTP ${res.status} for ${path}`,
-          res.status === HTTP_UNAUTHORIZED ? 'AUTH_FAILED' : 'NETWORK',
-          res.status,
-        );
-      }
-      return res;
+      if (res.status === HTTP_NOT_FOUND) return null;
+      if (res.ok) return res;
+      lastFailure = new FileSyncError(
+        `OpenList download failed: HTTP ${res.status} for ${path}`,
+        res.status === HTTP_UNAUTHORIZED ? 'AUTH_FAILED' : 'NETWORK',
+        res.status,
+      );
     }
     throw (
       lastFailure ??
