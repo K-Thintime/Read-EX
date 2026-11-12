@@ -249,7 +249,7 @@ class OpenListProviderImpl {
       // Try each candidate in order (driver URL → logged-in /d → guest /p proxy);
       // the buffered `download()` shares this exact ordering. The `/d` candidate
       // needs the bearer token, the others do not.
-      const targets = this.client.resolveDownloadTargets(remotePath, entry.sign, entry.url ?? entry.durl);
+      const targets = await this.client.resolveDownloadTargets(remotePath, entry.sign, entry.url ?? entry.durl);
       let lastErr: unknown;
       for (const target of targets) {
         try {
