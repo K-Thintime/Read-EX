@@ -100,7 +100,7 @@ class OpenListProviderImpl {
   async readBinary(path: string): Promise<ArrayBuffer | null> {
     const entry = await this.getEntry(path);
     if (!entry || entry.is_dir) return null;
-    const res = await this.client.download(path, entry.sign);
+    const res = await this.client.download(path, entry.sign, entry.url ?? entry.durl);
     return res ? res.arrayBuffer() : null;
   }
 
@@ -246,15 +246,24 @@ class OpenListProviderImpl {
     try {
       const entry = await this.getEntry(remotePath);
       if (!entry) return false;
-      // A live signature is required by the `/p` proxy route; the one attached to
-      // the entry can already be expired, so re-issue `fs/get` right before the
-      // native download instead of trusting the cached value.
-      const url = this.client.downloadUrl(remotePath, await this.client.freshSign(remotePath));
-      // The /p proxy authenticates on the guest `sign`; an Authorization header
-      // alongside it 401s on several OpenList deployments, so download sign-only
-      // (the buffered fallback in `download()` applies the same rule).
-      await tauriDownload(url, localPath, onProgress);
-      return true;
+      // Try each candidate in order (driver URL → logged-in /d → guest /p proxy);
+      // the buffered `download()` shares this exact ordering. The `/d` candidate
+      // needs the bearer token, the others do not.
+      const targets = this.client.resolveDownloadTargets(remotePath, entry.sign, entry.url ?? entry.durl);
+      let lastErr: unknown;
+      for (const target of targets) {
+        try {
+          const headers = target.auth
+            ? new Map<string, string>([['Authorization', await this.client.ensureToken()]])
+            : undefined;
+          await tauriDownload(target.url, localPath, onProgress, headers);
+          return true;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      console.warn('OpenListProvider.downloadStream failed', remotePath, lastErr);
+      return false;
     } catch (e) {
       console.warn('OpenListProvider.downloadStream failed', remotePath, e);
       return false;
