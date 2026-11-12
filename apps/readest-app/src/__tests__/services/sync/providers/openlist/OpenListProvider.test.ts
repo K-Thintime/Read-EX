@@ -31,12 +31,14 @@ const makeWire = () => {
   /** Directory listing returned by `fs/list` in `ok` mode. */
   let listing: Array<{ name: string; size: number; is_dir: boolean; modified: string }> = [];
   /** Result of `fs/get` in `ok` mode. */
-  let stat: { name: string; size: number; is_dir: boolean; sign?: string } | null = null;
-  /** Body served by the `/p` proxy route. */
+  let stat: { name: string; size: number; is_dir: boolean; sign?: string; url?: string } | null = null;
+  /** Body served by the `/d` and `/p` download routes. */
   let fileBody = 'hello';
   /** When true, `/p` returns 401 unless the request carries a `?sign=` query —
    *  mirroring OpenList, whose proxy route authenticates on the signature. */
   let requireSign = false;
+  /** When true, the logged-in `/d` route returns 403, forcing the `/p` fallback. */
+  let dFails = false;
   /** Counts fs/get hits so the second lookup can supply a sign the first lacked. */
   let fsGetCount = 0;
 
@@ -104,11 +106,29 @@ const makeWire = () => {
       return json({ code: 200, message: 'success', data: null });
     }
 
-    // /p proxy download route (plain text, not JSON).
-    if (new URL(url).pathname.startsWith('/p/') || url.includes('/p/')) {
+    // Download routes. AList/OpenList exposes three ways to fetch bytes:
+    //  - a driver direct `url` (absolute, self-authenticating)
+    //  - the logged-in `/d` route (bearer token; the AList web UI path)
+    //  - the guest `/p` proxy (sign-based; last resort)
+    const pathname = (() => {
+      try {
+        return new URL(url).pathname;
+      } catch {
+        return '';
+      }
+    })();
+    if (pathname.startsWith('/d/') || url.includes('/d/')) {
+      if (dFails) return new Response('driver 403', { status: 403 });
+      return new Response(fileBody, { status: 200 });
+    }
+    if (pathname.startsWith('/p/') || url.includes('/p/')) {
       if (requireSign && !new URL(url).searchParams.has('sign')) {
         return new Response('sign required', { status: 401 });
       }
+      return new Response(fileBody, { status: 200 });
+    }
+    // Driver direct URL — absolute, off the OpenList origin.
+    if (/^https?:\/\//.test(url) && !url.includes('/api/')) {
       return new Response(fileBody, { status: 200 });
     }
 
@@ -132,6 +152,9 @@ const makeWire = () => {
     },
     setRequireSign: (v: boolean) => {
       requireSign = v;
+    },
+    setDStatus: (v: boolean) => {
+      dFails = v;
     },
     tokensIssued: () => tokensIssued,
   };
@@ -171,7 +194,10 @@ describe('OpenListProvider — read/head mapping', () => {
     expect(await provider.head('/onedrive/Readest/Readest/library.json')).toEqual({ size: 1234 });
   });
 
-  test('readBinary streams from the /p proxy with the returned sign', async () => {
+  test('readBinary downloads via the logged-in /d route with token + sign', async () => {
+    // The standard AList download path for a signed-in user: the `/d` route
+    // authenticates on the bearer token (not the guest sign), so it works even
+    // when guest signing is unavailable.
     const { wire, provider } = build();
     wire.setStat({ name: 'book.epub', size: 5, is_dir: false, sign: 'sg' });
     wire.setFileBody('hello');
@@ -179,17 +205,17 @@ describe('OpenListProvider — read/head mapping', () => {
     const buffer = await provider.readBinary('/onedrive/Readest/Readest/books/h/book.epub');
     expect(new TextDecoder().decode(buffer!)).toBe('hello');
 
-    const download = wire.calls.find((c) => c.url.includes('/p/'));
+    const download = wire.calls.find((c) => c.url.includes('/d/'))!;
     expect(download?.url).toBe(
-      'https://openlist.test/p/onedrive/Readest/Readest/books/h/book.epub?sign=sg',
+      'https://openlist.test/d/onedrive/Readest/Readest/books/h/book.epub?sign=sg',
     );
+    expect(download.headers['Authorization']).toMatch(/^tk-/);
   });
 
-  test('readBinary falls back to a freshly-issued sign when the listing entry omits one', async () => {
-    // Regression for the 401-on-download bug: the `/p` proxy authenticates on a
-    // `sign` (guest signature), not the Authorization token, and the signature
-    // attached to the directory-listing entry can be missing. The download must
-    // re-issue fs/get to obtain a live sign rather than 401-ing.
+  test('readBinary re-issues fs/get for a live sign when the entry omits one', async () => {
+    // Regression for the 401-on-download bug: the original code trusted a possibly
+    // stale/missing sign. The download must re-issue fs/get to obtain a live sign
+    // rather than 401-ing, and prefers the logged-in /d route.
     const { wire, provider } = build();
     wire.setRequireSign(true);
     // No sign on the entry returned by the initial getEntry probe.
@@ -199,18 +225,20 @@ describe('OpenListProvider — read/head mapping', () => {
     const buffer = await provider.readBinary('/onedrive/Readest/Readest/books/h/book.epub');
     expect(new TextDecoder().decode(buffer!)).toBe('hello');
 
-    const download = wire.calls.find((c) => c.url.includes('/p/'));
-    expect(download?.url).toContain('?sign=');
+    const download = wire.calls.find((c) => c.url.includes('/d/'))!;
+    expect(download?.url).toContain('?sign=fresh');
 
-    // The listing fs/get plus the download's own fs/get refresh.
+    // The getEntry probe plus the download's own fs/get refresh (no sign was
+    // supplied, so the client re-issues fs/get to obtain a live one).
     expect(wire.calls.filter((c) => c.url.includes('/api/fs/get')).length).toBeGreaterThanOrEqual(2);
   });
 
-  test('the /p download request is sign-only (no Authorization header) on the first attempt', async () => {
-    // Regression for the persistent HTTP 401: many OpenList deployments reject
-    // the `/p` proxy route with 401 *because* a bearer token is sent alongside
-    // the guest `sign`. The first attempt must authenticate on the sign alone.
+  test('download falls back to the /p proxy when the /d route 403s', async () => {
+    // Some drivers (115, Tianyi) 403 the /d redirect; the guest /p proxy must
+    // still work as a last resort and authenticates on the sign, not the token.
     const { wire, provider } = build();
+    wire.setDStatus(true);
+    wire.setRequireSign(true);
     wire.setStat({ name: 'book.epub', size: 5, is_dir: false, sign: 'sg' });
     wire.setFileBody('hello');
 
@@ -218,7 +246,28 @@ describe('OpenListProvider — read/head mapping', () => {
     expect(new TextDecoder().decode(buffer!)).toBe('hello');
 
     const download = wire.calls.find((c) => c.url.includes('/p/'))!;
-    expect(download.url).toContain('?sign=sg');
+    expect(download?.url).toContain('?sign=sg');
+    expect(download.headers['Authorization']).toBeUndefined();
+  });
+
+  test('prefers the driver direct url when fs/get returns one', async () => {
+    // A self-authenticating presigned link is tried first and needs no token
+    // (and avoids leaking the bearer token to a third-party host).
+    const { wire, provider } = build();
+    wire.setStat({
+      name: 'book.epub',
+      size: 5,
+      is_dir: false,
+      sign: 'sg',
+      url: 'https://driver.test/signed/book.epub',
+    });
+    wire.setFileBody('hello');
+
+    const buffer = await provider.readBinary('/onedrive/Readest/Readest/books/h/book.epub');
+    expect(new TextDecoder().decode(buffer!)).toBe('hello');
+
+    const download = wire.calls.find((c) => c.url.startsWith('https://driver.test/'))!;
+    expect(download?.url).toBe('https://driver.test/signed/book.epub');
     expect(download.headers['Authorization']).toBeUndefined();
   });
 
