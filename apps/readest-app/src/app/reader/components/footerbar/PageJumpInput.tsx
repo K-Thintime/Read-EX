@@ -1,8 +1,9 @@
 import clsx from 'clsx';
 import React, { useEffect, useRef, useState } from 'react';
+import { useBookProgress } from '@/store/readerProgressStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useTranslation } from '@/hooks/useTranslation';
-import { useBookDataStore } from '@/store/bookDataStore';
+import { useBookData } from '@/store/bookDataStore';
 import type { PageInfo } from '@/types/book';
 import {
   collectLabels,
@@ -36,11 +37,10 @@ const PageJumpInput: React.FC<PageJumpInputProps> = ({
   className,
 }) => {
   const _ = useTranslation();
-  const { hoveredBookKey, getView, getProgress, getViewSettings } = useReaderStore();
-  const { getBookData } = useBookDataStore();
+  const { hoveredBookKey, getView, getViewSettings } = useReaderStore();
   const view = getView(bookKey);
-  const bookData = getBookData(bookKey);
-  const progress = getProgress(bookKey);
+  const bookData = useBookData(bookKey);
+  const progress = useBookProgress(bookKey);
   const viewSettings = getViewSettings(bookKey);
   const progressStyle = viewSettings?.progressStyle || 'percentage';
 
@@ -76,15 +76,13 @@ const PageJumpInput: React.FC<PageJumpInputProps> = ({
   const livePageInfo = bookData?.isFixedLayout ? section : pageinfo;
   const liveValid = !!livePageInfo && livePageInfo.total > 0 && livePageInfo.current >= 0;
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (liveValid) setLastPageInfo(livePageInfo);
-  }, [liveValid, livePageInfo]);
-
   // Keep showing the last valid page while a relocation briefly reports an
   // invalid one: unmounting the label widens the progress slider under a
   // dragging cursor, which jumps somewhere else and brings the label back,
-  // looping into a jitter (#6646).
+  // looping into a jitter (#6646). Remembered while rendering, as React
+  // re-renders this alone at once: from an effect, every page turn took a
+  // second commit through the whole tree.
+  if (liveValid && livePageInfo !== lastPageInfo) setLastPageInfo(livePageInfo);
   const pageInfo = liveValid ? livePageInfo : lastPageInfo;
   if (!pageInfo) return null;
 

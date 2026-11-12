@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { useBookDataStore } from '@/store/bookDataStore';
+import { useBookDataStore, useBookConfig, useBookData } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useSettingsStore } from '@/store/settingsStore';
-import { useBookProgress } from '@/store/readerProgressStore';
+import { useBookProgressValue } from '@/store/readerProgressStore';
 import { useEnv } from '@/context/EnvContext';
 import { saveSysSettings } from '@/helpers/settings';
 import { HandwritingEditor } from '@/services/handwriting/editor';
@@ -74,12 +74,13 @@ const measureFixedPage = (view: FoliateView | null): PageRect | null => {
 };
 
 export function useHandwriting(bookKey: string) {
-  const { getBookData, getConfig, setConfig, saveConfig } = useBookDataStore();
+  const getConfig = useBookDataStore((s) => s.getConfig);
+  const setConfig = useBookDataStore((s) => s.setConfig);
+  const saveConfig = useBookDataStore((s) => s.saveConfig);
   const { getView, getViewSettings } = useReaderStore();
   const { settings } = useSettingsStore();
   const { envConfig } = useEnv();
-  const progress = useBookProgress(bookKey);
-  const isFixedLayout = !!getBookData(bookKey)?.isFixedLayout;
+  const isFixedLayout = !!useBookData(bookKey)?.isFixedLayout;
   // Scrolled views show several pages at once; strokes are routed per page.
   const scrolled = !!getViewSettings(bookKey)?.scrolled;
   // Each tool keeps its own color and width; the dock shows the active one's.
@@ -117,8 +118,16 @@ export function useHandwriting(bookKey: string) {
 
   if (!editorRef.current) loadEditor();
 
-  const location = progress?.location;
-  const sectionIndex = progress?.section?.current;
+  // Ink is re-anchored to the text whenever the layout may have moved it. A
+  // page turn writes styles across the paginator many times, so with no ink in
+  // the book and the pen off (nothing to place, no stroke to anchor) that work
+  // and its re-renders are skipped.
+  const needsAnchoring = enabled || editorRef.current!.pageKeys().length > 0;
+  // The section picks the ink to show. The page within it matters only while ink
+  // is placed or drawn: with none and the pen off, a turn within a section
+  // re-renders nothing here.
+  const sectionIndex = useBookProgressValue(bookKey, (p) => p.section?.current);
+  const location = useBookProgressValue(needsAnchoring ? bookKey : null, (p) => p.location);
   // Fixed layout pins ink to the page; reflowable ink is kept per section and
   // each stroke is bound to the text or element under it.
   const pageKey =
@@ -127,6 +136,11 @@ export function useHandwriting(bookKey: string) {
       : isFixedLayout
         ? fixedPageKey(sectionIndex)
         : sectionPageKey(sectionIndex);
+
+  const needsAnchoringRef = useRef(needsAnchoring);
+  useEffect(() => {
+    needsAnchoringRef.current = needsAnchoring;
+  }, [needsAnchoring]);
 
   const visible = !!pageKey;
   const editable = visible;
@@ -151,7 +165,7 @@ export function useHandwriting(bookKey: string) {
 
   // An ink annotation deleted from the sidebar, or ink pulled by sync,
   // changes the notes without this hook; pick it up.
-  const booknotes = getConfig(bookKey)?.booknotes;
+  const booknotes = useBookConfig(bookKey)?.booknotes;
   useEffect(() => {
     if (inkSignature(booknotes) !== inkSignatureRef.current) reload();
   }, [booknotes, reload]);
@@ -188,14 +202,18 @@ export function useHandwriting(bookKey: string) {
     };
   }, [editorVersion, bookKey, envConfig, getConfig, getView, setConfig, saveConfig]);
 
+  // The rects last measured. An unchanged rect sets no state: right after a
+  // render React can't drop an equal update unseen, and each took a commit.
+  const rectsRef = useRef({ cell: EMPTY_RECT, page: EMPTY_RECT });
   const measure = useCallback(() => {
     if (!cellEl) return;
     const cell = toRect(cellEl.getBoundingClientRect());
     // A scrolled view shows many pages: input spans the whole view and each
     // stroke is routed to the page it is drawn over.
     const page = (isFixedLayout && !scrolled && measureFixedPage(getView(bookKey))) || cell;
-    setCellRect((prev) => (sameRect(prev, cell) ? prev : cell));
-    setPageRect((prev) => (sameRect(prev, page) ? prev : page));
+    const rects = rectsRef.current;
+    if (!sameRect(rects.cell, cell)) setCellRect((rects.cell = cell));
+    if (!sameRect(rects.page, page)) setPageRect((rects.page = page));
   }, [cellEl, isFixedLayout, getView, bookKey, scrolled, sectionIndex]);
 
   // Re-measure on layout changes: window/cell resize, a page turn, scrolling,
@@ -209,7 +227,7 @@ export function useHandwriting(bookKey: string) {
       frameRequest = requestAnimationFrame(() => {
         frameRequest = 0;
         measure();
-        setLayoutTick((n) => n + 1);
+        if (needsAnchoringRef.current) setLayoutTick((n) => n + 1);
       });
     };
     measure();
@@ -286,12 +304,21 @@ export function useHandwriting(bookKey: string) {
   // Re-resolve text anchors whenever the layout may have moved them: a page
   // turn, a relayout (font, margins, spacing) or a resize.
   useEffect(() => {
-    if (isFixedLayout || sectionIndex === undefined) return;
+    if (isFixedLayout || sectionIndex === undefined || !needsAnchoring) return;
     const view = getView(bookKey);
     serviceRef.current?.setAnchoring(
       view && pageRect.width ? createInkAnchoring(view, sectionIndex, pageRect) : null,
     );
-  }, [isFixedLayout, sectionIndex, location, pageRect, layoutTick, getView, bookKey]);
+  }, [
+    isFixedLayout,
+    sectionIndex,
+    location,
+    pageRect,
+    layoutTick,
+    needsAnchoring,
+    getView,
+    bookKey,
+  ]);
 
   // Pen choice is a device-wide setting, so a change here retargets the live
   // session without disturbing the ink already committed.

@@ -2774,5 +2774,13 @@
   "OPEN DOWNLOAD PAGE": "打开下载页",
   "Skipped Version": "已跳过的版本",
   "Version {{version}} will not be offered again": "不再提示 {{version}} 这个版本",
-  "Notify Me Again": "恢复提示"
+  "Notify Me Again": "恢复提示",
+  "Words per Flash": "每次显示词数",
+  "Warm-up": "渐进加速",
+  "Long Word Delay": "长词延时",
+  "Reading Calendar": "读书日历",
+  "Previous Month": "上个月",
+  "Next Month": "下个月",
+  "No reading activity on this day": "当天没有阅读记录",
+  "See which books you read each day and for how long": "查看每天读过的书籍和阅读时长"
 }
