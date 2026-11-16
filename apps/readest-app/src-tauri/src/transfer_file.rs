@@ -19,7 +19,7 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 use read_progress_stream::ReadProgressStream;
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, sync::Arc};
 
 type Result<T> = std::result::Result<T, Error>;
@@ -298,14 +298,31 @@ pub async fn download_file<R: tauri::Runtime>(
 
     const PART_SIZE: u64 = 1024 * 1024;
 
+    // A stalled WebDAV/cloud-drive server used to leave this command pending
+    // forever (UI spun at 0%): reqwest's default timeout is *unlimited*. Bound
+    // every network phase so a dead/misbehaving server surfaces an error the
+    // sync engine can report and retry, instead of hanging the whole sync.
+    // CONNECT_TIMEOUT covers TCP/TLS setup; REQUEST_TIMEOUT covers the whole
+    // request incl. body, generous enough for a large book on a slow mobile
+    // link but finite. Both clients (relaxed + verified) get the same bounds.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
     let relaxed = skip_ssl_verification.unwrap_or(false);
     let mut builder = reqwest::ClientBuilder::new()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
         .danger_accept_invalid_certs(relaxed)
         .danger_accept_invalid_hostnames(relaxed);
     let mut verified = None;
     if relaxed {
         builder = builder.redirect(reqwest::redirect::Policy::none());
-        verified = Some(reqwest::Client::new());
+        verified = Some(
+            reqwest::ClientBuilder::new()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()?,
+        );
     }
     let client = builder.build()?;
     let force_single = single_threaded.unwrap_or(false);
@@ -366,10 +383,36 @@ pub async fn download_file<R: tauri::Runtime>(
         .await;
     }
 
-    // Check if server supports range requests
+    // Check if server supports range requests. Cloud-drive WebDAV gateways
+    // (坚果云 et al.) frequently stall forever on this probe — it was the direct
+    // trigger of the "0% then spin" bug. Give it a short, independent deadline
+    // and fall back to a plain single-stream GET if it does not answer in time,
+    // rather than waiting out the full request timeout.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
     let mut range_headers = headers.clone();
     range_headers.insert("Range".into(), "bytes=0-0".into());
-    let range_resp = send(&client, verified.as_ref(), url, None, &range_headers).await?;
+    let probe = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        send(&client, verified.as_ref(), url, None, &range_headers),
+    )
+    .await;
+    let range_resp = match probe {
+        Ok(Ok(resp)) => resp,
+        // Timed out or transport error: this server does not do Range reliably.
+        // The single-stream GET is the one operation every WebDAV server supports.
+        _ => {
+            return single_threaded_download(
+                &client,
+                verified.as_ref(),
+                url,
+                file_path,
+                &headers,
+                &body,
+                on_progress,
+            )
+            .await;
+        }
+    };
     let accept_ranges = range_resp
         .headers()
         .get("accept-ranges")
@@ -411,6 +454,10 @@ pub async fn download_file<R: tauri::Runtime>(
 
     let file = Arc::new(tokio::sync::Mutex::new(file));
     let progress = Arc::new(tokio::sync::Mutex::new(TransferStats::default()));
+    // Count parts that fail. Previously every failure was silently skipped, so
+    // a file with missing (zero-filled) ranges was still reported as a success
+    // and the sync engine never knew to retry. Surface any partial failure.
+    let failed_parts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     stream::iter(0..part_count)
         .for_each_concurrent(8, |i| {
@@ -421,6 +468,7 @@ pub async fn download_file<R: tauri::Runtime>(
             let headers = headers.clone();
             let url = url.to_string();
             let on_progress = on_progress.clone();
+            let failed_parts = Arc::clone(&failed_parts);
 
             async move {
                 let start = i * PART_SIZE;
@@ -430,20 +478,29 @@ pub async fn download_file<R: tauri::Runtime>(
                 let mut headers = headers;
                 headers.insert("Range".into(), range_header);
 
+                // Every early exit below counts the part as failed so the caller
+                // can detect an incomplete file, instead of silently skipping it.
                 let resp = match send(&client, verified.as_ref(), &url, None, &headers).await {
                     Ok(r) => r,
-                    Err(_) => return,
+                    Err(_) => {
+                        failed_parts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                 };
 
                 if !resp.status().is_success()
                     && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT
                 {
+                    failed_parts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
 
                 let bytes = match resp.bytes().await {
                     Ok(b) => b,
-                    Err(_) => return,
+                    Err(_) => {
+                        failed_parts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                 };
 
                 {
@@ -464,6 +521,14 @@ pub async fn download_file<R: tauri::Runtime>(
             }
         })
         .await;
+
+    if failed_parts.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        return Err(Error::ContentLength(format!(
+            "multi-part download incomplete: {} of {} parts failed",
+            failed_parts.load(std::sync::atomic::Ordering::Relaxed),
+            part_count
+        )));
+    }
 
     Ok(resp_headers)
 }

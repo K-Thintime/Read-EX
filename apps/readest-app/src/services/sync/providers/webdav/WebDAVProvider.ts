@@ -121,7 +121,21 @@ export const createWebDAVProvider = (settings: WebDAVSettings): FileSyncProvider
     provider.downloadStream = async (remotePath, localPath, onProgress) => {
       const url = buildRequestUrl(settings.serverUrl, remotePath);
       try {
-        await tauriDownload(url, localPath, onProgress, authHeaders());
+        // Force the single-stream GET path. The native downloader's default is
+        // to probe with `Range: bytes=0-0` and then fan out into 8 concurrent
+        // ranged requests. Many WebDAV servers — cloud-drive gateways (e.g.
+        // 坚果云) and proxies especially — either never answer the probe or
+        // mishandle Range, and the client has no timeout, so the UI spins at
+        // 0% forever. A plain single GET is the one operation every WebDAV
+        // server supports; correctness beats parallel speed for book sync.
+        await tauriDownload(
+          url,
+          localPath,
+          onProgress,
+          authHeaders(),
+          undefined, // body — GET has none
+          true, // singleThreaded — skip the Range probe / 8-way fan-out
+        );
         return true;
       } catch (e) {
         throw mapError(e);
